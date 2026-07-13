@@ -143,6 +143,39 @@ class TransferPauseControllerTest {
     }
 
     @Test
+    fun `running callback can coordinate with cancel without holding controller lock`() {
+        val controller = TransferPauseController()
+        val runningCallbackEntered = CountDownLatch(1)
+        val cancelCompleted = CountDownLatch(1)
+        val cancelWorker = startWorker {
+            assertTrue(runningCallbackEntered.await(2, TimeUnit.SECONDS))
+            controller.cancel()
+            cancelCompleted.countDown()
+        }
+
+        assertTrue(controller.requestPause())
+        val checkpointWorker = startWorker {
+            controller.checkpoint(
+                sendPause = {},
+                sendResume = {},
+                onState = { state ->
+                    if (state == TransferPauseState.RUNNING) {
+                        runningCallbackEntered.countDown()
+                        assertTrue(cancelCompleted.await(1, TimeUnit.SECONDS))
+                    }
+                }
+            )
+        }
+
+        eventually { controller.state == TransferPauseState.PAUSED }
+        assertTrue(controller.requestResume())
+        cancelWorker.joinAndRethrow()
+        checkpointWorker.joinAndRethrow()
+
+        assertEquals(TransferPauseState.CANCELLED, controller.state)
+    }
+
+    @Test
     fun `await between files pauses and resumes without wire callbacks`() {
         val controller = TransferPauseController()
         val states = Collections.synchronizedList(mutableListOf<TransferPauseState>())

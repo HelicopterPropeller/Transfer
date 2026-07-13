@@ -70,8 +70,8 @@ class TransferPauseController {
                 throw CancellationException("Transfer cancelled")
             }
             state = TransferPauseState.RUNNING
-            onState(TransferPauseState.RUNNING)
         }
+        onState(TransferPauseState.RUNNING)
     }
 
     fun awaitBetweenFiles(onState: (TransferPauseState) -> Unit) {
@@ -91,8 +91,8 @@ class TransferPauseController {
             }
             resumeRequested = false
             state = TransferPauseState.RUNNING
-            onState(TransferPauseState.RUNNING)
         }
+        onState(TransferPauseState.RUNNING)
     }
 
     fun cancel() = synchronized(lock) {
