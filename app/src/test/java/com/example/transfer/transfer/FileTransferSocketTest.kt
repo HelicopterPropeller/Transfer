@@ -8,11 +8,13 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -27,7 +29,7 @@ class FileTransferSocketTest {
         val result = transfer(bytes)
         assertTrue(result.sendResult.isSuccess)
         assertArrayEquals(bytes, result.store.bytes.toByteArray())
-        assertEquals(100, result.progress.last())
+        assertEquals(100, result.progress.last().percent)
         assertTrue(result.store.completed)
         result.close()
     }
@@ -41,7 +43,7 @@ class FileTransferSocketTest {
         val result = transfer(ByteArray(1024) { it.toByte() }, verifier)
         assertTrue(result.sendResult.isSuccess)
         assertEquals(2, checks.get())
-        assertEquals(listOf(100), result.progress)
+        assertEquals(listOf(FileTransferProgress(1024, 1024)), result.progress)
         result.close()
     }
 
@@ -55,26 +57,101 @@ class FileTransferSocketTest {
         result.close()
     }
 
-    private suspend fun transfer(bytes: ByteArray, verifier: ChunkVerifier = ChunkVerifier.SHA256): TransferResult {
+    @Test
+    fun `zero byte file publishes completed byte progress`() = runBlocking {
+        val result = transfer(ByteArray(0))
+
+        assertTrue(result.sendResult.isSuccess)
+        assertEquals(listOf(FileTransferProgress(0, 0)), result.progress)
+        assertTrue(result.store.completed)
+        result.close()
+    }
+
+    @Test
+    fun `pause waits after verified chunk and resume completes remaining chunks`() = runBlocking {
+        val firstChunk = CompletableDeferred<Unit>()
+        val paused = CompletableDeferred<Unit>()
+        val controller = TransferPauseController()
+        val bytes = ByteArray(TransferProtocol.CHUNK_SIZE * 2 + 10) { (it % 251).toByte() }
+        val transfer = async(Dispatchers.IO) {
+            transfer(
+                bytes = bytes,
+                controller = controller,
+                onProgress = { progress ->
+                    if (progress.confirmedBytes == TransferProtocol.CHUNK_SIZE.toLong()) {
+                        controller.requestPause()
+                        firstChunk.complete(Unit)
+                    }
+                },
+                onPauseState = { state ->
+                    if (state == TransferPauseState.PAUSED) paused.complete(Unit)
+                }
+            )
+        }
+
+        withTimeout(3_000) {
+            firstChunk.await()
+            paused.await()
+        }
+        assertFalse(transfer.isCompleted)
+        controller.requestResume()
+        val result = withTimeout(5_000) { transfer.await() }
+        assertTrue(result.sendResult.isSuccess)
+        assertArrayEquals(bytes, result.store.bytes.toByteArray())
+        result.close()
+    }
+
+    @Test
+    fun `pause requested after final chunk completes file and remains pending`() = runBlocking {
+        val controller = TransferPauseController()
+        val bytes = ByteArray(1024) { (it % 251).toByte() }
+
+        val result = transfer(
+            bytes = bytes,
+            controller = controller,
+            onProgress = { progress ->
+                if (progress.confirmedBytes == progress.totalBytes) controller.requestPause()
+            }
+        )
+
+        assertTrue(result.sendResult.exceptionOrNull()?.message, result.sendResult.isSuccess)
+        assertArrayEquals(bytes, result.store.bytes.toByteArray())
+        assertTrue(result.store.completed)
+        assertEquals(TransferPauseState.PAUSING, controller.state)
+        result.close()
+    }
+
+    private suspend fun transfer(
+        bytes: ByteArray,
+        verifier: ChunkVerifier = ChunkVerifier.SHA256,
+        controller: TransferPauseController = TransferPauseController(),
+        onProgress: (FileTransferProgress) -> Unit = {},
+        onPauseState: (TransferPauseState) -> Unit = {}
+    ): TransferResult {
         val store = MemoryStore()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val ready = CompletableDeferred<Int>()
         val server = FileTransferServer(0, store, verifier)
         server.start(scope, { ready.complete(it) }, { _, _ -> }, {}, {})
-        val progress = mutableListOf<Int>()
+        val progress = mutableListOf<FileTransferProgress>()
         val sendResult = FileTransferClient().send(
             InetAddress.getLoopbackAddress(),
             withTimeout(3_000) { ready.await() },
             SendFileSource("sample.bin", "application/octet-stream", bytes.size.toLong()) {
                 ByteArrayInputStream(bytes)
-            }
-        ) { progress += it }
+            },
+            controller,
+            onPauseState
+        ) {
+            progress += it
+            onProgress(it)
+        }
         return TransferResult(store, progress, sendResult, server, scope)
     }
 
     private data class TransferResult(
         val store: MemoryStore,
-        val progress: List<Int>,
+        val progress: List<FileTransferProgress>,
         val sendResult: Result<Unit>,
         val server: FileTransferServer,
         val scope: CoroutineScope

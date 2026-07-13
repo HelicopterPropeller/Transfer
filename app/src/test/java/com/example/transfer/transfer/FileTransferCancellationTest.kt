@@ -1,13 +1,20 @@
 package com.example.transfer.transfer
 
+import com.example.transfer.protocol.ChunkCodec
+import com.example.transfer.protocol.TransferFrameCodec
+import com.example.transfer.protocol.TransferFrameType
+import com.example.transfer.protocol.TransferProtocol
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 
@@ -33,6 +40,58 @@ class FileTransferCancellationTest {
         withTimeout(2_000) { accepted.await() }
         client.cancelActive()
         assertTrue(withTimeout(2_000) { send.await() }.isFailure)
+        server.close()
+        serverJob.cancel()
+    }
+
+    @Test
+    fun `cancel active wakes a client paused after acknowledged chunk`() = runBlocking {
+        val server = ServerSocket(0)
+        val bytes = ByteArray(TransferProtocol.CHUNK_SIZE + 1) { (it % 251).toByte() }
+        val pauseAcknowledged = CompletableDeferred<Unit>()
+        val serverJob = async(Dispatchers.IO) {
+            server.accept().use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                TransferProtocol.readHeader(input)
+                assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
+                ChunkCodec.read(input, expectedIndex = 0, expectedLength = TransferProtocol.CHUNK_SIZE)
+                output.writeByte(TransferProtocol.ACK)
+                output.flush()
+                assertEquals(TransferFrameType.PAUSE, TransferFrameCodec.readType(input))
+                output.writeByte(TransferProtocol.CONTROL_ACK)
+                output.flush()
+                pauseAcknowledged.complete(Unit)
+                input.read()
+            }
+        }
+        val client = FileTransferClient()
+        val controller = TransferPauseController()
+        val paused = CompletableDeferred<Unit>()
+        val send = async(Dispatchers.IO) {
+            client.send(
+                InetAddress.getLoopbackAddress(),
+                server.localPort,
+                SendFileSource("a.bin", "application/octet-stream", bytes.size.toLong()) {
+                    ByteArrayInputStream(bytes)
+                },
+                controller,
+                { state -> if (state == TransferPauseState.PAUSED) paused.complete(Unit) }
+            ) { progress ->
+                if (progress.confirmedBytes == TransferProtocol.CHUNK_SIZE.toLong()) {
+                    controller.requestPause()
+                }
+            }
+        }
+
+        withTimeout(2_000) {
+            pauseAcknowledged.await()
+            paused.await()
+        }
+        client.cancelActive()
+
+        assertTrue(withTimeout(2_000) { send.await() }.isFailure)
+        assertEquals(TransferPauseState.CANCELLED, controller.state)
         server.close()
         serverJob.cancel()
     }

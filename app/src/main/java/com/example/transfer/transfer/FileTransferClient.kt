@@ -1,6 +1,8 @@
 package com.example.transfer.transfer
 
 import com.example.transfer.protocol.ChunkCodec
+import com.example.transfer.protocol.TransferFrameCodec
+import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferHeader
 import com.example.transfer.protocol.TransferProtocol
 import kotlinx.coroutines.Dispatchers
@@ -17,16 +19,20 @@ import java.net.Socket
 
 class FileTransferClient {
     @Volatile private var activeSocket: Socket? = null
+    @Volatile private var activePauseController: TransferPauseController? = null
 
     suspend fun send(
         host: InetAddress,
         port: Int,
         source: SendFileSource,
-        onProgress: (Int) -> Unit
+        pauseController: TransferPauseController,
+        onPauseState: (TransferPauseState) -> Unit,
+        onProgress: (FileTransferProgress) -> Unit
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val socket = Socket()
             activeSocket = socket
+            activePauseController = pauseController
             try {
                 socket.use {
                     socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS)
@@ -36,21 +42,46 @@ class FileTransferClient {
                     TransferProtocol.writeHeader(output, TransferHeader(source.displayName, source.mimeType, source.length))
                     output.flush()
                     source.openStream().use { fileInput ->
-                        sendChunks(fileInput, source.length, input, output, onProgress)
+                        sendChunks(
+                            fileInput,
+                            source.length,
+                            input,
+                            output,
+                            pauseController,
+                            onPauseState,
+                            onProgress
+                        )
                     }
                     if (input.readUnsignedByte() != TransferProtocol.COMPLETE) {
                         error("Receiver could not finalize the file")
                     }
-                    if (source.length == 0L) onProgress(100)
+                    if (source.length == 0L) onProgress(FileTransferProgress(0, 0))
                 }
             } finally {
                 if (activeSocket === socket) activeSocket = null
+                if (activePauseController === pauseController) activePauseController = null
             }
         }
     }
 
+    suspend fun send(
+        host: InetAddress,
+        port: Int,
+        source: SendFileSource,
+        onProgress: (Int) -> Unit
+    ): Result<Unit> = send(
+        host,
+        port,
+        source,
+        TransferPauseController(),
+        {},
+        { onProgress(it.percent) }
+    )
+
     fun cancelActive() {
+        activePauseController?.cancel()
         runCatching { activeSocket?.close() }
+        activePauseController = null
         activeSocket = null
     }
 
@@ -59,7 +90,9 @@ class FileTransferClient {
         total: Long,
         input: DataInputStream,
         output: DataOutputStream,
-        onProgress: (Int) -> Unit
+        pauseController: TransferPauseController,
+        onPauseState: (TransferPauseState) -> Unit,
+        onProgress: (FileTransferProgress) -> Unit
     ) {
         var confirmed = 0L
         var index = 0
@@ -68,6 +101,7 @@ class FileTransferClient {
             val frame = ChunkCodec.create(index, readExactly(fileInput, length))
             var acknowledged = false
             for (attempt in 1..MAX_ATTEMPTS) {
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                 ChunkCodec.write(output, frame)
                 output.flush()
                 when (input.readUnsignedByte()) {
@@ -79,7 +113,26 @@ class FileTransferClient {
             }
             if (!acknowledged) error("Chunk $index failed verification after $MAX_ATTEMPTS attempts")
             confirmed += length
-            onProgress(TransferProgress.percent(confirmed, total))
+            onProgress(FileTransferProgress(confirmed, total))
+            if (confirmed < total) {
+                pauseController.checkpoint(
+                    sendPause = {
+                        TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                        output.flush()
+                        if (input.readUnsignedByte() != TransferProtocol.CONTROL_ACK) {
+                            error("Pause was not acknowledged")
+                        }
+                    },
+                    sendResume = {
+                        TransferFrameCodec.writeType(output, TransferFrameType.RESUME)
+                        output.flush()
+                        if (input.readUnsignedByte() != TransferProtocol.CONTROL_ACK) {
+                            error("Resume was not acknowledged")
+                        }
+                    },
+                    onState = onPauseState
+                )
+            }
             index++
         }
     }

@@ -1,6 +1,9 @@
 package com.example.transfer.transfer
 
 import com.example.transfer.protocol.ChunkCodec
+import com.example.transfer.protocol.ProtocolException
+import com.example.transfer.protocol.TransferFrameCodec
+import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.storage.IncomingFileStore
 import com.example.transfer.storage.ReceivedFileHandle
@@ -90,7 +93,7 @@ class FileTransferServer(
                 if (!onTransferStart()) error("Another transfer is active")
                 transferStarted = true
                 handle = store.create(header.fileName, header.mimeType)
-                receiveChunks(input, output, header.fileSize, handle, onProgress)
+                receiveChunks(socket, input, output, header.fileSize, handle, onProgress)
                 store.complete(handle)
                 output.writeByte(TransferProtocol.COMPLETE)
                 output.flush()
@@ -106,6 +109,7 @@ class FileTransferServer(
     }
 
     private fun receiveChunks(
+        socket: Socket,
         input: DataInputStream,
         output: DataOutputStream,
         total: Long,
@@ -118,6 +122,15 @@ class FileTransferServer(
             val expectedLength = minOf(TransferProtocol.CHUNK_SIZE.toLong(), total - received).toInt()
             var failures = 0
             while (true) {
+                val type = TransferFrameCodec.readType(input)
+                if (type == TransferFrameType.PAUSE) {
+                    if (failures > 0) throw ProtocolException("Control frame during chunk retry")
+                    acknowledgePause(socket, input, output)
+                    continue
+                }
+                if (type == TransferFrameType.RESUME) {
+                    throw ProtocolException("Unexpected resume frame")
+                }
                 val frame = ChunkCodec.read(input, index, expectedLength)
                 if (chunkVerifier.matches(frame.data, frame.digest)) {
                     handle.output.write(frame.data)
@@ -133,6 +146,26 @@ class FileTransferServer(
                 if (failures >= MAX_ATTEMPTS) error("Chunk $index failed verification")
             }
             index++
+        }
+    }
+
+    private fun acknowledgePause(
+        socket: Socket,
+        input: DataInputStream,
+        output: DataOutputStream
+    ) {
+        output.writeByte(TransferProtocol.CONTROL_ACK)
+        output.flush()
+        val originalTimeout = socket.soTimeout
+        socket.soTimeout = 0
+        try {
+            if (TransferFrameCodec.readType(input) != TransferFrameType.RESUME) {
+                throw ProtocolException("Expected resume frame")
+            }
+            output.writeByte(TransferProtocol.CONTROL_ACK)
+            output.flush()
+        } finally {
+            socket.soTimeout = originalTimeout
         }
     }
 
