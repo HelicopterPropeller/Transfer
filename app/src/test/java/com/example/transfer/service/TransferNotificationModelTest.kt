@@ -3,6 +3,7 @@ package com.example.transfer.service
 import com.example.transfer.transfer.TransferPauseState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -71,6 +72,68 @@ class TransferNotificationModelTest {
         assertEquals(
             TransferNotificationAction.RESUME,
             TransferNotificationModel.from(ServiceTransferState(transfer = transfer)).action
+        )
+    }
+
+    @Test
+    fun `termination gate rejects publishing after close`() {
+        val gate = ServiceTerminationGate()
+        var publications = 0
+
+        assertTrue(gate.runIfOpen { publications++ })
+        gate.close()
+
+        assertFalse(gate.runIfOpen { publications++ })
+        assertEquals(1, publications)
+    }
+
+    @Test
+    fun `termination gate close is idempotent`() {
+        val gate = ServiceTerminationGate()
+
+        assertTrue(gate.close())
+        assertFalse(gate.close())
+    }
+
+    @Test
+    fun `checked batch length rejects total overflow`() {
+        assertNull(checkedBatchLength(listOf(Long.MAX_VALUE, 1L)))
+    }
+
+    @Test
+    fun `late pause publication reads latest controller state`() {
+        val initial = ServiceTransferState(transfer = ServiceTransfer(
+            "发送", "b.bin", 25, "正在暂停", true,
+            pauseState = TransferPauseState.PAUSING
+        ))
+        var latestState = TransferPauseState.PAUSING
+        val reduce: (ServiceTransferState) -> ServiceTransferState = { state ->
+            state.withLatestOutgoingPauseState(
+                controllerMatches = true,
+                latestPauseState = { latestState }
+            )
+        }
+
+        latestState = TransferPauseState.PAUSED
+        val reduced = reduce(initial)
+
+        assertEquals(TransferPauseState.PAUSED, reduced.transfer?.pauseState)
+        assertEquals("已暂停", reduced.transfer?.message)
+    }
+
+    @Test
+    fun `batch level failure becomes inactive`() {
+        val active = ServiceTransferState(transfer = ServiceTransfer(
+            "发送", "b.bin", 25, "正在发送", true
+        ))
+
+        val failed = active.withInactiveBatchFailure("批次失败")
+
+        assertFalse(failed.transfer?.active ?: true)
+        assertEquals("批次失败", failed.transfer?.message)
+        assertEquals(
+            TransferNotificationAction.NONE,
+            TransferNotificationModel.from(failed).action
         )
     }
 }
