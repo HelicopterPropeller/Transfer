@@ -19,14 +19,15 @@ object TransferProtocol {
     const val ACK = 0
     const val NACK = 1
     const val FATAL = 2
+    const val CONTROL_ACK = 3
     const val COMPLETE = 0
     const val FAILED = 1
     const val SUCCESS = COMPLETE
     const val FAILURE = FAILED
-    private const val VERSION = 2
+    private const val VERSION = 3
     private const val MAX_FILE_NAME_BYTES = 1024
     private const val MAX_MIME_BYTES = 256
-    private val MAGIC = byteArrayOf('L'.code.toByte(), 'T'.code.toByte(), 'F'.code.toByte(), '2'.code.toByte())
+    private val MAGIC = byteArrayOf('L'.code.toByte(), 'T'.code.toByte(), 'F'.code.toByte(), '3'.code.toByte())
 
     fun writeHeader(output: DataOutputStream, header: TransferHeader) {
         validateFileSize(header.fileSize)
