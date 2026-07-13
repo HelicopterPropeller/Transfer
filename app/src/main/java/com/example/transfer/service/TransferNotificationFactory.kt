@@ -31,6 +31,16 @@ class TransferNotificationFactory(private val context: Context) {
             Intent(context, TransferForegroundService::class.java).setAction(TransferForegroundService.ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val pauseIntent = PendingIntent.getService(
+            context, 2,
+            Intent(context, TransferForegroundService::class.java).setAction(TransferForegroundService.ACTION_PAUSE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val resumeIntent = PendingIntent.getService(
+            context, 3,
+            Intent(context, TransferForegroundService::class.java).setAction(TransferForegroundService.ACTION_RESUME),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_transfer_notification)
             .setContentTitle(model.title)
@@ -39,7 +49,12 @@ class TransferNotificationFactory(private val context: Context) {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .addAction(0, "停止服务", stopIntent)
+        when (model.action) {
+            TransferNotificationAction.PAUSE -> builder.addAction(0, context.getString(R.string.pause), pauseIntent)
+            TransferNotificationAction.RESUME -> builder.addAction(0, context.getString(R.string.resume), resumeIntent)
+            TransferNotificationAction.NONE -> Unit
+        }
+        builder.addAction(0, context.getString(R.string.stop_service), stopIntent)
         if (model.showProgress) builder.setProgress(100, model.progress, false)
         else builder.setProgress(0, 0, false)
         return builder.build()
