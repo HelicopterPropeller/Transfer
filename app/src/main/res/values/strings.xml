@@ -1,3 +1,20 @@
 <resources>
-    <string name="app_name">Transfer</string>
+    <string name="app_name">局域网互传</string>
+    <string name="subtitle">同一 Wi-Fi 下，文件直达</string>
+    <string name="this_device">本机设备</string>
+    <string name="save_location">自动保存至 Download/Transfer</string>
+    <string name="nearby_devices">附近设备</string>
+    <string name="searching_devices">正在搜索同一局域网内的设备…</string>
+    <string name="send_file_title">发送文件</string>
+    <string name="no_file_selected">尚未选择文件</string>
+    <string name="select_file">选择文件</string>
+    <string name="send_file">发送给所选设备</string>
+    <string name="trusted_network_warning">传输未加密，请仅在可信局域网中使用</string>
+    <string name="device_row">%1$s\n%2$s · TCP %3$d</string>
+    <string name="selected_file">%1$s · %2$s</string>
+    <string name="unknown_size">大小未知</string>
+    <string name="transfer_title">%1$s文件</string>
+    <string name="transfer_message">%1$d%% · %2$s</string>
+    <string name="storage_permission_denied">未授予存储权限，Android 9 及以下无法接收文件</string>
+    <string name="file_read_failed">无法读取所选文件</string>
 </resources>

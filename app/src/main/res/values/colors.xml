@@ -2,4 +2,13 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <color name="brand_blue">#356DF3</color>
+    <color name="page_background">#F5F7FB</color>
+    <color name="card_background">#FFFFFFFF</color>
+    <color name="card_stroke">#DCE2ED</color>
+    <color name="selected_background">#EAF0FF</color>
+    <color name="text_primary">#172033</color>
+    <color name="text_secondary">#5C667A</color>
+    <color name="text_tertiary">#8791A4</color>
+    <color name="status_green">#18865D</color>
 </resources>
