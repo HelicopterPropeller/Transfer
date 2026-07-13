@@ -16,3 +16,6 @@ local.properties
 
 # Local project requirement/design documents (do not commit)
 /docs/local/
+
+# Local isolated development worktrees
+/.worktrees/
