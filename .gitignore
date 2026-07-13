@@ -19,3 +19,6 @@ local.properties
 
 # Local isolated development worktrees
 /.worktrees/
+
+# Local Superpowers execution ledger and review artifacts
+/.superpowers/

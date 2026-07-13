@@ -3,6 +3,7 @@ package com.example.transfer.ui
 import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransfer
 import com.example.transfer.service.ServiceTransferState
+import com.example.transfer.transfer.TransferPauseState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -16,17 +17,101 @@ class TransferUiReducerTest {
     )
 
     @Test
-    fun `send is enabled only with live peer file and no active transfer`() {
+    fun `invalid selection does not persist uri permission`() {
+        val events = mutableListOf<String>()
+
+        val result = validateThenPersist(
+            validate = {
+                events += "validate"
+                null
+            },
+            persist = { events += "persist" }
+        )
+
+        assertNull(result)
+        assertEquals(listOf("validate"), events)
+    }
+
+    @Test
+    fun `valid selection persists only after validation`() {
+        val events = mutableListOf<String>()
+
+        val result = validateThenPersist(
+            validate = {
+                events += "validate"
+                "selected"
+            },
+            persist = { events += "persist" }
+        )
+
+        assertEquals("selected", result)
+        assertEquals(listOf("validate", "persist"), events)
+    }
+
+    @Test
+    fun `send requires a non-empty valid file list`() {
         var state = TransferUiState()
         assertFalse(state.canSend)
 
         state = TransferUiReducer.withDevices(state, listOf(peer))
         state = TransferUiReducer.selectDevice(state, "peer")
-        state = state.copy(selectedFile = SelectedFile("content://file", "a.txt", "text/plain", 4))
+        assertFalse(state.canSend)
+
+        state = state.copy(selectedFiles = listOf(
+            SelectedFile("content://a", "a.txt", "text/plain", 4),
+            SelectedFile("content://b", "b.txt", "text/plain", 8)
+        ))
         assertTrue(state.canSend)
 
-        state = state.copy(transfer = TransferStatus("发送", "a.txt", 10, "发送中", true))
+        state = state.copy(selectedFiles = listOf(
+            SelectedFile("content://bad", "bad.txt", "text/plain", -1)
+        ))
         assertFalse(state.canSend)
+    }
+
+    @Test
+    fun `running outgoing transfer can pause but cannot resume`() {
+        val status = TransferStatus(
+            "发送", "a.txt", 40, "正在发送", true,
+            fileIndex = 1, fileCount = 2, batchProgress = 20,
+            pauseState = TransferPauseState.RUNNING
+        )
+
+        val state = TransferUiState(transfer = status)
+
+        assertTrue(state.canPause)
+        assertFalse(state.canResume)
+    }
+
+    @Test
+    fun `paused outgoing transfer can resume but cannot pause`() {
+        val status = TransferStatus(
+            "发送", "a.txt", 40, "已暂停", true,
+            fileIndex = 1, fileCount = 2, batchProgress = 20,
+            pauseState = TransferPauseState.PAUSED
+        )
+
+        val state = TransferUiState(transfer = status)
+
+        assertFalse(state.canPause)
+        assertTrue(state.canResume)
+    }
+
+    @Test
+    fun `incoming and inactive transfers expose no pause control`() {
+        val incoming = TransferUiState(transfer = TransferStatus(
+            "接收", "a.txt", 40, "正在接收", true,
+            pauseState = TransferPauseState.RUNNING
+        ))
+        val inactive = TransferUiState(transfer = TransferStatus(
+            "发送", "a.txt", 100, "发送完成", false,
+            pauseState = TransferPauseState.PAUSED
+        ))
+
+        assertFalse(incoming.canPause)
+        assertFalse(incoming.canResume)
+        assertFalse(inactive.canPause)
+        assertFalse(inactive.canResume)
     }
 
     @Test
@@ -37,17 +122,80 @@ class TransferUiReducerTest {
     }
 
     @Test
-    fun `service state maps progress and preserves selected file`() {
-        val file = SelectedFile("content://file", "a.txt", "text/plain", 4)
-        val current = TransferUiState(selectedFile = file)
+    fun `service state maps batch progress and preserves selected files`() {
+        val files = listOf(
+            SelectedFile("content://a", "a.txt", "text/plain", 4),
+            SelectedFile("content://b", "b.txt", "text/plain", 8)
+        )
+        val current = TransferUiState(selectedFiles = files)
         val service = ServiceTransferState(
             devices = listOf(peer),
             serviceMessage = "后台运行中",
-            transfer = ServiceTransfer("接收", "movie.mp4", 55, "正在接收", true)
+            transfer = ServiceTransfer(
+                "发送", "movie.mp4", 55, "正在发送", true,
+                fileIndex = 2, fileCount = 3, batchProgress = 60,
+                pauseState = TransferPauseState.PAUSING
+            )
         )
         val result = TransferUiReducer.withServiceState(current, service)
-        assertEquals(file, result.selectedFile)
+        assertEquals(files, result.selectedFiles)
         assertEquals(55, result.transfer?.progress)
+        assertEquals(2, result.transfer?.fileIndex)
+        assertEquals(3, result.transfer?.fileCount)
+        assertEquals(60, result.transfer?.batchProgress)
+        assertEquals(TransferPauseState.PAUSING, result.transfer?.pauseState)
         assertEquals("后台运行中", result.serviceStatus)
+    }
+
+    @Test
+    fun `service state preserves notice without changing pause controls`() {
+        val current = TransferUiState(notice = "2 个文件无法读取，已跳过")
+        val service = ServiceTransferState(transfer = ServiceTransfer(
+            "发送", "b.txt", 40, "已暂停", true,
+            fileIndex = 2, fileCount = 3, batchProgress = 50,
+            pauseState = TransferPauseState.PAUSED
+        ))
+
+        val result = TransferUiReducer.withServiceState(current, service)
+
+        assertEquals("2 个文件无法读取，已跳过", result.notice)
+        assertFalse(result.canPause)
+        assertTrue(result.canResume)
+    }
+
+    @Test
+    fun `selecting files replaces both selection and notice atomically`() {
+        val replacement = listOf(SelectedFile("content://new", "new.txt", "text/plain", 2))
+        val current = TransferUiState(
+            selectedFiles = listOf(SelectedFile("content://old", "old.txt", "text/plain", 1)),
+            notice = "old notice"
+        )
+
+        val result = TransferUiReducer.selectFiles(current, replacement, "new notice")
+
+        assertEquals(replacement, result.selectedFiles)
+        assertEquals("new notice", result.notice)
+    }
+
+    @Test
+    fun `successful file selection clears previous notice`() {
+        val current = TransferUiState(notice = "old notice")
+        val files = listOf(SelectedFile("content://new", "new.txt", "text/plain", 2))
+
+        val result = TransferUiReducer.selectFiles(current, files)
+
+        assertEquals(files, result.selectedFiles)
+        assertNull(result.notice)
+    }
+
+    @Test
+    fun `only the latest selection request token can commit`() {
+        val requests = LatestSelectionRequest()
+
+        val token1 = requests.nextToken()
+        val token2 = requests.nextToken()
+
+        assertFalse(requests.isLatest(token1))
+        assertTrue(requests.isLatest(token2))
     }
 }

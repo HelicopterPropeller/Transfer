@@ -2,7 +2,7 @@ package com.example.transfer.discovery
 
 object DiscoveryPacketCodec {
     const val MAX_PACKET_BYTES = 2048
-    private const val VERSION = 2
+    private const val VERSION = 3
     private val packetPattern = Regex(
         """^\{"protocol":"transfer-mvp","version":(\d+),"id":"((?:\\.|[^"\\])*)","name":"((?:\\.|[^"\\])*)","port":(\d+)\}$"""
     )

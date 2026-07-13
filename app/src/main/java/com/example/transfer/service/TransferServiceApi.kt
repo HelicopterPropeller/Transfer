@@ -5,5 +5,8 @@ import kotlinx.coroutines.flow.StateFlow
 
 interface TransferServiceApi {
     val state: StateFlow<ServiceTransferState>
-    fun send(deviceId: String, file: SelectedFile): Boolean
+    fun send(deviceId: String, files: List<SelectedFile>): Boolean
+    fun send(deviceId: String, file: SelectedFile): Boolean = send(deviceId, listOf(file))
+    fun pause(): Boolean
+    fun resume(): Boolean
 }

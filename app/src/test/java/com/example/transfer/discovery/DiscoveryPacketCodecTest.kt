@@ -9,7 +9,7 @@ class DiscoveryPacketCodecTest {
     @Test
     fun `packet round trips escaped device name`() {
         val encoded = DiscoveryPacketCodec.encode("id-1", "Pixel \"Lab\"\\A", 42043)
-        assertTrue(encoded.toString(Charsets.UTF_8).contains("\"version\":2"))
+        assertTrue(encoded.toString(Charsets.UTF_8).contains("\"version\":3"))
         assertEquals(
             DiscoveryPacket("id-1", "Pixel \"Lab\"\\A", 42043),
             DiscoveryPacketCodec.decode(encoded, encoded.size)
@@ -17,8 +17,8 @@ class DiscoveryPacketCodecTest {
     }
 
     @Test
-    fun `legacy version is rejected`() {
-        val bytes = """{"protocol":"transfer-mvp","version":1,"id":"a","name":"b","port":42043}"""
+    fun `version 2 is ignored`() {
+        val bytes = """{"protocol":"transfer-mvp","version":2,"id":"a","name":"b","port":42043}"""
             .toByteArray()
         assertNull(DiscoveryPacketCodec.decode(bytes, bytes.size))
     }
@@ -32,7 +32,7 @@ class DiscoveryPacketCodecTest {
 
     @Test
     fun `invalid port is rejected`() {
-        val bytes = """{"protocol":"transfer-mvp","version":1,"id":"a","name":"b","port":0}"""
+        val bytes = """{"protocol":"transfer-mvp","version":3,"id":"a","name":"b","port":0}"""
             .toByteArray()
         assertNull(DiscoveryPacketCodec.decode(bytes, bytes.size))
     }

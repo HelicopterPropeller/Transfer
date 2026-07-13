@@ -1,13 +1,11 @@
 package com.example.transfer
 
 import android.app.Application
-import android.net.Uri
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.SelectedFile
-import com.example.transfer.ui.TransferStatus
 import com.example.transfer.ui.TransferUiReducer
 import com.example.transfer.ui.TransferUiState
 import kotlinx.coroutines.Job
@@ -46,26 +44,31 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
         mutableState.update { TransferUiReducer.selectDevice(it, id) }
     }
 
-    fun selectFile(uri: Uri, name: String, mimeType: String?, size: Long) {
-        mutableState.update {
-            it.copy(selectedFile = SelectedFile(
-                uri.toString(), name,
-                mimeType.orEmpty().ifBlank { "application/octet-stream" }, size
-            ))
-        }
+    fun selectFiles(files: List<SelectedFile>, notice: String? = null) {
+        mutableState.update { TransferUiReducer.selectFiles(it, files, notice) }
     }
 
     fun showMessage(message: String) {
-        mutableState.update { it.copy(transfer = TransferStatus("", "", 0, message, false)) }
+        mutableState.update { it.copy(notice = message) }
     }
 
     fun sendSelected() {
         val snapshot = mutableState.value
         val deviceId = snapshot.selectedDeviceId ?: return
-        val file = snapshot.selectedFile ?: return
+        val files = snapshot.selectedFiles
         when {
-            file.size < 0 -> showMessage("无法获取文件大小，请选择其他文件")
-            service?.send(deviceId, file) != true -> showMessage("后台服务未连接或已有传输任务")
+            files.isEmpty() || files.any { it.size < 0 } ->
+                showMessage("无法获取文件大小，请选择其他文件")
+            service?.send(deviceId, files) != true ->
+                showMessage("后台服务未连接或已有传输任务")
+        }
+    }
+
+    fun togglePause() {
+        val snapshot = mutableState.value
+        when {
+            snapshot.canPause -> service?.pause()
+            snapshot.canResume -> service?.resume()
         }
     }
 

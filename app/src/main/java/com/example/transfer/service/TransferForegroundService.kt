@@ -14,9 +14,15 @@ import com.example.transfer.storage.DownloadStorage
 import com.example.transfer.transfer.FileTransferClient
 import com.example.transfer.transfer.FileTransferServer
 import com.example.transfer.transfer.SendFileSource
+import com.example.transfer.transfer.TransferBatchRunner
+import com.example.transfer.transfer.TransferPauseController
+import com.example.transfer.transfer.TransferPauseState
+import com.example.transfer.transfer.formatBatchCompletion
 import com.example.transfer.ui.SelectedFile
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,19 +31,24 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 
 class TransferForegroundService : Service() {
     inner class LocalBinder : Binder(), TransferServiceApi {
         override val state: StateFlow<ServiceTransferState>
             get() = this@TransferForegroundService.state
-        override fun send(deviceId: String, file: SelectedFile): Boolean =
-            this@TransferForegroundService.send(deviceId, file)
+        override fun send(deviceId: String, files: List<SelectedFile>): Boolean =
+            this@TransferForegroundService.send(deviceId, files)
+        override fun pause(): Boolean = this@TransferForegroundService.pause()
+        override fun resume(): Boolean = this@TransferForegroundService.resume()
     }
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val busy = AtomicBoolean(false)
+    private val cancellationStarted = AtomicBoolean(false)
+    private val terminationGate = ServiceTerminationGate()
     private val mutableState = MutableStateFlow(ServiceTransferState())
     val state: StateFlow<ServiceTransferState> = mutableState.asStateFlow()
     private lateinit var notificationFactory: TransferNotificationFactory
@@ -45,6 +56,8 @@ class TransferForegroundService : Service() {
     private lateinit var discovery: DiscoveryManager
     private lateinit var server: FileTransferServer
     private val client = FileTransferClient()
+    @Volatile private var activePauseController: TransferPauseController? = null
+    @Volatile private var activeBatchJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -85,6 +98,8 @@ class TransferForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_PAUSE) pause()
+        if (intent?.action == ACTION_RESUME) resume()
         if (intent?.action == ACTION_STOP) {
             shutdown()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -96,30 +111,137 @@ class TransferForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    fun send(deviceId: String, file: SelectedFile): Boolean {
-        val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return false
-        if (file.size < 0 || !beginTransfer()) return false
-        publish { it.copy(transfer = ServiceTransfer("发送", file.displayName, 0, "正在连接 ${device.name}", true)) }
-        serviceScope.launch {
-            try {
-                val source = SendFileSource(file.displayName, file.mimeType, file.size) {
+    fun send(deviceId: String, files: List<SelectedFile>): Boolean {
+        if (files.isEmpty() || checkedBatchLength(files.map { it.size }) == null) return false
+        var accepted = false
+        terminationGate.runIfOpen gate@{
+            val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return@gate
+            if (!beginTransfer()) return@gate
+            val sources = files.map { file ->
+                SendFileSource(file.displayName, file.mimeType, file.size) {
                     contentResolver.openInputStream(file.uri.toUri()) ?: error("无法读取所选文件")
                 }
-                val result = client.send(device.address, device.port, source) { progress ->
-                    publish { it.copy(transfer = ServiceTransfer("发送", file.displayName, progress, "正在发送", true)) }
-                }
-                publish {
-                    it.copy(transfer = if (result.isSuccess) {
-                        ServiceTransfer("发送", file.displayName, 100, "发送完成", false)
-                    } else {
-                        ServiceTransfer("发送", file.displayName, 0, result.exceptionOrNull()?.message ?: "发送失败", false)
-                    })
-                }
-            } finally {
-                endTransfer()
             }
+            val controller = TransferPauseController()
+            activePauseController = controller
+            publish { current ->
+                if (activePauseController !== controller) current else {
+                    val pauseState = controller.state
+                    current.copy(transfer = ServiceTransfer(
+                        direction = "发送",
+                        fileName = files.first().displayName,
+                        progress = 0,
+                        message = if (pauseState == TransferPauseState.RUNNING) {
+                            "正在连接 ${device.name}"
+                        } else {
+                            servicePauseMessage(pauseState)
+                        },
+                        active = true,
+                        fileIndex = 1,
+                        fileCount = files.size,
+                        batchProgress = 0,
+                        pauseState = pauseState
+                    ))
+                }
+            }
+            lateinit var job: Job
+            val cleanupStarted = AtomicBoolean(false)
+            val cleanup = {
+                if (cleanupStarted.compareAndSet(false, true)) {
+                    if (activePauseController === controller) activePauseController = null
+                    if (activeBatchJob === job) activeBatchJob = null
+                    endTransfer()
+                }
+            }
+            job = serviceScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    val onPauseState: (TransferPauseState) -> Unit = {
+                        publishPauseState(controller)
+                    }
+                    val runner = TransferBatchRunner(controller) { source, onProgress ->
+                        client.send(
+                            device.address,
+                            device.port,
+                            source,
+                            controller,
+                            onPauseState,
+                            onProgress
+                        )
+                    }
+                    val result = runner.run(
+                        sources,
+                        onProgress = { progress ->
+                            publish { current ->
+                                if (
+                                    activePauseController !== controller ||
+                                    current.transfer?.active != true
+                                ) {
+                                    current
+                                } else {
+                                    val pauseState = controller.state
+                                    current.copy(transfer = ServiceTransfer(
+                                        direction = "发送",
+                                        fileName = progress.fileName,
+                                        progress = progress.fileProgress,
+                                        message = servicePauseMessage(pauseState),
+                                        active = true,
+                                        fileIndex = progress.fileIndex,
+                                        fileCount = progress.fileCount,
+                                        batchProgress = progress.batchProgress,
+                                        pauseState = pauseState
+                                    ))
+                                }
+                            }
+                        },
+                        onPauseState = onPauseState
+                    )
+                    publish { current ->
+                        if (activePauseController !== controller) current else {
+                            current.copy(transfer = ServiceTransfer(
+                                direction = "发送",
+                                fileName = files.last().displayName,
+                                progress = 100,
+                                message = formatBatchCompletion(result),
+                                active = false,
+                                fileIndex = files.size,
+                                fileCount = files.size,
+                                batchProgress = 100,
+                                pauseState = controller.state
+                            ))
+                        }
+                    }
+                } catch (exception: CancellationException) {
+                    throw exception
+                } catch (exception: Exception) {
+                    publish { current ->
+                        if (activePauseController !== controller) current else {
+                            current.withInactiveBatchFailure(
+                                "发送失败：${exception.message ?: "未知错误"}"
+                            )
+                        }
+                    }
+                } finally {
+                    cleanup()
+                }
+            }
+            activeBatchJob = job
+            job.invokeOnCompletion { cleanup() }
+            accepted = job.start()
+            if (!accepted) cleanup()
         }
+        return accepted
+    }
+
+    fun pause(): Boolean {
+        val controller = activePauseController ?: return false
+        if (!controller.requestPause()) return false
+        publishPauseState(controller)
         return true
+    }
+
+    fun resume(): Boolean {
+        val controller = activePauseController ?: return false
+        return controller.requestResume()
     }
 
     private fun beginTransfer(): Boolean {
@@ -133,11 +255,26 @@ class TransferForegroundService : Service() {
     }
 
     private fun publish(transform: (ServiceTransferState) -> ServiceTransferState) {
+        terminationGate.runIfOpen {
+            publishNow(transform)
+        }
+    }
+
+    private fun publishNow(transform: (ServiceTransferState) -> ServiceTransferState) {
         mutableState.update(transform)
         startForeground(
             TransferNotificationFactory.NOTIFICATION_ID,
             notificationFactory.build(TransferNotificationModel.from(mutableState.value))
         )
+    }
+
+    private fun publishPauseState(controller: TransferPauseController) {
+        publish { current ->
+            current.withLatestOutgoingPauseState(
+                controllerMatches = activePauseController === controller,
+                latestPauseState = { controller.state }
+            )
+        }
     }
 
     private fun createResourceGuard(): TransferResourceGuard {
@@ -163,12 +300,18 @@ class TransferForegroundService : Service() {
     }
 
     private fun shutdown() {
+        terminationGate.close()
+        cancelResourcesOnce()
+    }
+
+    private fun cancelResourcesOnce() {
+        if (!cancellationStarted.compareAndSet(false, true)) return
+        activePauseController?.cancel()
         client.cancelActive()
         if (::server.isInitialized) server.stop()
         if (::discovery.isInitialized) discovery.stop()
-        if (::resourceGuard.isInitialized) resourceGuard.release()
+        activeBatchJob?.cancel()
         serviceScope.cancel()
-        busy.set(false)
     }
 
     override fun onDestroy() {
@@ -177,13 +320,22 @@ class TransferForegroundService : Service() {
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        publish { it.copy(transfer = ServiceTransfer("", "", 0, "后台服务达到系统运行时限", false)) }
-        shutdown()
-        stopSelf()
+        try {
+            terminationGate.closeWithAction {
+                publishNow {
+                    it.copy(transfer = ServiceTransfer("", "", 0, "后台服务达到系统运行时限", false))
+                }
+            }
+        } finally {
+            cancelResourcesOnce()
+            stopSelf()
+        }
     }
 
     companion object {
         const val ACTION_START = "com.example.transfer.action.START"
+        const val ACTION_PAUSE = "com.example.transfer.action.PAUSE"
+        const val ACTION_RESUME = "com.example.transfer.action.RESUME"
         const val ACTION_STOP = "com.example.transfer.action.STOP"
         private const val MAX_LOCK_MILLIS = 12L * 60 * 60 * 1000
     }

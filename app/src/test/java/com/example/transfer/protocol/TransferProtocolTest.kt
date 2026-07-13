@@ -10,14 +10,14 @@ import java.io.DataOutputStream
 
 class TransferProtocolTest {
     @Test
-    fun `LTF2 header round trips with fixed chunk size`() {
+    fun `LTF3 header round trips`() {
         val expected = TransferHeader("photo.jpg", "image/jpeg", 987654321L)
         val bytes = ByteArrayOutputStream().also {
             TransferProtocol.writeHeader(DataOutputStream(it), expected)
         }.toByteArray()
 
-        assertEquals("LTF2", bytes.take(4).map(Byte::toInt).map(Int::toChar).joinToString(""))
-        assertEquals(2, bytes[4].toInt())
+        assertEquals("LTF3", bytes.take(4).map(Byte::toInt).map(Int::toChar).joinToString(""))
+        assertEquals(3, bytes[4].toInt())
         assertEquals(expected, TransferProtocol.readHeader(DataInputStream(ByteArrayInputStream(bytes))))
         assertEquals(1_048_576, expected.chunkSize)
     }
