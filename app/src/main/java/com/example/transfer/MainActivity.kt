@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -28,6 +29,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.transfer.service.TransferForegroundService
 import com.example.transfer.service.TransferServiceApi
+import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
@@ -57,24 +59,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var transferCard: MaterialCardView
     private lateinit var transferTitleText: TextView
     private lateinit var transferFileText: TextView
+    private lateinit var transferBatchText: TextView
     private lateinit var transferProgress: ProgressBar
     private lateinit var transferMessageText: TextView
+    private lateinit var pauseResumeButton: MaterialButton
 
-    private val openDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri ?: return@registerForActivityResult
-        runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-        val metadata = contentResolver.query(
-            uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null
-        )?.use { cursor ->
-            if (!cursor.moveToFirst()) return@use null
-            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-            val name = if (nameIndex >= 0) cursor.getString(nameIndex) else null
-            val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else -1L
-            Pair(name ?: "selected_file", size)
+    private val openDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        val files = ArrayList<SelectedFile>(uris.size)
+        var skipped = 0
+        uris.forEach { uri ->
+            val file = readSelectedFile(uri)
+            if (file == null) skipped++ else files += file
         }
-        if (metadata == null) viewModel.showMessage(getString(R.string.file_read_failed))
-        else viewModel.selectFile(uri, metadata.first, contentResolver.getType(uri), metadata.second)
+        viewModel.selectFiles(files)
+        if (skipped > 0) viewModel.showMessage(getString(R.string.files_skipped, skipped))
     }
 
     private val requestStoragePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -95,8 +93,9 @@ class MainActivity : AppCompatActivity() {
             insets
         }
         deviceNameText.text = viewModel.deviceName
-        findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocument.launch(arrayOf("*/*")) }
+        findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocuments.launch(arrayOf("*/*")) }
         sendButton.setOnClickListener { viewModel.sendSelected() }
+        pauseResumeButton.setOnClickListener { viewModel.togglePause() }
         val serviceIntent = Intent(this, TransferForegroundService::class.java)
             .setAction(TransferForegroundService.ACTION_START)
         ContextCompat.startForegroundService(this, serviceIntent)
@@ -135,8 +134,10 @@ class MainActivity : AppCompatActivity() {
         transferCard = findViewById(R.id.transferCard)
         transferTitleText = findViewById(R.id.transferTitleText)
         transferFileText = findViewById(R.id.transferFileText)
+        transferBatchText = findViewById(R.id.transferBatchText)
         transferProgress = findViewById(R.id.transferProgress)
         transferMessageText = findViewById(R.id.transferMessageText)
+        pauseResumeButton = findViewById(R.id.pauseResumeButton)
     }
 
     private fun render(state: TransferUiState) {
@@ -150,10 +151,13 @@ class MainActivity : AppCompatActivity() {
             row.setOnClickListener { viewModel.selectDevice(device.id) }
             deviceContainer.addView(row)
         }
-        selectedFileText.text = state.selectedFile?.let { file ->
-            val size = if (file.size >= 0) Formatter.formatFileSize(this, file.size) else getString(R.string.unknown_size)
-            getString(R.string.selected_file, file.displayName, size)
-        } ?: getString(R.string.no_file_selected)
+        selectedFileText.text = if (state.selectedFiles.isEmpty()) {
+            getString(R.string.no_file_selected)
+        } else {
+            val total = saturatingTotalSize(state.selectedFiles)
+            val size = total?.let { Formatter.formatFileSize(this, it) } ?: getString(R.string.unknown_size)
+            getString(R.string.selected_files, state.selectedFiles.size, size)
+        }
         sendButton.isEnabled = state.canSend
         state.transfer.let { transfer ->
             transferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
@@ -161,11 +165,59 @@ class MainActivity : AppCompatActivity() {
                 transferTitleText.text = if (transfer.direction.isBlank()) transfer.message else getString(R.string.transfer_title, transfer.direction)
                 transferFileText.text = transfer.fileName
                 transferFileText.visibility = if (transfer.fileName.isBlank()) View.GONE else View.VISIBLE
+                transferBatchText.text = getString(
+                    R.string.transfer_batch,
+                    transfer.fileIndex,
+                    transfer.fileCount,
+                    transfer.batchProgress
+                )
+                transferBatchText.visibility = if (transfer.active) View.VISIBLE else View.GONE
                 transferProgress.progress = transfer.progress
                 transferProgress.visibility = if (transfer.active) View.VISIBLE else View.GONE
                 transferMessageText.text = getString(R.string.transfer_message, transfer.progress, transfer.message)
+                pauseResumeButton.visibility = if (state.canPause || state.canResume) View.VISIBLE else View.GONE
+                pauseResumeButton.setText(if (state.canPause) R.string.pause else R.string.resume)
             }
         }
+    }
+
+    private fun readSelectedFile(uri: Uri): SelectedFile? = runCatching {
+        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val metadata = contentResolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            val name = if (nameIndex >= 0 && !cursor.isNull(nameIndex)) cursor.getString(nameIndex) else null
+            val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else -1L
+            name?.takeIf(String::isNotBlank)?.let { it to size }
+        } ?: return@runCatching null
+        if (metadata.second < 0) return@runCatching null
+        contentResolver.openFileDescriptor(uri, "r")?.use { } ?: return@runCatching null
+        SelectedFile(
+            uri.toString(),
+            metadata.first,
+            contentResolver.getType(uri).orEmpty().ifBlank { "application/octet-stream" },
+            metadata.second
+        )
+    }.getOrNull()
+
+    private fun saturatingTotalSize(files: List<SelectedFile>): Long? {
+        var total = 0L
+        files.forEach { file ->
+            if (file.size < 0) return null
+            total = try {
+                Math.addExact(total, file.size)
+            } catch (_: ArithmeticException) {
+                Long.MAX_VALUE
+            }
+        }
+        return total
     }
 
     private fun requestLegacyStoragePermissionIfNeeded() {

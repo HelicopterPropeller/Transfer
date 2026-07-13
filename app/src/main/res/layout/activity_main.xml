@@ -200,6 +200,17 @@
                     android:textColor="@color/text_secondary"
                     tools:text="photo.jpg" />
 
+                <TextView
+                    android:id="@+id/transferBatchText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp"
+                    android:visibility="gone"
+                    tools:text="第 2/3 个文件 · 总进度 50%"
+                    tools:visibility="visible" />
+
                 <ProgressBar
                     android:id="@+id/transferProgress"
                     style="?android:attr/progressBarStyleHorizontal"
@@ -217,6 +228,16 @@
                     android:textColor="@color/text_secondary"
                     android:textSize="13sp"
                     tools:text="50%" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/pauseResumeButton"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/pause"
+                    android:visibility="gone"
+                    tools:visibility="visible" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

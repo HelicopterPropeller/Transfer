@@ -12,11 +12,14 @@
     <string name="trusted_network_warning">传输未加密，请仅在可信局域网中使用</string>
     <string name="device_row">%1$s\n%2$s · TCP %3$d</string>
     <string name="selected_file">%1$s · %2$s</string>
+    <string name="selected_files">已选择 %1$d 个文件 · 总计 %2$s</string>
     <string name="unknown_size">大小未知</string>
     <string name="transfer_title">%1$s文件</string>
     <string name="transfer_message">%1$d%% · %2$s</string>
+    <string name="transfer_batch">第 %1$d/%2$d 个文件 · 总进度 %3$d%%</string>
     <string name="storage_permission_denied">未授予存储权限，Android 9 及以下无法接收文件</string>
     <string name="file_read_failed">无法读取所选文件</string>
+    <string name="files_skipped">%1$d 个文件无法读取，已跳过</string>
     <string name="notification_permission_denied">通知权限未授予，后台传输仍可运行，但通知可能不会显示在通知栏</string>
     <string name="pause">暂停</string>
     <string name="resume">继续</string>
