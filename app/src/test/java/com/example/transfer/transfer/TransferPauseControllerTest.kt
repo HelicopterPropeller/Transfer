@@ -7,6 +7,8 @@ import org.junit.Assert.fail
 import org.junit.Test
 import java.util.Collections
 import java.util.concurrent.CancellationException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -17,7 +19,7 @@ class TransferPauseControllerTest {
         val states = Collections.synchronizedList(mutableListOf<TransferPauseState>())
 
         assertTrue(controller.requestPause())
-        val worker = thread {
+        val worker = startWorker {
             controller.checkpoint(
                 sendPause = { states += TransferPauseState.PAUSING },
                 sendResume = { states += TransferPauseState.RUNNING },
@@ -27,10 +29,9 @@ class TransferPauseControllerTest {
 
         eventually { controller.state == TransferPauseState.PAUSED }
         assertTrue(controller.requestResume())
-        worker.join(2_000)
+        worker.joinAndRethrow()
 
         assertEquals(TransferPauseState.RUNNING, controller.state)
-        assertFalse(worker.isAlive)
         assertEquals(
             listOf(
                 TransferPauseState.PAUSING,
@@ -48,11 +49,10 @@ class TransferPauseControllerTest {
 
         repeat(2) {
             assertTrue(controller.requestPause())
-            val worker = thread { controller.checkpoint({}, {}, {}) }
+            val worker = startWorker { controller.checkpoint({}, {}, {}) }
             eventually { controller.state == TransferPauseState.PAUSED }
             assertTrue(controller.requestResume())
-            worker.join(2_000)
-            assertFalse(worker.isAlive)
+            worker.joinAndRethrow()
             assertEquals(TransferPauseState.RUNNING, controller.state)
         }
     }
@@ -60,25 +60,86 @@ class TransferPauseControllerTest {
     @Test
     fun `cancel wakes a paused checkpoint`() {
         val controller = TransferPauseController()
-        val workerFailure = AtomicReference<Throwable?>()
         controller.requestPause()
-        val worker = thread {
-            try {
-                org.junit.Assert.assertThrows(CancellationException::class.java) {
-                    controller.checkpoint({}, {}, {})
-                }
-            } catch (failure: Throwable) {
-                workerFailure.set(failure)
+        val worker = startWorker {
+            org.junit.Assert.assertThrows(CancellationException::class.java) {
+                controller.checkpoint({}, {}, {})
             }
         }
 
         eventually { controller.state == TransferPauseState.PAUSED }
         controller.cancel()
-        worker.join(2_000)
+        worker.joinAndRethrow()
 
-        workerFailure.get()?.let { throw AssertionError("Worker assertion failed", it) }
-        assertFalse(worker.isAlive)
         assertEquals(TransferPauseState.CANCELLED, controller.state)
+    }
+
+    @Test
+    fun `cancel during resume remains terminal and suppresses running state`() {
+        val controller = TransferPauseController()
+        val resumeStarted = CountDownLatch(1)
+        val finishResume = CountDownLatch(1)
+        val states = Collections.synchronizedList(mutableListOf<TransferPauseState>())
+
+        assertTrue(controller.requestPause())
+        val worker = startWorker {
+            org.junit.Assert.assertThrows(CancellationException::class.java) {
+                controller.checkpoint(
+                    sendPause = {},
+                    sendResume = {
+                        resumeStarted.countDown()
+                        assertTrue(finishResume.await(2, TimeUnit.SECONDS))
+                    },
+                    onState = { states += it }
+                )
+            }
+        }
+
+        eventually { controller.state == TransferPauseState.PAUSED }
+        assertTrue(controller.requestResume())
+        assertTrue(resumeStarted.await(2, TimeUnit.SECONDS))
+        controller.cancel()
+        finishResume.countDown()
+        worker.joinAndRethrow()
+
+        assertEquals(TransferPauseState.CANCELLED, controller.state)
+        assertFalse(states.contains(TransferPauseState.RUNNING))
+    }
+
+    @Test
+    fun `duplicate resume during resume callback does not skip next pause`() {
+        val controller = TransferPauseController()
+        val resumeStarted = CountDownLatch(1)
+        val finishResume = CountDownLatch(1)
+
+        assertTrue(controller.requestPause())
+        val firstWorker = startWorker {
+            controller.checkpoint(
+                sendPause = {},
+                sendResume = {
+                    resumeStarted.countDown()
+                    assertTrue(finishResume.await(2, TimeUnit.SECONDS))
+                },
+                onState = {}
+            )
+        }
+
+        eventually { controller.state == TransferPauseState.PAUSED }
+        assertTrue(controller.requestResume())
+        assertTrue(resumeStarted.await(2, TimeUnit.SECONDS))
+        val duplicateResumeAccepted = controller.requestResume()
+        finishResume.countDown()
+        firstWorker.joinAndRethrow()
+
+        assertTrue(controller.requestPause())
+        val secondWorker = startWorker { controller.checkpoint({}, {}, {}) }
+        eventually { controller.state == TransferPauseState.PAUSED }
+        assertTrue(secondWorker.isAlive)
+        assertTrue(controller.requestResume())
+        secondWorker.joinAndRethrow()
+
+        assertFalse(duplicateResumeAccepted)
+        assertEquals(TransferPauseState.RUNNING, controller.state)
     }
 
     @Test
@@ -87,12 +148,11 @@ class TransferPauseControllerTest {
         val states = Collections.synchronizedList(mutableListOf<TransferPauseState>())
 
         assertTrue(controller.requestPause())
-        val worker = thread { controller.awaitBetweenFiles { states += it } }
+        val worker = startWorker { controller.awaitBetweenFiles { states += it } }
         eventually { controller.state == TransferPauseState.PAUSED }
         assertTrue(controller.requestResume())
-        worker.join(2_000)
+        worker.joinAndRethrow()
 
-        assertFalse(worker.isAlive)
         assertEquals(TransferPauseState.RUNNING, controller.state)
         assertEquals(
             listOf(TransferPauseState.PAUSED, TransferPauseState.RUNNING),
@@ -107,5 +167,31 @@ class TransferPauseControllerTest {
             Thread.sleep(10)
         }
         fail("Condition was not met within 2 seconds")
+    }
+
+    private fun startWorker(block: () -> Unit): Worker {
+        val failure = AtomicReference<Throwable?>()
+        val thread = thread(isDaemon = true) {
+            try {
+                block()
+            } catch (throwable: Throwable) {
+                failure.set(throwable)
+            }
+        }
+        return Worker(thread, failure)
+    }
+
+    private class Worker(
+        private val thread: Thread,
+        private val failure: AtomicReference<Throwable?>
+    ) {
+        val isAlive: Boolean
+            get() = thread.isAlive
+
+        fun joinAndRethrow() {
+            thread.join(2_000)
+            assertFalse("Worker did not finish within 2 seconds", thread.isAlive)
+            failure.get()?.let { throw AssertionError("Worker failed", it) }
+        }
     }
 }

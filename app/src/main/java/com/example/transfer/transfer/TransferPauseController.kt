@@ -7,6 +7,7 @@ enum class TransferPauseState { RUNNING, PAUSING, PAUSED, CANCELLED }
 class TransferPauseController {
     private val lock = Object()
     private var resumeRequested = false
+    private var resumeInProgress = false
 
     @Volatile
     var state = TransferPauseState.RUNNING
@@ -22,7 +23,10 @@ class TransferPauseController {
     }
 
     fun requestResume(): Boolean = synchronized(lock) {
-        if (state != TransferPauseState.PAUSING && state != TransferPauseState.PAUSED) {
+        if (
+            resumeInProgress ||
+            (state != TransferPauseState.PAUSING && state != TransferPauseState.PAUSED)
+        ) {
             false
         } else {
             resumeRequested = true
@@ -57,12 +61,17 @@ class TransferPauseController {
                 throw CancellationException("Transfer cancelled")
             }
             resumeRequested = false
+            resumeInProgress = true
         }
         sendResume()
         synchronized(lock) {
+            resumeInProgress = false
+            if (state == TransferPauseState.CANCELLED) {
+                throw CancellationException("Transfer cancelled")
+            }
             state = TransferPauseState.RUNNING
+            onState(TransferPauseState.RUNNING)
         }
-        onState(TransferPauseState.RUNNING)
     }
 
     fun awaitBetweenFiles(onState: (TransferPauseState) -> Unit) {
@@ -82,12 +91,14 @@ class TransferPauseController {
             }
             resumeRequested = false
             state = TransferPauseState.RUNNING
+            onState(TransferPauseState.RUNNING)
         }
-        onState(TransferPauseState.RUNNING)
     }
 
     fun cancel() = synchronized(lock) {
         state = TransferPauseState.CANCELLED
+        resumeRequested = false
+        resumeInProgress = false
         lock.notifyAll()
     }
 }
