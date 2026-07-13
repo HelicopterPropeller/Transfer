@@ -8,6 +8,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -130,6 +131,37 @@ class TransferBatchRunnerTest {
             org.junit.Assert.fail("Expected cancellation")
         } catch (_: CancellationException) {
             assertEquals(listOf("a"), calls)
+        }
+    }
+
+    @Test
+    fun `cancellation returned as failure is rethrown for a single file`() = runBlocking {
+        val cancellation = CancellationException("cancelled result")
+        val runner = TransferBatchRunner(TransferPauseController()) { _, _ ->
+            Result.failure(cancellation)
+        }
+
+        try {
+            runner.run(listOf(source("only", 1)), {}, {})
+            org.junit.Assert.fail("Expected cancellation")
+        } catch (actual: CancellationException) {
+            assertSame(cancellation, actual)
+        }
+    }
+
+    @Test
+    fun `controller cancelled by final sender is checked after it returns`() = runBlocking {
+        val controller = TransferPauseController()
+        val runner = TransferBatchRunner(controller) { _, _ ->
+            controller.cancel()
+            Result.failure(IOException("socket closed"))
+        }
+
+        try {
+            runner.run(listOf(source("only", 1)), {}, {})
+            org.junit.Assert.fail("Expected cancellation")
+        } catch (_: CancellationException) {
+            assertEquals(TransferPauseState.CANCELLED, controller.state)
         }
     }
 

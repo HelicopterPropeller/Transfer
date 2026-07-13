@@ -77,6 +77,10 @@ class TransferBatchRunner(
                 Result.failure(exception)
             }
 
+            val failure = result.exceptionOrNull()
+            if (failure is CancellationException) throw failure
+            throwIfCancelled()
+
             if (result.isSuccess) {
                 completedBytes = checkedAdd(
                     completedBytes,
@@ -92,7 +96,7 @@ class TransferBatchRunner(
                 )
                 failures += BatchFailure(
                     fileName = file.displayName,
-                    message = result.exceptionOrNull()?.message ?: "发送失败"
+                    message = failure?.message ?: "发送失败"
                 )
             }
         }
