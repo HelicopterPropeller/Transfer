@@ -30,8 +30,130 @@ import java.net.InetAddress
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class FileTransferSocketTest {
+    @Test
+    fun `pause lease is cumulative across verified chunk boundaries`() = runBlocking {
+        val clock = AtomicLong(0)
+        val server = RawServerHarness(
+            serverFactory = {
+                FileTransferServer(
+                    port = 0,
+                    store = it,
+                    pausedSessionLeaseMillis = 1_200,
+                    monotonicMillis = clock::get
+                )
+            }
+        )
+        try {
+            var secondPauseWaitMillis = Long.MAX_VALUE
+            val response = Socket(InetAddress.getLoopbackAddress(), server.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                TransferProtocol.writeHeader(
+                    output,
+                    TransferHeader(
+                        "raw.bin",
+                        "application/octet-stream",
+                        TransferProtocol.CHUNK_SIZE.toLong() * 2 + 1
+                    )
+                )
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(
+                    output,
+                    ChunkCodec.create(0, ByteArray(TransferProtocol.CHUNK_SIZE))
+                )
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+                clock.set(1_100)
+                TransferFrameCodec.writeType(output, TransferFrameType.RESUME)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(
+                    output,
+                    ChunkCodec.create(1, ByteArray(TransferProtocol.CHUNK_SIZE))
+                )
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+
+                val waitStarted = System.nanoTime()
+                val fatal = input.readUnsignedByte()
+                secondPauseWaitMillis = (System.nanoTime() - waitStarted) / 1_000_000
+                fatal
+            }
+
+            withTimeout(2_000) { server.terminal.await() }
+            assertEquals(TransferProtocol.FATAL, response)
+            assertTrue(
+                "Second pause waited ${secondPauseWaitMillis}ms instead of using the remaining budget",
+                secondPauseWaitMillis < 700
+            )
+            assertEquals(listOf("Paused session lease expired"), server.errors())
+            assertTrue(server.store.aborted)
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `verified ack permits only one pause resume round`() = runBlocking {
+        val server = RawServerHarness()
+        try {
+            val response = Socket(InetAddress.getLoopbackAddress(), server.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                TransferProtocol.writeHeader(
+                    output,
+                    TransferHeader(
+                        "raw.bin",
+                        "application/octet-stream",
+                        TransferProtocol.CHUNK_SIZE.toLong() + 1
+                    )
+                )
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(
+                    output,
+                    ChunkCodec.create(0, ByteArray(TransferProtocol.CHUNK_SIZE))
+                )
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+                TransferFrameCodec.writeType(output, TransferFrameType.RESUME)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                input.readUnsignedByte()
+            }
+
+            withTimeout(2_000) { server.terminal.await() }
+            assertEquals(TransferProtocol.FATAL, response)
+            assertEquals(
+                listOf("Pause requires a new verified chunk ACK"),
+                server.errors()
+            )
+            assertTrue(server.store.aborted)
+        } finally {
+            server.close()
+        }
+    }
+
     @Test
     fun `pause lease must be positive`() {
         org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {

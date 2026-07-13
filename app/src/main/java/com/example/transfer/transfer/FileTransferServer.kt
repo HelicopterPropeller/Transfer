@@ -34,7 +34,8 @@ class FileTransferServer(
     private val chunkVerifier: ChunkVerifier = ChunkVerifier.SHA256,
     private val onTransferStart: () -> Boolean = { true },
     private val onTransferEnd: () -> Unit = {},
-    private val pausedSessionLeaseMillis: Int = DEFAULT_PAUSED_SESSION_LEASE_MILLIS
+    private val pausedSessionLeaseMillis: Int = DEFAULT_PAUSED_SESSION_LEASE_MILLIS,
+    private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 }
 ) {
     init {
         require(pausedSessionLeaseMillis > 0) { "Paused session lease must be positive" }
@@ -125,6 +126,8 @@ class FileTransferServer(
         var received = 0L
         var index = 0
         var hasVerifiedChunkAck = false
+        var pauseEntitled = false
+        var remainingPauseLeaseMillis = pausedSessionLeaseMillis.toLong()
         while (received < total) {
             val expectedLength = minOf(TransferProtocol.CHUNK_SIZE.toLong(), total - received).toInt()
             var failures = 0
@@ -134,8 +137,17 @@ class FileTransferServer(
                     if (!hasVerifiedChunkAck) {
                         throw ProtocolException("Pause before first verified chunk ACK")
                     }
+                    if (!pauseEntitled) {
+                        throw ProtocolException("Pause requires a new verified chunk ACK")
+                    }
                     if (failures > 0) throw ProtocolException("Control frame during chunk retry")
-                    acknowledgePause(socket, input, output)
+                    pauseEntitled = false
+                    remainingPauseLeaseMillis = acknowledgePause(
+                        socket,
+                        input,
+                        output,
+                        remainingPauseLeaseMillis
+                    )
                     continue
                 }
                 if (type == TransferFrameType.RESUME) {
@@ -148,6 +160,7 @@ class FileTransferServer(
                     output.writeByte(TransferProtocol.ACK)
                     output.flush()
                     hasVerifiedChunkAck = true
+                    pauseEntitled = true
                     onProgress(handle.displayName, TransferProgress.percent(received, total))
                     break
                 }
@@ -163,18 +176,28 @@ class FileTransferServer(
     private fun acknowledgePause(
         socket: Socket,
         input: DataInputStream,
-        output: DataOutputStream
-    ) {
-        output.writeByte(TransferProtocol.CONTROL_ACK)
-        output.flush()
+        output: DataOutputStream,
+        remainingLeaseMillis: Long
+    ): Long {
+        if (remainingLeaseMillis <= 0) {
+            throw ProtocolException("Paused session lease expired")
+        }
         val originalTimeout = socket.soTimeout
-        socket.soTimeout = pausedSessionLeaseMillis
+        val pauseStartedAt = monotonicMillis()
+        socket.soTimeout = remainingLeaseMillis.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         try {
+            output.writeByte(TransferProtocol.CONTROL_ACK)
+            output.flush()
             if (TransferFrameCodec.readType(input) != TransferFrameType.RESUME) {
                 throw ProtocolException("Expected resume frame")
             }
+            val elapsed = (monotonicMillis() - pauseStartedAt).coerceAtLeast(0)
+            if (elapsed >= remainingLeaseMillis) {
+                throw ProtocolException("Paused session lease expired")
+            }
             output.writeByte(TransferProtocol.CONTROL_ACK)
             output.flush()
+            return remainingLeaseMillis - elapsed
         } catch (_: SocketTimeoutException) {
             throw ProtocolException("Paused session lease expired")
         } finally {
