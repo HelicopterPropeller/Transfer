@@ -17,4 +17,5 @@
     <string name="transfer_message">%1$d%% · %2$s</string>
     <string name="storage_permission_denied">未授予存储权限，Android 9 及以下无法接收文件</string>
     <string name="file_read_failed">无法读取所选文件</string>
+    <string name="notification_permission_denied">通知权限未授予，后台传输仍可运行，但通知可能不会显示在通知栏</string>
 </resources>

@@ -1,6 +1,9 @@
 package com.example.transfer.ui
 
 import com.example.transfer.discovery.DiscoveredDevice
+import com.example.transfer.service.ServiceTransfer
+import com.example.transfer.service.ServiceTransferState
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -31,5 +34,20 @@ class TransferUiReducerTest {
         var state = TransferUiState(devices = listOf(peer), selectedDeviceId = "peer")
         state = TransferUiReducer.withDevices(state, emptyList())
         assertNull(state.selectedDeviceId)
+    }
+
+    @Test
+    fun `service state maps progress and preserves selected file`() {
+        val file = SelectedFile("content://file", "a.txt", "text/plain", 4)
+        val current = TransferUiState(selectedFile = file)
+        val service = ServiceTransferState(
+            devices = listOf(peer),
+            serviceMessage = "后台运行中",
+            transfer = ServiceTransfer("接收", "movie.mp4", 55, "正在接收", true)
+        )
+        val result = TransferUiReducer.withServiceState(current, service)
+        assertEquals(file, result.selectedFile)
+        assertEquals(55, result.transfer?.progress)
+        assertEquals("后台运行中", result.serviceStatus)
     }
 }

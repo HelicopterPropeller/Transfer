@@ -1,6 +1,7 @@
 package com.example.transfer.ui
 
 import com.example.transfer.discovery.DiscoveredDevice
+import com.example.transfer.service.ServiceTransferState
 
 data class SelectedFile(
     val uri: String,
@@ -32,6 +33,14 @@ data class TransferUiState(
 }
 
 object TransferUiReducer {
+    fun withServiceState(state: TransferUiState, service: ServiceTransferState): TransferUiState {
+        val withDevices = withDevices(state, service.devices)
+        val transfer = service.transfer?.let {
+            TransferStatus(it.direction, it.fileName, it.progress, it.message, it.active)
+        }
+        return withDevices.copy(serviceStatus = service.serviceMessage, transfer = transfer)
+    }
+
     fun withDevices(state: TransferUiState, devices: List<DiscoveredDevice>): TransferUiState {
         val selected = state.selectedDeviceId?.takeIf { id -> devices.any { it.id == id } }
         return state.copy(devices = devices, selectedDeviceId = selected)

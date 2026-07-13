@@ -1,10 +1,14 @@
 package com.example.transfer
 
 import android.Manifest
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.provider.OpenableColumns
 import android.text.format.Formatter
 import android.view.LayoutInflater
@@ -22,6 +26,8 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.example.transfer.service.TransferForegroundService
+import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
@@ -29,6 +35,18 @@ import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
     private val viewModel: TransferViewModel by viewModels()
+    private var serviceBound = false
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val service = binder as? TransferServiceApi ?: return
+            serviceBound = true
+            viewModel.attachService(service)
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            serviceBound = false
+            viewModel.detachService()
+        }
+    }
 
     private lateinit var deviceNameText: TextView
     private lateinit var serviceStatusText: TextView
@@ -44,15 +62,9 @@ class MainActivity : AppCompatActivity() {
 
     private val openDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri ?: return@registerForActivityResult
-        runCatching {
-            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         val metadata = contentResolver.query(
-            uri,
-            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
-            null,
-            null,
-            null
+            uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null
         )?.use { cursor ->
             if (!cursor.moveToFirst()) return@use null
             val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -61,17 +73,15 @@ class MainActivity : AppCompatActivity() {
             val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else -1L
             Pair(name ?: "selected_file", size)
         }
-        if (metadata == null) {
-            viewModel.showMessage(getString(R.string.file_read_failed))
-        } else {
-            viewModel.selectFile(uri, metadata.first, contentResolver.getType(uri), metadata.second)
-        }
+        if (metadata == null) viewModel.showMessage(getString(R.string.file_read_failed))
+        else viewModel.selectFile(uri, metadata.first, contentResolver.getType(uri), metadata.second)
     }
 
-    private val requestStoragePermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (!granted) viewModel.showMessage(getString(R.string.storage_permission_denied))
+    private val requestStoragePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (!it) viewModel.showMessage(getString(R.string.storage_permission_denied))
+    }
+    private val requestNotificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (!it) viewModel.showMessage(getString(R.string.notification_permission_denied))
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -85,25 +95,33 @@ class MainActivity : AppCompatActivity() {
             insets
         }
         deviceNameText.text = viewModel.deviceName
-        findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener {
-            openDocument.launch(arrayOf("*/*"))
-        }
+        findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocument.launch(arrayOf("*/*")) }
         sendButton.setOnClickListener { viewModel.sendSelected() }
+        val serviceIntent = Intent(this, TransferForegroundService::class.java)
+            .setAction(TransferForegroundService.ACTION_START)
+        ContextCompat.startForegroundService(this, serviceIntent)
         requestLegacyStoragePermissionIfNeeded()
+        requestNotificationPermissionIfNeeded()
         lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
-                viewModel.state.collect(::render)
-            }
+            repeatOnLifecycle(Lifecycle.State.STARTED) { viewModel.state.collect(::render) }
         }
     }
 
     override fun onStart() {
         super.onStart()
-        viewModel.startForeground()
+        serviceBound = bindService(
+            Intent(this, TransferForegroundService::class.java),
+            serviceConnection,
+            Context.BIND_AUTO_CREATE
+        )
     }
 
     override fun onStop() {
-        viewModel.stopForeground()
+        viewModel.detachService()
+        if (serviceBound) {
+            unbindService(serviceConnection)
+            serviceBound = false
+        }
         super.onStop()
     }
 
@@ -126,17 +144,9 @@ class MainActivity : AppCompatActivity() {
         emptyDevicesText.visibility = if (state.devices.isEmpty()) View.VISIBLE else View.GONE
         deviceContainer.removeAllViews()
         state.devices.forEach { device ->
-            val row = LayoutInflater.from(this)
-                .inflate(R.layout.item_device, deviceContainer, false) as TextView
-            row.text = getString(
-                R.string.device_row,
-                device.name,
-                device.address.hostAddress.orEmpty(),
-                device.port
-            )
-            row.setBackgroundResource(
-                if (device.id == state.selectedDeviceId) R.drawable.bg_device_selected else R.drawable.bg_device
-            )
+            val row = LayoutInflater.from(this).inflate(R.layout.item_device, deviceContainer, false) as TextView
+            row.text = getString(R.string.device_row, device.name, device.address.hostAddress.orEmpty(), device.port)
+            row.setBackgroundResource(if (device.id == state.selectedDeviceId) R.drawable.bg_device_selected else R.drawable.bg_device)
             row.setOnClickListener { viewModel.selectDevice(device.id) }
             deviceContainer.addView(row)
         }
@@ -145,25 +155,28 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.selected_file, file.displayName, size)
         } ?: getString(R.string.no_file_selected)
         sendButton.isEnabled = state.canSend
-        val transfer = state.transfer
-        transferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
-        if (transfer != null) {
-            transferTitleText.text = if (transfer.direction.isBlank()) transfer.message else
-                getString(R.string.transfer_title, transfer.direction)
-            transferFileText.text = transfer.fileName
-            transferFileText.visibility = if (transfer.fileName.isBlank()) View.GONE else View.VISIBLE
-            transferProgress.progress = transfer.progress
-            transferProgress.visibility = if (transfer.active) View.VISIBLE else View.GONE
-            transferMessageText.text = getString(R.string.transfer_message, transfer.progress, transfer.message)
+        state.transfer.let { transfer ->
+            transferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
+            if (transfer != null) {
+                transferTitleText.text = if (transfer.direction.isBlank()) transfer.message else getString(R.string.transfer_title, transfer.direction)
+                transferFileText.text = transfer.fileName
+                transferFileText.visibility = if (transfer.fileName.isBlank()) View.GONE else View.VISIBLE
+                transferProgress.progress = transfer.progress
+                transferProgress.visibility = if (transfer.active) View.VISIBLE else View.GONE
+                transferMessageText.text = getString(R.string.transfer_message, transfer.progress, transfer.message)
+            }
         }
     }
 
     private fun requestLegacyStoragePermissionIfNeeded() {
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            requestStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        }
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) requestStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }

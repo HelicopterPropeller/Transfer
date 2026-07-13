@@ -1,0 +1,9 @@
+package com.example.transfer.service
+
+import com.example.transfer.ui.SelectedFile
+import kotlinx.coroutines.flow.StateFlow
+
+interface TransferServiceApi {
+    val state: StateFlow<ServiceTransferState>
+    fun send(deviceId: String, file: SelectedFile): Boolean
+}

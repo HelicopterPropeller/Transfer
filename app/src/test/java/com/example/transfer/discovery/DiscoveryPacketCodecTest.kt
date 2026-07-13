@@ -2,12 +2,14 @@ package com.example.transfer.discovery
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DiscoveryPacketCodecTest {
     @Test
     fun `packet round trips escaped device name`() {
         val encoded = DiscoveryPacketCodec.encode("id-1", "Pixel \"Lab\"\\A", 42043)
+        assertTrue(encoded.toString(Charsets.UTF_8).contains("\"version\":2"))
         assertEquals(
             DiscoveryPacket("id-1", "Pixel \"Lab\"\\A", 42043),
             DiscoveryPacketCodec.decode(encoded, encoded.size)
@@ -15,8 +17,8 @@ class DiscoveryPacketCodecTest {
     }
 
     @Test
-    fun `unknown version is rejected`() {
-        val bytes = """{"protocol":"transfer-mvp","version":2,"id":"a","name":"b","port":42043}"""
+    fun `legacy version is rejected`() {
+        val bytes = """{"protocol":"transfer-mvp","version":1,"id":"a","name":"b","port":42043}"""
             .toByteArray()
         assertNull(DiscoveryPacketCodec.decode(bytes, bytes.size))
     }

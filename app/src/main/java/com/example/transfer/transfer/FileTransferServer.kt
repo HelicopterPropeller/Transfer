@@ -1,5 +1,6 @@
 package com.example.transfer.transfer
 
+import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.storage.IncomingFileStore
 import com.example.transfer.storage.ReceivedFileHandle
@@ -12,13 +13,23 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
-import java.io.EOFException
 import java.net.ServerSocket
 import java.net.Socket
 
+fun interface ChunkVerifier {
+    fun matches(data: ByteArray, expectedDigest: ByteArray): Boolean
+
+    companion object {
+        val SHA256 = ChunkVerifier { data, digest -> ChunkCodec.sha256(data).contentEquals(digest) }
+    }
+}
+
 class FileTransferServer(
     private val port: Int = DEFAULT_PORT,
-    private val store: IncomingFileStore
+    private val store: IncomingFileStore,
+    private val chunkVerifier: ChunkVerifier = ChunkVerifier.SHA256,
+    private val onTransferStart: () -> Boolean = { true },
+    private val onTransferEnd: () -> Unit = {}
 ) {
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var activeSocket: Socket? = null
@@ -35,19 +46,18 @@ class FileTransferServer(
         job = scope.launch(Dispatchers.IO) {
             try {
                 ServerSocket(port).use { server ->
-                    server.reuseAddress = true
                     serverSocket = server
                     onStarted(server.localPort)
                     while (isActive) {
                         val socket = server.accept()
                         activeSocket = socket
                         runCatching { receive(socket, onProgress, onComplete) }
-                            .onFailure { if (isActive) onError(it.message ?: "接收文件失败") }
+                            .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
                         activeSocket = null
                     }
                 }
             } catch (error: Exception) {
-                if (isActive) onError(error.message ?: "接收服务启动失败")
+                if (isActive) onError(error.message ?: "Receive service failed")
             } finally {
                 serverSocket = null
                 activeSocket = null
@@ -74,49 +84,61 @@ class FileTransferServer(
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             var handle: ReceivedFileHandle? = null
+            var transferStarted = false
             try {
                 val header = TransferProtocol.readHeader(input)
+                if (!onTransferStart()) error("Another transfer is active")
+                transferStarted = true
                 handle = store.create(header.fileName, header.mimeType)
-                copyExactly(input, handle.output, header.fileSize) { progress ->
-                    onProgress(handle.displayName, progress)
-                }
+                receiveChunks(input, output, header.fileSize, handle, onProgress)
                 store.complete(handle)
-                output.writeByte(TransferProtocol.SUCCESS)
+                output.writeByte(TransferProtocol.COMPLETE)
                 output.flush()
                 onComplete(handle.displayName)
             } catch (error: Exception) {
                 handle?.let { runCatching { store.abort(it) } }
-                runCatching {
-                    output.writeByte(TransferProtocol.FAILURE)
-                    output.flush()
-                }
+                runCatching { output.writeByte(TransferProtocol.FATAL); output.flush() }
                 throw error
+            } finally {
+                if (transferStarted) onTransferEnd()
             }
         }
     }
 
-    private fun copyExactly(
-        input: java.io.InputStream,
-        output: java.io.OutputStream,
-        length: Long,
-        onProgress: (Int) -> Unit
+    private fun receiveChunks(
+        input: DataInputStream,
+        output: DataOutputStream,
+        total: Long,
+        handle: ReceivedFileHandle,
+        onProgress: (String, Int) -> Unit
     ) {
-        val buffer = ByteArray(BUFFER_SIZE)
         var received = 0L
-        if (length == 0L) onProgress(100)
-        while (received < length) {
-            val wanted = minOf(buffer.size.toLong(), length - received).toInt()
-            val count = input.read(buffer, 0, wanted)
-            if (count < 0) throw EOFException("文件传输提前中断")
-            output.write(buffer, 0, count)
-            received += count
-            onProgress(TransferProgress.percent(received, length))
+        var index = 0
+        while (received < total) {
+            val expectedLength = minOf(TransferProtocol.CHUNK_SIZE.toLong(), total - received).toInt()
+            var failures = 0
+            while (true) {
+                val frame = ChunkCodec.read(input, index, expectedLength)
+                if (chunkVerifier.matches(frame.data, frame.digest)) {
+                    handle.output.write(frame.data)
+                    received += frame.data.size
+                    output.writeByte(TransferProtocol.ACK)
+                    output.flush()
+                    onProgress(handle.displayName, TransferProgress.percent(received, total))
+                    break
+                }
+                failures++
+                output.writeByte(TransferProtocol.NACK)
+                output.flush()
+                if (failures >= MAX_ATTEMPTS) error("Chunk $index failed verification")
+            }
+            index++
         }
     }
 
     companion object {
         const val DEFAULT_PORT = 42043
         private const val SOCKET_TIMEOUT_MILLIS = 15_000
-        private const val BUFFER_SIZE = 64 * 1024
+        private const val MAX_ATTEMPTS = 3
     }
 }
