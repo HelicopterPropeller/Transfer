@@ -1,5 +1,7 @@
 package com.example.transfer.transfer
 
+import java.util.concurrent.CancellationException
+
 data class BatchTransferProgress(
     val fileIndex: Int,
     val fileCount: Int,
@@ -32,36 +34,62 @@ class TransferBatchRunner(
     ): BatchTransferResult {
         require(files.isNotEmpty())
 
-        val totalBytes = files.sumOf(SendFileSource::length)
+        val totalBytes = files.fold(0L) { total, file ->
+            require(file.length >= 0) { "File length must not be negative" }
+            checkedAdd(total, file.length, "Total file length exceeds Long.MAX_VALUE")
+        }
         var completedBytes = 0L
         var successCount = 0
         var lastFileProgress = 100
         val failures = mutableListOf<BatchFailure>()
 
         files.forEachIndexed { index, file ->
+            throwIfCancelled()
             pauseController.awaitBetweenFiles(onPauseState)
+            throwIfCancelled()
             lastFileProgress = if (file.length == 0L) 100 else 0
+            var confirmedBytes = 0L
 
-            val result = sendOne(file) { current ->
-                lastFileProgress = current.percent
-                onProgress(
-                    BatchTransferProgress(
-                        fileIndex = index + 1,
-                        fileCount = files.size,
-                        fileName = file.displayName,
-                        fileProgress = current.percent,
-                        batchProgress = TransferProgress.percent(
-                            completedBytes + current.confirmedBytes,
-                            totalBytes
+            val result = try {
+                sendOne(file) { current ->
+                    confirmedBytes = current.confirmedBytes.coerceIn(0, file.length)
+                    lastFileProgress = current.percent
+                    onProgress(
+                        BatchTransferProgress(
+                            fileIndex = index + 1,
+                            fileCount = files.size,
+                            fileName = file.displayName,
+                            fileProgress = current.percent,
+                            batchProgress = TransferProgress.percent(
+                                checkedAdd(
+                                    completedBytes,
+                                    confirmedBytes,
+                                    "Batch progress exceeds Long.MAX_VALUE"
+                                ),
+                                totalBytes
+                            )
                         )
                     )
-                )
+                }
+            } catch (exception: CancellationException) {
+                throw exception
+            } catch (exception: Exception) {
+                Result.failure(exception)
             }
 
-            completedBytes += file.length
             if (result.isSuccess) {
+                completedBytes = checkedAdd(
+                    completedBytes,
+                    file.length,
+                    "Completed byte count exceeds Long.MAX_VALUE"
+                )
                 successCount++
             } else {
+                completedBytes = checkedAdd(
+                    completedBytes,
+                    confirmedBytes,
+                    "Completed byte count exceeds Long.MAX_VALUE"
+                )
                 failures += BatchFailure(
                     fileName = file.displayName,
                     message = result.exceptionOrNull()?.message ?: "发送失败"
@@ -80,5 +108,17 @@ class TransferBatchRunner(
             )
         )
         return BatchTransferResult(successCount, failures)
+    }
+
+    private fun throwIfCancelled() {
+        if (pauseController.state == TransferPauseState.CANCELLED) {
+            throw CancellationException("Transfer cancelled")
+        }
+    }
+
+    private fun checkedAdd(left: Long, right: Long, message: String): Long = try {
+        Math.addExact(left, right)
+    } catch (exception: ArithmeticException) {
+        throw IllegalArgumentException(message, exception)
     }
 }

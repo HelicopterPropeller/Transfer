@@ -3,6 +3,7 @@ package com.example.transfer.transfer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -11,6 +12,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.util.concurrent.CancellationException
 
 class TransferBatchRunnerTest {
     @Test
@@ -54,6 +56,117 @@ class TransferBatchRunnerTest {
         assertEquals(50, snapshots[0].fileProgress)
         assertEquals(62, snapshots[1].batchProgress)
         assertEquals(50, snapshots[1].fileProgress)
+    }
+
+    @Test
+    fun `failed file carries only its confirmed bytes into next file progress`() = runBlocking {
+        val files = listOf(source("a", 10), source("b", 20), source("c", 30))
+        val runner = TransferBatchRunner(TransferPauseController()) { file, progress ->
+            when (file.displayName) {
+                "a" -> {
+                    progress(FileTransferProgress(10, 10))
+                    Result.success(Unit)
+                }
+                "b" -> {
+                    progress(FileTransferProgress(5, 20))
+                    Result.failure(IOException("partial"))
+                }
+                else -> {
+                    progress(FileTransferProgress(0, 30))
+                    Result.success(Unit)
+                }
+            }
+        }
+        val snapshots = mutableListOf<BatchTransferProgress>()
+
+        runner.run(files, snapshots::add) {}
+
+        val firstCProgress = snapshots.first { it.fileName == "c" }
+        assertEquals(25, firstCProgress.batchProgress)
+    }
+
+    @Test
+    fun `exception thrown by one sender is recorded and later files continue`() = runBlocking {
+        val calls = mutableListOf<String>()
+        val runner = TransferBatchRunner(TransferPauseController()) { file, _ ->
+            calls += file.displayName
+            when (file.displayName) {
+                "b" -> throw IOException("thrown")
+                else -> Result.success(Unit)
+            }
+        }
+
+        val result = runner.run(
+            listOf(source("a", 1), source("b", 1), source("c", 1)),
+            onProgress = {},
+            onPauseState = {}
+        )
+
+        assertEquals(listOf("a", "b", "c"), calls)
+        assertEquals(2, result.successCount)
+        assertEquals(listOf(BatchFailure("b", "thrown")), result.failures)
+    }
+
+    @Test
+    fun `cancel after current file prevents next file from starting`() = runBlocking {
+        val controller = TransferPauseController()
+        val calls = mutableListOf<String>()
+        val runner = TransferBatchRunner(controller) { file, _ ->
+            calls += file.displayName
+            if (file.displayName == "a") {
+                controller.cancel()
+                Result.failure(IOException("transport cancelled"))
+            } else {
+                Result.success(Unit)
+            }
+        }
+
+        try {
+            runner.run(
+                listOf(source("a", 1), source("b", 1)),
+                onProgress = {},
+                onPauseState = {}
+            )
+            org.junit.Assert.fail("Expected cancellation")
+        } catch (_: CancellationException) {
+            assertEquals(listOf("a"), calls)
+        }
+    }
+
+    @Test
+    fun `negative source length is rejected before sending`() = runBlocking {
+        var senderCalled = false
+        val runner = TransferBatchRunner(TransferPauseController()) { _, _ ->
+            senderCalled = true
+            Result.success(Unit)
+        }
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                runner.run(listOf(source("invalid", -1)), {}, {})
+            }
+        }
+        assertFalse(senderCalled)
+    }
+
+    @Test
+    fun `total length overflow is rejected before sending`() = runBlocking {
+        var senderCalled = false
+        val runner = TransferBatchRunner(TransferPauseController()) { _, _ ->
+            senderCalled = true
+            Result.success(Unit)
+        }
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                runner.run(
+                    listOf(source("huge", Long.MAX_VALUE), source("extra", 1)),
+                    {},
+                    {}
+                )
+            }
+        }
+        assertFalse(senderCalled)
     }
 
     @Test
@@ -115,13 +228,18 @@ class TransferBatchRunnerTest {
             )
         }
 
-        withTimeout(2_000) { paused.await() }
-        assertEquals(listOf("a"), calls)
-        assertFalse(secondStarted.isCompleted)
-        assertTrue(controller.requestResume())
-        withTimeout(2_000) { secondStarted.await() }
-        withTimeout(2_000) { batch.await() }
-        assertEquals(listOf("a", "b"), calls)
+        try {
+            withTimeout(2_000) { paused.await() }
+            assertEquals(listOf("a"), calls)
+            assertFalse(secondStarted.isCompleted)
+            assertTrue(controller.requestResume())
+            withTimeout(2_000) { secondStarted.await() }
+            withTimeout(2_000) { batch.await() }
+            assertEquals(listOf("a", "b"), calls)
+        } finally {
+            controller.cancel()
+            withTimeout(2_000) { batch.cancelAndJoin() }
+        }
     }
 
     private fun source(name: String, length: Long) = SendFileSource(
