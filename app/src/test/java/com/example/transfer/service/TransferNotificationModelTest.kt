@@ -96,6 +96,20 @@ class TransferNotificationModelTest {
     }
 
     @Test
+    fun `terminal action runs once and closes gate`() {
+        val gate = ServiceTerminationGate()
+        var terminalActions = 0
+        var laterActions = 0
+
+        assertTrue(gate.closeWithAction { terminalActions++ })
+        assertFalse(gate.closeWithAction { terminalActions++ })
+        assertFalse(gate.runIfOpen { laterActions++ })
+
+        assertEquals(1, terminalActions)
+        assertEquals(0, laterActions)
+    }
+
+    @Test
     fun `checked batch length rejects total overflow`() {
         assertNull(checkedBatchLength(listOf(Long.MAX_VALUE, 1L)))
     }

@@ -46,6 +46,7 @@ class TransferForegroundService : Service() {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val busy = AtomicBoolean(false)
+    private val cancellationStarted = AtomicBoolean(false)
     private val terminationGate = ServiceTerminationGate()
     private val mutableState = MutableStateFlow(ServiceTransferState())
     val state: StateFlow<ServiceTransferState> = mutableState.asStateFlow()
@@ -254,12 +255,16 @@ class TransferForegroundService : Service() {
 
     private fun publish(transform: (ServiceTransferState) -> ServiceTransferState) {
         terminationGate.runIfOpen {
-            mutableState.update(transform)
-            startForeground(
-                TransferNotificationFactory.NOTIFICATION_ID,
-                notificationFactory.build(TransferNotificationModel.from(mutableState.value))
-            )
+            publishNow(transform)
         }
+    }
+
+    private fun publishNow(transform: (ServiceTransferState) -> ServiceTransferState) {
+        mutableState.update(transform)
+        startForeground(
+            TransferNotificationFactory.NOTIFICATION_ID,
+            notificationFactory.build(TransferNotificationModel.from(mutableState.value))
+        )
     }
 
     private fun publishPauseState(controller: TransferPauseController) {
@@ -294,11 +299,17 @@ class TransferForegroundService : Service() {
     }
 
     private fun shutdown() {
-        if (!terminationGate.close()) return
+        terminationGate.close()
+        cancelResourcesOnce()
+    }
+
+    private fun cancelResourcesOnce() {
+        if (!cancellationStarted.compareAndSet(false, true)) return
         activePauseController?.cancel()
         client.cancelActive()
         if (::server.isInitialized) server.stop()
         if (::discovery.isInitialized) discovery.stop()
+        activeBatchJob?.cancel()
         serviceScope.cancel()
     }
 
@@ -308,9 +319,16 @@ class TransferForegroundService : Service() {
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        publish { it.copy(transfer = ServiceTransfer("", "", 0, "后台服务达到系统运行时限", false)) }
-        shutdown()
-        stopSelf()
+        try {
+            terminationGate.closeWithAction {
+                publishNow {
+                    it.copy(transfer = ServiceTransfer("", "", 0, "后台服务达到系统运行时限", false))
+                }
+            }
+        } finally {
+            cancelResourcesOnce()
+            stopSelf()
+        }
     }
 
     companion object {

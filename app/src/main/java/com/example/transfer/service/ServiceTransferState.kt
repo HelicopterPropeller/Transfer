@@ -32,6 +32,17 @@ internal class ServiceTerminationGate {
         }
     }
 
+    fun closeWithAction(action: () -> Unit): Boolean = synchronized(lock) {
+        if (closed) false else {
+            try {
+                action()
+            } finally {
+                closed = true
+            }
+            true
+        }
+    }
+
     fun runIfOpen(action: () -> Unit): Boolean = synchronized(lock) {
         if (closed) false else {
             action()
