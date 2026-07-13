@@ -1,5 +1,6 @@
 package com.example.transfer.service
 
+import com.example.transfer.transfer.TransferPauseState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -31,5 +32,45 @@ class TransferNotificationModelTest {
         assertEquals("接收完成", model.title)
         assertEquals("a.zip", model.text)
         assertFalse(model.showProgress)
+    }
+
+    @Test
+    fun `running batch offers pause with queue progress`() {
+        val transfer = ServiceTransfer(
+            "发送", "b.bin", 25, "正在发送", true,
+            fileIndex = 2, fileCount = 3, batchProgress = 50,
+            pauseState = TransferPauseState.RUNNING
+        )
+
+        val model = TransferNotificationModel.from(ServiceTransferState(transfer = transfer))
+
+        assertEquals("第 2/3 个 · b.bin · 50%", model.text)
+        assertEquals(TransferNotificationAction.PAUSE, model.action)
+    }
+
+    @Test
+    fun `paused outgoing transfer offers resume`() {
+        val transfer = ServiceTransfer(
+            "发送", "b.bin", 25, "已暂停", true,
+            pauseState = TransferPauseState.PAUSED
+        )
+
+        assertEquals(
+            TransferNotificationAction.RESUME,
+            TransferNotificationModel.from(ServiceTransferState(transfer = transfer)).action
+        )
+    }
+
+    @Test
+    fun `pausing outgoing transfer offers resume`() {
+        val transfer = ServiceTransfer(
+            "发送", "b.bin", 25, "正在暂停", true,
+            pauseState = TransferPauseState.PAUSING
+        )
+
+        assertEquals(
+            TransferNotificationAction.RESUME,
+            TransferNotificationModel.from(ServiceTransferState(transfer = transfer)).action
+        )
     }
 }

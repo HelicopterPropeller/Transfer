@@ -1,22 +1,47 @@
 package com.example.transfer.service
 
+import com.example.transfer.transfer.TransferPauseState
+
+enum class TransferNotificationAction { NONE, PAUSE, RESUME }
+
 data class TransferNotificationModel(
     val title: String,
     val text: String,
     val showProgress: Boolean,
-    val progress: Int = 0
+    val progress: Int = 0,
+    val action: TransferNotificationAction = TransferNotificationAction.NONE
 ) {
     companion object {
         fun from(state: ServiceTransferState): TransferNotificationModel {
             val transfer = state.transfer ?: return TransferNotificationModel(
                 "局域网互传运行中", "等待设备或文件", false
             )
-            if (transfer.active) return TransferNotificationModel(
-                "${transfer.direction}文件",
-                "${transfer.fileName} · ${transfer.progress}%",
-                true,
-                transfer.progress
-            )
+            if (transfer.active) {
+                val text = if (transfer.fileCount > 1) {
+                    "第 ${transfer.fileIndex}/${transfer.fileCount} 个 · ${transfer.fileName} · ${transfer.batchProgress}%"
+                } else {
+                    "${transfer.fileName} · ${transfer.progress}%"
+                }
+                val action = if (transfer.direction != "发送") {
+                    TransferNotificationAction.NONE
+                } else if (
+                    transfer.pauseState == TransferPauseState.PAUSING ||
+                    transfer.pauseState == TransferPauseState.PAUSED
+                ) {
+                    TransferNotificationAction.RESUME
+                } else if (transfer.pauseState == TransferPauseState.RUNNING) {
+                    TransferNotificationAction.PAUSE
+                } else {
+                    TransferNotificationAction.NONE
+                }
+                return TransferNotificationModel(
+                    "${transfer.direction}文件",
+                    text,
+                    true,
+                    transfer.batchProgress,
+                    action
+                )
+            }
             return TransferNotificationModel(
                 transfer.message,
                 transfer.fileName.ifBlank { state.serviceMessage },
