@@ -9,7 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
@@ -20,6 +20,7 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.net.InetAddress
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 
 class FileTransferSocketTest {
@@ -31,7 +32,7 @@ class FileTransferSocketTest {
         assertArrayEquals(bytes, result.store.bytes.toByteArray())
         assertEquals(100, result.progress.last().percent)
         assertTrue(result.store.completed)
-        result.close()
+        result.assertNoServerErrors()
     }
 
     @Test
@@ -44,7 +45,7 @@ class FileTransferSocketTest {
         assertTrue(result.sendResult.isSuccess)
         assertEquals(2, checks.get())
         assertEquals(listOf(FileTransferProgress(1024, 1024)), result.progress)
-        result.close()
+        result.assertNoServerErrors()
     }
 
     @Test
@@ -54,7 +55,18 @@ class FileTransferSocketTest {
         assertTrue(result.sendResult.isFailure)
         assertEquals(3, checks.get())
         assertTrue(result.store.aborted)
-        result.close()
+        assertEquals(listOf("Chunk 0 failed verification"), result.serverErrors)
+    }
+
+    @Test
+    fun `server failure is exposed by transfer result`() = runBlocking {
+        val result = transfer(
+            ByteArray(64) { 7 },
+            ChunkVerifier { _, _ -> error("synthetic server failure") }
+        )
+
+        assertTrue(result.sendResult.isFailure)
+        assertEquals(listOf("synthetic server failure"), result.serverErrors)
     }
 
     @Test
@@ -64,7 +76,7 @@ class FileTransferSocketTest {
         assertTrue(result.sendResult.isSuccess)
         assertEquals(listOf(FileTransferProgress(0, 0)), result.progress)
         assertTrue(result.store.completed)
-        result.close()
+        result.assertNoServerErrors()
     }
 
     @Test
@@ -98,7 +110,7 @@ class FileTransferSocketTest {
         val result = withTimeout(5_000) { transfer.await() }
         assertTrue(result.sendResult.isSuccess)
         assertArrayEquals(bytes, result.store.bytes.toByteArray())
-        result.close()
+        result.assertNoServerErrors()
     }
 
     @Test
@@ -118,7 +130,7 @@ class FileTransferSocketTest {
         assertArrayEquals(bytes, result.store.bytes.toByteArray())
         assertTrue(result.store.completed)
         assertEquals(TransferPauseState.PAUSING, controller.state)
-        result.close()
+        result.assertNoServerErrors()
     }
 
     private suspend fun transfer(
@@ -129,37 +141,56 @@ class FileTransferSocketTest {
         onPauseState: (TransferPauseState) -> Unit = {}
     ): TransferResult {
         val store = MemoryStore()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val scopeJob = SupervisorJob()
+        val scope = CoroutineScope(scopeJob + Dispatchers.IO)
         val ready = CompletableDeferred<Int>()
+        val terminal = CompletableDeferred<Unit>()
+        val serverErrors = Collections.synchronizedList(mutableListOf<String>())
         val server = FileTransferServer(0, store, verifier)
-        server.start(scope, { ready.complete(it) }, { _, _ -> }, {}, {})
+        server.start(
+            scope,
+            { ready.complete(it) },
+            { _, _ -> },
+            { terminal.complete(Unit) },
+            { error ->
+                serverErrors += error
+                terminal.complete(Unit)
+            }
+        )
         val progress = mutableListOf<FileTransferProgress>()
-        val sendResult = FileTransferClient().send(
-            InetAddress.getLoopbackAddress(),
-            withTimeout(3_000) { ready.await() },
-            SendFileSource("sample.bin", "application/octet-stream", bytes.size.toLong()) {
-                ByteArrayInputStream(bytes)
-            },
-            controller,
-            onPauseState
-        ) {
-            progress += it
-            onProgress(it)
+        try {
+            val sendResult = FileTransferClient().send(
+                InetAddress.getLoopbackAddress(),
+                withTimeout(3_000) { ready.await() },
+                SendFileSource("sample.bin", "application/octet-stream", bytes.size.toLong()) {
+                    ByteArrayInputStream(bytes)
+                },
+                controller,
+                onPauseState
+            ) {
+                progress += it
+                onProgress(it)
+            }
+            withTimeout(3_000) { terminal.await() }
+            return TransferResult(
+                store,
+                progress,
+                sendResult,
+                synchronized(serverErrors) { serverErrors.toList() }
+            )
+        } finally {
+            server.stop()
+            withTimeout(3_000) { scopeJob.cancelAndJoin() }
         }
-        return TransferResult(store, progress, sendResult, server, scope)
     }
 
     private data class TransferResult(
         val store: MemoryStore,
         val progress: List<FileTransferProgress>,
         val sendResult: Result<Unit>,
-        val server: FileTransferServer,
-        val scope: CoroutineScope
+        val serverErrors: List<String>
     ) {
-        fun close() {
-            server.stop()
-            scope.cancel()
-        }
+        fun assertNoServerErrors() = assertEquals(emptyList<String>(), serverErrors)
     }
 
     private class MemoryStore : IncomingFileStore {
