@@ -29,6 +29,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.transfer.service.TransferForegroundService
 import com.example.transfer.service.TransferServiceApi
+import com.example.transfer.ui.LatestSelectionRequest
 import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
@@ -39,6 +40,7 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
     private val viewModel: TransferViewModel by viewModels()
+    private val latestSelectionRequest = LatestSelectionRequest()
     private var serviceBound = false
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -68,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pauseResumeButton: MaterialButton
 
     private val openDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        val requestToken = latestSelectionRequest.nextToken()
         if (uris.isEmpty()) return@registerForActivityResult
         lifecycleScope.launch {
             val (files, skipped) = withContext(Dispatchers.IO) {
@@ -79,6 +82,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 readableFiles to skippedFiles
             }
+            if (!latestSelectionRequest.isLatest(requestToken)) return@launch
             val notice = skipped.takeIf { it > 0 }?.let { getString(R.string.files_skipped, it) }
             viewModel.selectFiles(files, notice)
         }

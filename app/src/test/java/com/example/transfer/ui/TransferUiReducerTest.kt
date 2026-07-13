@@ -155,4 +155,15 @@ class TransferUiReducerTest {
         assertEquals(files, result.selectedFiles)
         assertNull(result.notice)
     }
+
+    @Test
+    fun `only the latest selection request token can commit`() {
+        val requests = LatestSelectionRequest()
+
+        val token1 = requests.nextToken()
+        val token2 = requests.nextToken()
+
+        assertFalse(requests.isLatest(token1))
+        assertTrue(requests.isLatest(token2))
+    }
 }

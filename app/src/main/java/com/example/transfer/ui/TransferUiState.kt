@@ -11,6 +11,17 @@ data class SelectedFile(
     val size: Long
 )
 
+internal class LatestSelectionRequest {
+    private var generation = 0L
+
+    fun nextToken(): Long {
+        generation++
+        return generation
+    }
+
+    fun isLatest(token: Long): Boolean = token == generation
+}
+
 data class TransferStatus(
     val direction: String,
     val fileName: String,
