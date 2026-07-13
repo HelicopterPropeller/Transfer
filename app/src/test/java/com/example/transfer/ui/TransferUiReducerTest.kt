@@ -17,6 +17,38 @@ class TransferUiReducerTest {
     )
 
     @Test
+    fun `invalid selection does not persist uri permission`() {
+        val events = mutableListOf<String>()
+
+        val result = validateThenPersist(
+            validate = {
+                events += "validate"
+                null
+            },
+            persist = { events += "persist" }
+        )
+
+        assertNull(result)
+        assertEquals(listOf("validate"), events)
+    }
+
+    @Test
+    fun `valid selection persists only after validation`() {
+        val events = mutableListOf<String>()
+
+        val result = validateThenPersist(
+            validate = {
+                events += "validate"
+                "selected"
+            },
+            persist = { events += "persist" }
+        )
+
+        assertEquals("selected", result)
+        assertEquals(listOf("validate", "persist"), events)
+    }
+
+    @Test
     fun `send requires a non-empty valid file list`() {
         var state = TransferUiState()
         assertFalse(state.canSend)

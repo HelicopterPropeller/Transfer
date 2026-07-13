@@ -1,6 +1,9 @@
 package com.example.transfer.transfer
 
 import com.example.transfer.protocol.ChunkCodec
+import com.example.transfer.protocol.TransferFrameCodec
+import com.example.transfer.protocol.TransferFrameType
+import com.example.transfer.protocol.TransferHeader
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.storage.IncomingFileStore
 import com.example.transfer.storage.ReceivedFileHandle
@@ -19,11 +22,100 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.net.InetAddress
+import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 
 class FileTransferSocketTest {
+    @Test
+    fun `pause lease must be positive`() {
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            FileTransferServer(
+                port = 0,
+                store = MemoryStore(),
+                pausedSessionLeaseMillis = 0
+            )
+        }
+    }
+
+    @Test
+    fun `pause lease aborts when resume never arrives`() = runBlocking {
+        val server = RawServerHarness(
+            serverFactory = {
+                FileTransferServer(
+                    port = 0,
+                    store = it,
+                    pausedSessionLeaseMillis = 100
+                )
+            }
+        )
+        try {
+            val response = Socket(InetAddress.getLoopbackAddress(), server.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                TransferProtocol.writeHeader(
+                    output,
+                    TransferHeader(
+                        "raw.bin",
+                        "application/octet-stream",
+                        TransferProtocol.CHUNK_SIZE.toLong() + 1
+                    )
+                )
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(
+                    output,
+                    ChunkCodec.create(0, ByteArray(TransferProtocol.CHUNK_SIZE))
+                )
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+                input.readUnsignedByte()
+            }
+
+            withTimeout(2_000) { server.terminal.await() }
+            assertEquals(TransferProtocol.FATAL, response)
+            assertEquals(listOf("Paused session lease expired"), server.errors())
+            assertTrue(server.store.aborted)
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `pause before first verified chunk ack is rejected`() = runBlocking {
+        val server = RawServerHarness()
+        try {
+            val response = Socket(InetAddress.getLoopbackAddress(), server.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                TransferProtocol.writeHeader(
+                    output,
+                    TransferHeader("raw.bin", "application/octet-stream", 1)
+                )
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                input.readUnsignedByte()
+            }
+
+            withTimeout(2_000) { server.terminal.await() }
+            assertEquals(TransferProtocol.FATAL, response)
+            assertEquals(listOf("Pause before first verified chunk ACK"), server.errors())
+            assertTrue(server.store.aborted)
+        } finally {
+            server.close()
+        }
+    }
+
     @Test
     fun `streams multiple verified chunks`() = runBlocking {
         val bytes = ByteArray(TransferProtocol.CHUNK_SIZE * 2 + 123) { (it % 251).toByte() }
@@ -191,6 +283,40 @@ class FileTransferSocketTest {
         val serverErrors: List<String>
     ) {
         fun assertNoServerErrors() = assertEquals(emptyList<String>(), serverErrors)
+    }
+
+    private class RawServerHarness(
+        val store: MemoryStore = MemoryStore(),
+        serverFactory: (MemoryStore) -> FileTransferServer = { FileTransferServer(0, it) }
+    ) {
+        private val scopeJob = SupervisorJob()
+        private val scope = CoroutineScope(scopeJob + Dispatchers.IO)
+        private val ready = CompletableDeferred<Int>()
+        val terminal = CompletableDeferred<Unit>()
+        private val serverErrors = Collections.synchronizedList(mutableListOf<String>())
+        private val server = serverFactory(store)
+
+        init {
+            server.start(
+                scope,
+                { ready.complete(it) },
+                { _, _ -> },
+                { terminal.complete(Unit) },
+                { error ->
+                    serverErrors += error
+                    terminal.complete(Unit)
+                }
+            )
+        }
+
+        suspend fun port(): Int = withTimeout(2_000) { ready.await() }
+
+        fun errors(): List<String> = synchronized(serverErrors) { serverErrors.toList() }
+
+        suspend fun close() {
+            server.stop()
+            withTimeout(2_000) { scopeJob.cancelAndJoin() }
+        }
     }
 
     private class MemoryStore : IncomingFileStore {

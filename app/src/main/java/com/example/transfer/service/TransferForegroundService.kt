@@ -17,6 +17,7 @@ import com.example.transfer.transfer.SendFileSource
 import com.example.transfer.transfer.TransferBatchRunner
 import com.example.transfer.transfer.TransferPauseController
 import com.example.transfer.transfer.TransferPauseState
+import com.example.transfer.transfer.formatBatchCompletion
 import com.example.transfer.ui.SelectedFile
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
@@ -200,7 +201,7 @@ class TransferForegroundService : Service() {
                                 direction = "发送",
                                 fileName = files.last().displayName,
                                 progress = 100,
-                                message = "发送完成：成功 ${result.successCount}，失败 ${result.failures.size}",
+                                message = formatBatchCompletion(result),
                                 active = false,
                                 fileIndex = files.size,
                                 fileCount = files.size,

@@ -17,6 +17,73 @@ import java.util.concurrent.CancellationException
 
 class TransferBatchRunnerTest {
     @Test
+    fun `failure summary includes two details and remaining count`() {
+        val result = BatchTransferResult(
+            successCount = 1,
+            failures = listOf(
+                BatchFailure("a.txt", "broken"),
+                BatchFailure("b.txt", "denied"),
+                BatchFailure("c.txt", "offline")
+            )
+        )
+
+        assertEquals(
+            "发送完成：成功 1，失败 3；a.txt: broken；b.txt: denied；另有 1 项",
+            formatBatchCompletion(result)
+        )
+    }
+
+    @Test
+    fun `success summary does not add failure detail separator`() {
+        assertEquals(
+            "发送完成：成功 2，失败 0",
+            formatBatchCompletion(BatchTransferResult(2, emptyList()))
+        )
+    }
+
+    @Test
+    fun `resume control failure does not poison later files`() = runBlocking {
+        val controller = TransferPauseController()
+        val starts = mutableListOf<Pair<String, TransferPauseState>>()
+        val runner = TransferBatchRunner(controller) { file, _ ->
+            starts += file.displayName to controller.state
+            assertTrue(controller.requestPause())
+            assertTrue(controller.requestResume())
+            if (file.displayName == "a") {
+                controller.checkpoint(
+                    sendPause = {},
+                    sendResume = { throw IOException("resume control failed") },
+                    onState = {}
+                )
+            } else {
+                controller.checkpoint({}, {}, {})
+            }
+            Result.success(Unit)
+        }
+
+        val batch = async(Dispatchers.Default) {
+            runner.run(listOf(source("a", 1), source("b", 1)), {}, {})
+        }
+        try {
+            val result = withTimeout(2_000) { batch.await() }
+
+            assertEquals(
+                listOf(
+                    "a" to TransferPauseState.RUNNING,
+                    "b" to TransferPauseState.RUNNING
+                ),
+                starts
+            )
+            assertEquals(listOf(BatchFailure("a", "resume control failed")), result.failures)
+            assertEquals(1, result.successCount)
+            assertEquals(TransferPauseState.RUNNING, controller.state)
+        } finally {
+            if (!batch.isCompleted) controller.cancel()
+            withTimeout(2_000) { batch.cancelAndJoin() }
+        }
+    }
+
+    @Test
     fun `files run in order and failure does not stop queue`() = runBlocking {
         val calls = mutableListOf<String>()
         val files = listOf(source("a", 10), source("b", 20), source("c", 30))

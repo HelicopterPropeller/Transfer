@@ -32,6 +32,7 @@ import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.LatestSelectionRequest
 import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.TransferUiState
+import com.example.transfer.ui.validateThenPersist
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import kotlinx.coroutines.Dispatchers
@@ -198,7 +199,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun readSelectedFile(uri: Uri): SelectedFile? = runCatching {
-        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        validateThenPersist(
+            validate = { validateSelectedFile(uri) },
+            persist = {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+        )
+    }.getOrNull()
+
+    private fun validateSelectedFile(uri: Uri): SelectedFile? {
         val metadata = contentResolver.query(
             uri,
             arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
@@ -212,16 +224,16 @@ class MainActivity : AppCompatActivity() {
             val name = if (nameIndex >= 0 && !cursor.isNull(nameIndex)) cursor.getString(nameIndex) else null
             val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else -1L
             name?.takeIf(String::isNotBlank)?.let { it to size }
-        } ?: return@runCatching null
-        if (metadata.second < 0) return@runCatching null
-        contentResolver.openFileDescriptor(uri, "r")?.use { } ?: return@runCatching null
-        SelectedFile(
+        } ?: return null
+        if (metadata.second < 0) return null
+        contentResolver.openFileDescriptor(uri, "r")?.use { } ?: return null
+        return SelectedFile(
             uri.toString(),
             metadata.first,
             contentResolver.getType(uri).orEmpty().ifBlank { "application/octet-stream" },
             metadata.second
         )
-    }.getOrNull()
+    }
 
     private fun saturatingTotalSize(files: List<SelectedFile>): Long? {
         var total = 0L

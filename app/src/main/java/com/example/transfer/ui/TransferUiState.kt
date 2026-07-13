@@ -11,6 +11,15 @@ data class SelectedFile(
     val size: Long
 )
 
+internal fun <T> validateThenPersist(
+    validate: () -> T?,
+    persist: () -> Unit
+): T? {
+    val validated = validate() ?: return null
+    persist()
+    return validated
+}
+
 internal class LatestSelectionRequest {
     private var generation = 0L
 

@@ -63,7 +63,22 @@ class TransferPauseController {
             resumeRequested = false
             resumeInProgress = true
         }
-        sendResume()
+        try {
+            sendResume()
+        } catch (error: Throwable) {
+            val notifyRunning = synchronized(lock) {
+                resumeRequested = false
+                resumeInProgress = false
+                if (state == TransferPauseState.CANCELLED) {
+                    false
+                } else {
+                    state = TransferPauseState.RUNNING
+                    true
+                }
+            }
+            if (notifyRunning) onState(TransferPauseState.RUNNING)
+            throw error
+        }
         synchronized(lock) {
             resumeInProgress = false
             if (state == TransferPauseState.CANCELLED) {

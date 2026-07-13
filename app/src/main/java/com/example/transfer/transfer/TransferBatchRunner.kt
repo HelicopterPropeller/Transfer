@@ -20,6 +20,18 @@ data class BatchTransferResult(
     val failures: List<BatchFailure>
 )
 
+fun formatBatchCompletion(result: BatchTransferResult): String {
+    val summary = "发送完成：成功 ${result.successCount}，失败 ${result.failures.size}"
+    if (result.failures.isEmpty()) return summary
+    val shown = result.failures.take(FAILURE_SUMMARY_LIMIT)
+    val details = shown.joinToString("；") { "${it.fileName}: ${it.message}" }
+    val remaining = result.failures.size - shown.size
+    val suffix = if (remaining > 0) "；另有 $remaining 项" else ""
+    return "$summary；$details$suffix"
+}
+
+private const val FAILURE_SUMMARY_LIMIT = 2
+
 class TransferBatchRunner(
     private val pauseController: TransferPauseController,
     private val sendOne: suspend (

@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.io.IOException
 import java.util.Collections
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
@@ -13,6 +14,27 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 class TransferPauseControllerTest {
+    @Test
+    fun `resume failure resets controller and accepts another pause`() {
+        val controller = TransferPauseController()
+        val states = mutableListOf<TransferPauseState>()
+
+        assertTrue(controller.requestPause())
+        assertTrue(controller.requestResume())
+        val failure = org.junit.Assert.assertThrows(IOException::class.java) {
+            controller.checkpoint(
+                sendPause = {},
+                sendResume = { throw IOException("resume failed") },
+                onState = { states += it }
+            )
+        }
+
+        assertEquals("resume failed", failure.message)
+        assertEquals(TransferPauseState.RUNNING, controller.state)
+        assertEquals(listOf(TransferPauseState.RUNNING), states)
+        assertTrue(controller.requestPause())
+    }
+
     @Test
     fun `checkpoint pauses then resumes exactly once`() {
         val controller = TransferPauseController()
