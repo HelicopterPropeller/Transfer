@@ -114,4 +114,45 @@ class TransferUiReducerTest {
         assertEquals(TransferPauseState.PAUSING, result.transfer?.pauseState)
         assertEquals("后台运行中", result.serviceStatus)
     }
+
+    @Test
+    fun `service state preserves notice without changing pause controls`() {
+        val current = TransferUiState(notice = "2 个文件无法读取，已跳过")
+        val service = ServiceTransferState(transfer = ServiceTransfer(
+            "发送", "b.txt", 40, "已暂停", true,
+            fileIndex = 2, fileCount = 3, batchProgress = 50,
+            pauseState = TransferPauseState.PAUSED
+        ))
+
+        val result = TransferUiReducer.withServiceState(current, service)
+
+        assertEquals("2 个文件无法读取，已跳过", result.notice)
+        assertFalse(result.canPause)
+        assertTrue(result.canResume)
+    }
+
+    @Test
+    fun `selecting files replaces both selection and notice atomically`() {
+        val replacement = listOf(SelectedFile("content://new", "new.txt", "text/plain", 2))
+        val current = TransferUiState(
+            selectedFiles = listOf(SelectedFile("content://old", "old.txt", "text/plain", 1)),
+            notice = "old notice"
+        )
+
+        val result = TransferUiReducer.selectFiles(current, replacement, "new notice")
+
+        assertEquals(replacement, result.selectedFiles)
+        assertEquals("new notice", result.notice)
+    }
+
+    @Test
+    fun `successful file selection clears previous notice`() {
+        val current = TransferUiState(notice = "old notice")
+        val files = listOf(SelectedFile("content://new", "new.txt", "text/plain", 2))
+
+        val result = TransferUiReducer.selectFiles(current, files)
+
+        assertEquals(files, result.selectedFiles)
+        assertNull(result.notice)
+    }
 }

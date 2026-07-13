@@ -6,7 +6,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.SelectedFile
-import com.example.transfer.ui.TransferStatus
 import com.example.transfer.ui.TransferUiReducer
 import com.example.transfer.ui.TransferUiState
 import kotlinx.coroutines.Job
@@ -45,12 +44,12 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
         mutableState.update { TransferUiReducer.selectDevice(it, id) }
     }
 
-    fun selectFiles(files: List<SelectedFile>) {
-        mutableState.update { it.copy(selectedFiles = files) }
+    fun selectFiles(files: List<SelectedFile>, notice: String? = null) {
+        mutableState.update { TransferUiReducer.selectFiles(it, files, notice) }
     }
 
     fun showMessage(message: String) {
-        mutableState.update { it.copy(transfer = TransferStatus("", "", 0, message, false)) }
+        mutableState.update { it.copy(notice = message) }
     }
 
     fun sendSelected() {

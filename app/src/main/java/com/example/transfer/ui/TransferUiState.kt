@@ -27,6 +27,7 @@ data class TransferUiState(
     val devices: List<DiscoveredDevice> = emptyList(),
     val selectedDeviceId: String? = null,
     val selectedFiles: List<SelectedFile> = emptyList(),
+    val notice: String? = null,
     val serviceStatus: String = "正在启动接收服务…",
     val transfer: TransferStatus? = null
 ) {
@@ -68,4 +69,10 @@ object TransferUiReducer {
 
     fun selectDevice(state: TransferUiState, id: String): TransferUiState =
         state.copy(selectedDeviceId = id.takeIf { candidate -> state.devices.any { it.id == candidate } })
+
+    fun selectFiles(
+        state: TransferUiState,
+        files: List<SelectedFile>,
+        notice: String? = null
+    ): TransferUiState = state.copy(selectedFiles = files, notice = notice)
 }

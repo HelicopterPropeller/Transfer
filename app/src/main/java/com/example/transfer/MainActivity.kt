@@ -33,7 +33,9 @@ import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
     private val viewModel: TransferViewModel by viewModels()
@@ -55,6 +57,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var emptyDevicesText: TextView
     private lateinit var deviceContainer: LinearLayout
     private lateinit var selectedFileText: TextView
+    private lateinit var noticeText: TextView
     private lateinit var sendButton: MaterialButton
     private lateinit var transferCard: MaterialCardView
     private lateinit var transferTitleText: TextView
@@ -65,14 +68,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pauseResumeButton: MaterialButton
 
     private val openDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        val files = ArrayList<SelectedFile>(uris.size)
-        var skipped = 0
-        uris.forEach { uri ->
-            val file = readSelectedFile(uri)
-            if (file == null) skipped++ else files += file
+        if (uris.isEmpty()) return@registerForActivityResult
+        lifecycleScope.launch {
+            val (files, skipped) = withContext(Dispatchers.IO) {
+                val readableFiles = ArrayList<SelectedFile>(uris.size)
+                var skippedFiles = 0
+                uris.forEach { uri ->
+                    val file = readSelectedFile(uri)
+                    if (file == null) skippedFiles++ else readableFiles += file
+                }
+                readableFiles to skippedFiles
+            }
+            val notice = skipped.takeIf { it > 0 }?.let { getString(R.string.files_skipped, it) }
+            viewModel.selectFiles(files, notice)
         }
-        viewModel.selectFiles(files)
-        if (skipped > 0) viewModel.showMessage(getString(R.string.files_skipped, skipped))
     }
 
     private val requestStoragePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -130,6 +139,7 @@ class MainActivity : AppCompatActivity() {
         emptyDevicesText = findViewById(R.id.emptyDevicesText)
         deviceContainer = findViewById(R.id.deviceContainer)
         selectedFileText = findViewById(R.id.selectedFileText)
+        noticeText = findViewById(R.id.noticeText)
         sendButton = findViewById(R.id.sendButton)
         transferCard = findViewById(R.id.transferCard)
         transferTitleText = findViewById(R.id.transferTitleText)
@@ -158,6 +168,8 @@ class MainActivity : AppCompatActivity() {
             val size = total?.let { Formatter.formatFileSize(this, it) } ?: getString(R.string.unknown_size)
             getString(R.string.selected_files, state.selectedFiles.size, size)
         }
+        noticeText.text = state.notice.orEmpty()
+        noticeText.visibility = if (state.notice == null) View.GONE else View.VISIBLE
         sendButton.isEnabled = state.canSend
         state.transfer.let { transfer ->
             transferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
