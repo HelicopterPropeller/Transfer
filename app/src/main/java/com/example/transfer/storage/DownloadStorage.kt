@@ -48,7 +48,9 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
         handle.output.close()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && handle.uri != null) {
             val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-            context.contentResolver.update(handle.uri, values, null, null)
+            check(context.contentResolver.update(handle.uri, values, null, null) > 0) {
+                "Unable to publish received file"
+            }
             handle.uri.toString()
         } else {
             FileProvider.getUriForFile(

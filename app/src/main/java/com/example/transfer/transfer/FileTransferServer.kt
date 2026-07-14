@@ -100,6 +100,7 @@ class FileTransferServer(
             var handle: ReceivedFileHandle? = null
             var transferStarted = false
             var historyId: Long? = null
+            var committed = false
             try {
                 val header = TransferProtocol.readHeader(input)
                 if (!onTransferStart()) error("Another transfer is active")
@@ -115,14 +116,17 @@ class FileTransferServer(
                 handle = store.create(header.fileName, header.mimeType)
                 receiveChunks(socket, input, output, header.fileSize, handle, onProgress)
                 val receivedUri = store.complete(handle)
+                committed = true
                 historyBestEffort { history.succeed(historyId, receivedUri) }
                 output.writeByte(TransferProtocol.COMPLETE)
                 output.flush()
                 onComplete(handle.displayName)
             } catch (error: Exception) {
-                handle?.let { runCatching { store.abort(it) } }
-                withContext(NonCancellable) {
-                    runCatching { history.fail(historyId, error.message) }
+                if (!committed) {
+                    handle?.let { runCatching { store.abort(it) } }
+                    withContext(NonCancellable) {
+                        runCatching { history.fail(historyId, error.message) }
+                    }
                 }
                 runCatching { output.writeByte(TransferProtocol.FATAL); output.flush() }
                 throw error
