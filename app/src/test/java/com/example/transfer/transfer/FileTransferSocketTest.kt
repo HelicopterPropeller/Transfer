@@ -1,5 +1,7 @@
 package com.example.transfer.transfer
 
+import com.example.transfer.history.IncomingTransferHistory
+import com.example.transfer.history.TransferHistoryStatus
 import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.TransferFrameCodec
 import com.example.transfer.protocol.TransferFrameType
@@ -13,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
@@ -26,9 +29,11 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
 import java.util.Collections
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -246,6 +251,11 @@ class FileTransferSocketTest {
         assertArrayEquals(bytes, result.store.bytes.toByteArray())
         assertEquals(100, result.progress.last().percent)
         assertTrue(result.store.completed)
+        assertEquals(
+            listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.SUCCESS),
+            result.history.statuses
+        )
+        assertEquals("content://received/a.bin", result.history.lastReceivedUri)
         result.assertNoServerErrors()
     }
 
@@ -269,7 +279,159 @@ class FileTransferSocketTest {
         assertTrue(result.sendResult.isFailure)
         assertEquals(3, checks.get())
         assertTrue(result.store.aborted)
+        assertEquals(
+            listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.FAILED),
+            result.history.statuses
+        )
+        assertEquals(null, result.history.lastReceivedUri)
         assertEquals(listOf("Chunk 0 failed verification"), result.serverErrors)
+    }
+
+    @Test
+    fun `history failure never replaces original transfer failure`() = runBlocking {
+        val history = RecordingIncomingTransferHistory(failFailure = IOException("history unavailable"))
+
+        val result = transfer(
+            bytes = ByteArray(64) { 7 },
+            verifier = ChunkVerifier { _, _ -> error("original transfer failure") },
+            history = history
+        )
+
+        assertTrue(result.sendResult.isFailure)
+        assertTrue(result.store.aborted)
+        assertEquals(listOf("original transfer failure"), result.serverErrors)
+    }
+
+    @Test
+    fun `history cancellation after commit propagates without abort or failed history`() = runBlocking {
+        val cancellation = CancellationException("history cancelled")
+        val history = RecordingIncomingTransferHistory(succeedFailure = cancellation)
+
+        val result = transfer(ByteArray(0), history = history)
+
+        assertTrue(result.sendResult.isFailure)
+        assertTrue(result.store.committed)
+        assertFalse(result.store.aborted)
+        assertEquals(listOf(TransferHistoryStatus.IN_PROGRESS), history.statuses)
+        assertEquals(listOf("history cancelled"), result.serverErrors)
+    }
+
+    @Test
+    fun `protocol write failure after commit does not abort or fail successful history`() = runBlocking {
+        val completeEntered = CompletableDeferred<Unit>()
+        val releaseComplete = CompletableDeferred<Unit>()
+        val store = MemoryStore {
+            completeEntered.complete(Unit)
+            releaseComplete.await()
+        }
+        val history = RecordingIncomingTransferHistory()
+        val server = RawServerHarness(store) {
+            FileTransferServer(port = 0, store = it, history = history)
+        }
+        var socket: Socket? = null
+        try {
+            socket = Socket(InetAddress.getLoopbackAddress(), server.port())
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            TransferProtocol.writeHeader(
+                output,
+                TransferHeader("a.bin", "application/octet-stream", 0)
+            )
+            output.flush()
+
+            withTimeout(2_000) { completeEntered.await() }
+            socket.setSoLinger(true, 0)
+            socket.close()
+            socket = null
+            delay(100)
+            releaseComplete.complete(Unit)
+            withTimeout(2_000) { server.terminal.await() }
+
+            assertTrue(server.errors().isNotEmpty())
+            assertTrue(store.committed)
+            assertFalse(store.aborted)
+            assertEquals(
+                listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.SUCCESS),
+                history.statuses
+            )
+            assertEquals("content://received/a.bin", history.lastReceivedUri)
+        } finally {
+            releaseComplete.complete(Unit)
+            socket?.close()
+            server.close()
+        }
+    }
+
+    @Test
+    fun `disconnect before commit fails history and aborts destination`() = runBlocking {
+        val history = RecordingIncomingTransferHistory()
+        val createCompleted = CompletableDeferred<Unit>()
+        val server = RawServerHarness(
+            store = MemoryStore(onCreate = { createCompleted.complete(Unit) }),
+            serverFactory = {
+                FileTransferServer(port = 0, store = it, history = history)
+            }
+        )
+        try {
+            Socket(InetAddress.getLoopbackAddress(), server.port()).use { socket ->
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                TransferProtocol.writeHeader(
+                    output,
+                    TransferHeader("a.bin", "application/octet-stream", 4)
+                )
+                output.flush()
+                withTimeout(2_000) { createCompleted.await() }
+                socket.setSoLinger(true, 0)
+            }
+            withTimeout(2_000) { server.terminal.await() }
+
+            assertTrue(server.store.aborted)
+            assertFalse(server.store.committed)
+            assertEquals(
+                listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.FAILED),
+                history.statuses
+            )
+            assertEquals(null, history.lastReceivedUri)
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `stopping server during active receive cancels history and aborts destination`() = runBlocking {
+        val history = RecordingIncomingTransferHistory()
+        val createCompleted = CompletableDeferred<Unit>()
+        val server = RawServerHarness(
+            store = MemoryStore(onCreate = { createCompleted.complete(Unit) }),
+            serverFactory = {
+                FileTransferServer(port = 0, store = it, history = history)
+            }
+        )
+        var socket: Socket? = null
+        try {
+            socket = Socket(InetAddress.getLoopbackAddress(), server.port())
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            TransferProtocol.writeHeader(
+                output,
+                TransferHeader("a.bin", "application/octet-stream", 4)
+            )
+            output.flush()
+            withTimeout(2_000) { createCompleted.await() }
+
+            server.stop()
+            withTimeout(2_000) { history.terminal.await() }
+
+            assertTrue(server.store.aborted)
+            assertFalse(server.store.committed)
+            assertEquals(
+                listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.CANCELLED),
+                history.statuses
+            )
+            assertEquals(null, history.lastReceivedUri)
+            assertTrue(server.errors().isEmpty())
+        } finally {
+            socket?.close()
+            server.close()
+        }
     }
 
     @Test
@@ -352,7 +514,8 @@ class FileTransferSocketTest {
         verifier: ChunkVerifier = ChunkVerifier.SHA256,
         controller: TransferPauseController = TransferPauseController(),
         onProgress: (FileTransferProgress) -> Unit = {},
-        onPauseState: (TransferPauseState) -> Unit = {}
+        onPauseState: (TransferPauseState) -> Unit = {},
+        history: RecordingIncomingTransferHistory = RecordingIncomingTransferHistory()
     ): TransferResult {
         val store = MemoryStore()
         val scopeJob = SupervisorJob()
@@ -360,7 +523,7 @@ class FileTransferSocketTest {
         val ready = CompletableDeferred<Int>()
         val terminal = CompletableDeferred<Unit>()
         val serverErrors = Collections.synchronizedList(mutableListOf<String>())
-        val server = FileTransferServer(0, store, verifier)
+        val server = FileTransferServer(0, store, verifier, history = history)
         server.start(
             scope,
             { ready.complete(it) },
@@ -376,7 +539,7 @@ class FileTransferSocketTest {
             val sendResult = FileTransferClient().send(
                 InetAddress.getLoopbackAddress(),
                 withTimeout(3_000) { ready.await() },
-                SendFileSource("sample.bin", "application/octet-stream", bytes.size.toLong()) {
+                SendFileSource("a.bin", "application/octet-stream", bytes.size.toLong()) {
                     ByteArrayInputStream(bytes)
                 },
                 controller,
@@ -390,7 +553,8 @@ class FileTransferSocketTest {
                 store,
                 progress,
                 sendResult,
-                synchronized(serverErrors) { serverErrors.toList() }
+                synchronized(serverErrors) { serverErrors.toList() },
+                history
             )
         } finally {
             server.stop()
@@ -402,7 +566,8 @@ class FileTransferSocketTest {
         val store: MemoryStore,
         val progress: List<FileTransferProgress>,
         val sendResult: Result<Unit>,
-        val serverErrors: List<String>
+        val serverErrors: List<String>,
+        val history: RecordingIncomingTransferHistory
     ) {
         fun assertNoServerErrors() = assertEquals(emptyList<String>(), serverErrors)
     }
@@ -435,21 +600,74 @@ class FileTransferSocketTest {
 
         fun errors(): List<String> = synchronized(serverErrors) { serverErrors.toList() }
 
+        fun stop() = server.stop()
+
         suspend fun close() {
             server.stop()
             withTimeout(2_000) { scopeJob.cancelAndJoin() }
         }
     }
 
-    private class MemoryStore : IncomingFileStore {
+    private class MemoryStore(
+        private val onCreate: suspend () -> Unit = {},
+        private val onComplete: suspend () -> Unit = {}
+    ) : IncomingFileStore {
         val bytes = ByteArrayOutputStream()
         var completed = false
+        var committed = false
         var aborted = false
 
-        override suspend fun create(fileName: String, mimeType: String) =
-            ReceivedFileHandle(bytes, displayName = fileName)
+        override suspend fun create(fileName: String, mimeType: String): ReceivedFileHandle {
+            val handle = ReceivedFileHandle(bytes, displayName = fileName)
+            onCreate()
+            return handle
+        }
 
-        override suspend fun complete(handle: ReceivedFileHandle) { completed = true }
+        override suspend fun complete(handle: ReceivedFileHandle): String {
+            completed = true
+            committed = true
+            onComplete()
+            return "content://received/${handle.displayName}"
+        }
         override suspend fun abort(handle: ReceivedFileHandle) { aborted = true; bytes.reset() }
+    }
+
+    private class RecordingIncomingTransferHistory(
+        private val failFailure: Exception? = null,
+        private val succeedFailure: Exception? = null
+    ) : IncomingTransferHistory {
+        val statuses = mutableListOf<TransferHistoryStatus>()
+        val terminal = CompletableDeferred<Unit>()
+        var lastReceivedUri: String? = null
+
+        override suspend fun start(
+            fileName: String,
+            fileSize: Long,
+            mimeType: String,
+            peerAddress: String
+        ): Long {
+            statuses += TransferHistoryStatus.IN_PROGRESS
+            return 1L
+        }
+
+        override suspend fun succeed(historyId: Long?, receivedUri: String?) {
+            succeedFailure?.let { throw it }
+            statuses += TransferHistoryStatus.SUCCESS
+            lastReceivedUri = receivedUri
+            terminal.complete(Unit)
+        }
+
+        override suspend fun fail(historyId: Long?, errorMessage: String?) {
+            failFailure?.let { throw it }
+            statuses += TransferHistoryStatus.FAILED
+            lastReceivedUri = null
+            terminal.complete(Unit)
+        }
+
+        override suspend fun cancel(historyId: Long?, errorMessage: String?) {
+            statuses += TransferHistoryStatus.CANCELLED
+            lastReceivedUri = null
+            terminal.complete(Unit)
+        }
     }
 }

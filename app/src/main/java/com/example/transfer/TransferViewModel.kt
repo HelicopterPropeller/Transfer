@@ -48,6 +48,14 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
         mutableState.update { TransferUiReducer.selectFiles(it, files, notice) }
     }
 
+    fun restoreHistoryFile(file: SelectedFile, preferredPeerId: String?) {
+        mutableState.update { current ->
+            TransferUiReducer.restoreHistoryFile(current, file, preferredPeerId).copy(
+                notice = getApplication<Application>().getString(R.string.resend_file_ready)
+            )
+        }
+    }
+
     fun showMessage(message: String) {
         mutableState.update { it.copy(notice = message) }
     }

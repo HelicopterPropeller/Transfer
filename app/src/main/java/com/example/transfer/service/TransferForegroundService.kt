@@ -10,6 +10,11 @@ import android.os.PowerManager
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.example.transfer.discovery.DiscoveryManager
+import com.example.transfer.history.HistoryPeer
+import com.example.transfer.history.IncomingHistoryRecorder
+import com.example.transfer.history.OutgoingHistoryRecorder
+import com.example.transfer.history.TransferHistoryDatabase
+import com.example.transfer.history.TransferHistoryRepository
 import com.example.transfer.storage.DownloadStorage
 import com.example.transfer.transfer.FileTransferClient
 import com.example.transfer.transfer.FileTransferServer
@@ -47,7 +52,7 @@ class TransferForegroundService : Service() {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val busy = AtomicBoolean(false)
-    private val cancellationStarted = AtomicBoolean(false)
+    private val shutdownCoordinator = ServiceShutdownCoordinator()
     private val terminationGate = ServiceTerminationGate()
     private val mutableState = MutableStateFlow(ServiceTransferState())
     val state: StateFlow<ServiceTransferState> = mutableState.asStateFlow()
@@ -55,12 +60,23 @@ class TransferForegroundService : Service() {
     private lateinit var resourceGuard: TransferResourceGuard
     private lateinit var discovery: DiscoveryManager
     private lateinit var server: FileTransferServer
+    private lateinit var historyRepository: TransferHistoryRepository
+    private lateinit var outgoingHistoryRecorder: OutgoingHistoryRecorder
+    private lateinit var historyStartupGate: HistoryStartupGate
     private val client = FileTransferClient()
     @Volatile private var activePauseController: TransferPauseController? = null
     @Volatile private var activeBatchJob: Job? = null
+    @Volatile private var incomingStartupJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
+        historyRepository = TransferHistoryRepository(
+            TransferHistoryDatabase.getInstance(this).transferHistoryDao()
+        )
+        outgoingHistoryRecorder = OutgoingHistoryRecorder(historyRepository)
+        historyStartupGate = HistoryStartupGate(serviceScope) {
+            historyRepository.interruptActive()
+        }
         notificationFactory = TransferNotificationFactory(this).also { it.createChannel() }
         startForeground(
             TransferNotificationFactory.NOTIFICATION_ID,
@@ -78,18 +94,30 @@ class TransferForegroundService : Service() {
         server = FileTransferServer(
             store = DownloadStorage(this),
             onTransferStart = ::beginTransfer,
-            onTransferEnd = ::endTransfer
+            onTransferEnd = ::endTransfer,
+            history = IncomingHistoryRecorder(historyRepository) { address ->
+                val device = state.value.devices.firstOrNull {
+                    it.address.hostAddress == address
+                }
+                HistoryPeer(
+                    id = device?.id,
+                    name = device?.name,
+                    address = address
+                )
+            }
         )
-        server.start(
-            serviceScope,
-            { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
-            { name, progress -> publish { it.copy(transfer = ServiceTransfer("接收", name, progress, "正在接收", true)) } },
-            { name -> publish { it.copy(transfer = ServiceTransfer("接收", name, 100, "接收完成", false)) } },
-            { message -> publish {
-                if (it.transfer?.active == true) it
-                else it.copy(transfer = ServiceTransfer("接收", "", 0, message, false))
-            } }
-        )
+        incomingStartupJob = historyStartupGate.launchWhenReady {
+            server.start(
+                serviceScope,
+                { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
+                { name, progress -> publish { it.copy(transfer = ServiceTransfer("接收", name, progress, "正在接收", true)) } },
+                { name -> publish { it.copy(transfer = ServiceTransfer("接收", name, 100, "接收完成", false)) } },
+                { message -> publish {
+                    if (it.transfer?.active == true) it
+                    else it.copy(transfer = ServiceTransfer("接收", "", 0, message, false))
+                } }
+            )
+        }
         discovery.start(
             serviceScope,
             { devices -> publish { it.copy(devices = devices) } },
@@ -118,7 +146,12 @@ class TransferForegroundService : Service() {
             val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return@gate
             if (!beginTransfer()) return@gate
             val sources = files.map { file ->
-                SendFileSource(file.displayName, file.mimeType, file.size) {
+                SendFileSource(
+                    displayName = file.displayName,
+                    mimeType = file.mimeType,
+                    length = file.size,
+                    sourceUri = file.uri
+                ) {
                     contentResolver.openInputStream(file.uri.toUri()) ?: error("无法读取所选文件")
                 }
             }
@@ -155,18 +188,29 @@ class TransferForegroundService : Service() {
             }
             job = serviceScope.launch(start = CoroutineStart.LAZY) {
                 try {
+                    historyStartupGate.awaitReady()
                     val onPauseState: (TransferPauseState) -> Unit = {
                         publishPauseState(controller)
                     }
                     val runner = TransferBatchRunner(controller) { source, onProgress ->
-                        client.send(
-                            device.address,
-                            device.port,
-                            source,
-                            controller,
-                            onPauseState,
-                            onProgress
-                        )
+                        outgoingHistoryRecorder.send(
+                            source = source,
+                            peer = HistoryPeer(
+                                id = device.id,
+                                name = device.name,
+                                address = device.address.hostAddress
+                            ),
+                            controller = controller
+                        ) {
+                            client.send(
+                                device.address,
+                                device.port,
+                                source,
+                                controller,
+                                onPauseState,
+                                onProgress
+                            )
+                        }
                     }
                     val result = runner.run(
                         sources,
@@ -305,13 +349,21 @@ class TransferForegroundService : Service() {
     }
 
     private fun cancelResourcesOnce() {
-        if (!cancellationStarted.compareAndSet(false, true)) return
-        activePauseController?.cancel()
-        client.cancelActive()
-        if (::server.isInitialized) server.stop()
-        if (::discovery.isInitialized) discovery.stop()
-        activeBatchJob?.cancel()
-        serviceScope.cancel()
+        shutdownCoordinator.shutdown(
+            cancelOutgoing = {
+                activePauseController?.cancel()
+                client.cancelActive()
+                activeBatchJob?.cancel()
+            },
+            preventNewStarts = {
+                incomingStartupJob?.cancel()
+                serviceScope.cancel()
+            },
+            stopResources = {
+                if (::server.isInitialized) server.stop()
+                if (::discovery.isInitialized) discovery.stop()
+            }
+        )
     }
 
     override fun onDestroy() {

@@ -23,10 +23,23 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Transfer">
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <service
             android:name=".service.TransferForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <activity
+            android:name=".history.HistoryActivity"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true">

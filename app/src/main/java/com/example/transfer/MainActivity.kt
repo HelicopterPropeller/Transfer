@@ -6,11 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.provider.OpenableColumns
 import android.text.format.Formatter
 import android.view.LayoutInflater
 import android.view.View
@@ -22,17 +20,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.example.transfer.history.HistoryActivity
+import com.example.transfer.history.HistoryRetryContract
 import com.example.transfer.service.TransferForegroundService
 import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.LatestSelectionRequest
 import com.example.transfer.ui.SelectedFile
+import com.example.transfer.ui.SelectedFileResolver
 import com.example.transfer.ui.TransferUiState
-import com.example.transfer.ui.validateThenPersist
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +43,7 @@ import kotlinx.coroutines.withContext
 class MainActivity : AppCompatActivity() {
     private val viewModel: TransferViewModel by viewModels()
     private val latestSelectionRequest = LatestSelectionRequest()
+    private val selectedFileResolver by lazy { SelectedFileResolver(this) }
     private var serviceBound = false
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -71,21 +73,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pauseResumeButton: MaterialButton
 
     private val openDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        val requestToken = latestSelectionRequest.nextToken()
-        if (uris.isEmpty()) return@registerForActivityResult
+        val requestToken = latestSelectionRequest.nextTokenForSelection(uris.size)
+            ?: return@registerForActivityResult
         lifecycleScope.launch {
             val (files, skipped) = withContext(Dispatchers.IO) {
                 val readableFiles = ArrayList<SelectedFile>(uris.size)
                 var skippedFiles = 0
                 uris.forEach { uri ->
-                    val file = readSelectedFile(uri)
+                    val file = selectedFileResolver.resolve(uri, persistPermission = true)
                     if (file == null) skippedFiles++ else readableFiles += file
                 }
                 readableFiles to skippedFiles
             }
-            if (!latestSelectionRequest.isLatest(requestToken)) return@launch
             val notice = skipped.takeIf { it > 0 }?.let { getString(R.string.files_skipped, it) }
-            viewModel.selectFiles(files, notice)
+            latestSelectionRequest.completeIfLatest(
+                requestToken,
+                publish = { viewModel.selectFiles(files, notice) },
+                consume = { HistoryRetryContract.clear(intent) }
+            )
         }
     }
 
@@ -107,6 +112,10 @@ class MainActivity : AppCompatActivity() {
             insets
         }
         deviceNameText.text = viewModel.deviceName
+        findViewById<MaterialButton>(R.id.historyButton).setOnClickListener {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        restoreHistoryRetry(intent)
         findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocuments.launch(arrayOf("*/*")) }
         sendButton.setOnClickListener { viewModel.sendSelected() }
         pauseResumeButton.setOnClickListener { viewModel.togglePause() }
@@ -118,6 +127,12 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) { viewModel.state.collect(::render) }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        restoreHistoryRetry(intent)
     }
 
     override fun onStart() {
@@ -198,41 +213,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun readSelectedFile(uri: Uri): SelectedFile? = runCatching {
-        validateThenPersist(
-            validate = { validateSelectedFile(uri) },
-            persist = {
-                contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+    private fun restoreHistoryRetry(retryIntent: Intent) {
+        val request = HistoryRetryContract.read(retryIntent) ?: return
+        val requestToken = latestSelectionRequest.nextToken()
+        lifecycleScope.launch {
+            val file = withContext(Dispatchers.IO) {
+                selectedFileResolver.resolve(
+                    request.sourceUri.toUri(),
+                    persistPermission = false
                 )
             }
-        )
-    }.getOrNull()
-
-    private fun validateSelectedFile(uri: Uri): SelectedFile? {
-        val metadata = contentResolver.query(
-            uri,
-            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
-            null,
-            null,
-            null
-        )?.use { cursor ->
-            if (!cursor.moveToFirst()) return@use null
-            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-            val name = if (nameIndex >= 0 && !cursor.isNull(nameIndex)) cursor.getString(nameIndex) else null
-            val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else -1L
-            name?.takeIf(String::isNotBlank)?.let { it to size }
-        } ?: return null
-        if (metadata.second < 0) return null
-        contentResolver.openFileDescriptor(uri, "r")?.use { } ?: return null
-        return SelectedFile(
-            uri.toString(),
-            metadata.first,
-            contentResolver.getType(uri).orEmpty().ifBlank { "application/octet-stream" },
-            metadata.second
-        )
+            latestSelectionRequest.completeIfLatest(
+                requestToken,
+                publish = {
+                    if (file == null) {
+                        viewModel.showMessage(getString(R.string.history_source_unavailable))
+                    } else {
+                        viewModel.restoreHistoryFile(file, request.preferredPeerId)
+                    }
+                },
+                consume = { HistoryRetryContract.clear(retryIntent) }
+            )
+        }
     }
 
     private fun saturatingTotalSize(files: List<SelectedFile>): Long? {
@@ -259,4 +261,5 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
+
 }

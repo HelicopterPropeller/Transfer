@@ -4,6 +4,7 @@ import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransfer
 import com.example.transfer.service.ServiceTransferState
 import com.example.transfer.transfer.TransferPauseState
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -15,6 +16,38 @@ class TransferUiReducerTest {
     private val peer = DiscoveredDevice(
         "peer", "Pixel", InetAddress.getLoopbackAddress(), 42043, 1
     )
+    private val peerA = DiscoveredDevice(
+        "peer-a", "Pixel A", InetAddress.getByName("192.168.1.20"), 42043, 1
+    )
+    private val peerB = DiscoveredDevice(
+        "peer-b", "Pixel B", InetAddress.getByName("192.168.1.21"), 42043, 1
+    )
+    private val selectedFile = SelectedFile("content://a", "a.bin", "application/octet-stream", 4)
+
+    @Test
+    fun `history retry selects original peer when it later appears`() {
+        val restored = TransferUiReducer.restoreHistoryFile(
+            TransferUiState(), selectedFile, preferredPeerId = "peer-a"
+        )
+        assertNull(restored.selectedDeviceId)
+
+        val discovered = TransferUiReducer.withDevices(restored, listOf(peerA))
+
+        assertEquals("peer-a", discovered.selectedDeviceId)
+        assertEquals(listOf(selectedFile), discovered.selectedFiles)
+    }
+
+    @Test
+    fun `manual peer selection clears pending history preference`() {
+        val restored = TransferUiReducer.restoreHistoryFile(
+            TransferUiState(devices = listOf(peerA, peerB)), selectedFile, "peer-a"
+        )
+
+        val selected = TransferUiReducer.selectDevice(restored, "peer-b")
+
+        assertEquals("peer-b", selected.selectedDeviceId)
+        assertNull(selected.preferredDeviceId)
+    }
 
     @Test
     fun `invalid selection does not persist uri permission`() {
@@ -197,5 +230,67 @@ class TransferUiReducerTest {
 
         assertFalse(requests.isLatest(token1))
         assertTrue(requests.isLatest(token2))
+    }
+
+    @Test
+    fun `empty picker does not obsolete a pending history retry`() {
+        val requests = LatestSelectionRequest()
+        val retryToken = requests.nextToken()
+
+        val emptyPickerToken = requests.nextTokenForSelection(0)
+
+        assertNull(emptyPickerToken)
+        assertTrue(requests.isLatest(retryToken))
+    }
+
+    @Test
+    fun `current retry is consumed only after its result is published`() {
+        val requests = LatestSelectionRequest()
+        val token = requests.nextToken()
+        val events = mutableListOf<String>()
+
+        val completed = requests.completeIfLatest(
+            token,
+            publish = { events += "publish" },
+            consume = { events += "consume" }
+        )
+
+        assertTrue(completed)
+        assertEquals(listOf("publish", "consume"), events)
+    }
+
+    @Test
+    fun `obsolete retry cannot publish or consume a newer intent`() {
+        val requests = LatestSelectionRequest()
+        val obsoleteToken = requests.nextToken()
+        requests.nextToken()
+        val events = mutableListOf<String>()
+
+        val completed = requests.completeIfLatest(
+            obsoleteToken,
+            publish = { events += "publish" },
+            consume = { events += "consume" }
+        )
+
+        assertFalse(completed)
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun `canceled retry publication leaves its intent unconsumed`() {
+        val requests = LatestSelectionRequest()
+        val token = requests.nextToken()
+        var consumed = false
+
+        val result = runCatching {
+            requests.completeIfLatest(
+                token,
+                publish = { throw CancellationException("activity recreated") },
+                consume = { consumed = true }
+            )
+        }
+
+        assertTrue(result.exceptionOrNull() is CancellationException)
+        assertFalse(consumed)
     }
 }
