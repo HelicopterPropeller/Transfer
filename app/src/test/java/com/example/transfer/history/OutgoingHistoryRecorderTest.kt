@@ -2,6 +2,7 @@ package com.example.transfer.history
 
 import com.example.transfer.transfer.SendFileSource
 import com.example.transfer.transfer.TransferPauseController
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
@@ -81,6 +82,72 @@ class OutgoingHistoryRecorderTest {
     }
 
     @Test
+    fun `cancel during terminal result persistence still records cancelled and preserves result`() =
+        runBlocking {
+            val finishEntered = CompletableDeferred<Unit>()
+            val releaseFinish = CompletableDeferred<Unit>()
+            val store = RecordingHistoryStore(
+                beforeFinish = {
+                    finishEntered.complete(Unit)
+                    releaseFinish.await()
+                }
+            )
+            val controller = TransferPauseController().also { it.cancel() }
+            val failure = IOException("Socket closed")
+            val originalResult = Result.failure<Unit>(failure)
+            var returnedResult: Result<Unit>? = null
+            val parentJob = launch(start = CoroutineStart.UNDISPATCHED) {
+                returnedResult = OutgoingHistoryRecorder(store).send(
+                    source("content://a"),
+                    peer,
+                    controller
+                ) {
+                    originalResult
+                }
+            }
+
+            try {
+                finishEntered.await()
+                parentJob.cancel()
+                releaseFinish.complete(Unit)
+                parentJob.join()
+            } finally {
+                releaseFinish.complete(Unit)
+                parentJob.cancelAndJoin()
+            }
+
+            assertEquals(
+                listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.CANCELLED),
+                store.statuses
+            )
+            assertEquals(originalResult, returnedResult)
+            assertSame(failure, returnedResult?.exceptionOrNull())
+        }
+
+    @Test
+    fun `terminal persistence failures do not replace original result`() = runBlocking {
+        listOf(
+            IOException("history unavailable"),
+            CancellationException("history cancelled")
+        ).forEach { persistenceFailure ->
+            val store = RecordingHistoryStore(beforeFinish = { throw persistenceFailure })
+            val failure = IOException("Socket closed")
+            val originalResult = Result.failure<Unit>(failure)
+
+            val returnedResult = OutgoingHistoryRecorder(store).send(
+                source("content://a"),
+                peer,
+                TransferPauseController()
+            ) {
+                originalResult
+            }
+
+            assertEquals(originalResult, returnedResult)
+            assertSame(failure, returnedResult.exceptionOrNull())
+        }
+    }
+
+    @Test
     fun `history insert failure still sends file`() = runBlocking {
         var calls = 0
         val recorder = OutgoingHistoryRecorder(FailingStartHistoryStore())
@@ -149,6 +216,82 @@ class OutgoingHistoryRecorderTest {
             assertSame(cancellation, actual)
         }
     }
+
+    @Test
+    fun `terminal persistence failures do not replace original thrown exception`() = runBlocking {
+        listOf(
+            IOException("history unavailable"),
+            CancellationException("history cancelled")
+        ).forEach { persistenceFailure ->
+            var finishAttempts = 0
+            val store = RecordingHistoryStore(
+                beforeFinish = {
+                    finishAttempts++
+                    throw persistenceFailure
+                }
+            )
+            val transferFailure = IOException("transfer failed")
+
+            try {
+                OutgoingHistoryRecorder(store).send(
+                    source("content://a"),
+                    peer,
+                    TransferPauseController()
+                ) {
+                    throw transferFailure
+                }
+                fail("Expected transfer failure")
+            } catch (actual: Throwable) {
+                assertSame(transferFailure, actual)
+            }
+
+            assertEquals(1, finishAttempts)
+        }
+    }
+
+    @Test
+    fun `cancel during thrown failure persistence still records failed and preserves exception`() =
+        runBlocking {
+            val finishEntered = CompletableDeferred<Unit>()
+            val releaseFinish = CompletableDeferred<Unit>()
+            val store = RecordingHistoryStore(
+                beforeFinish = {
+                    finishEntered.complete(Unit)
+                    releaseFinish.await()
+                }
+            )
+            val transferFailure = IOException("transfer failed")
+            var caughtFailure: Throwable? = null
+            val parentJob = launch(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    OutgoingHistoryRecorder(store).send(
+                        source("content://a"),
+                        peer,
+                        TransferPauseController()
+                    ) {
+                        throw transferFailure
+                    }
+                } catch (actual: Throwable) {
+                    caughtFailure = actual
+                }
+            }
+
+            try {
+                finishEntered.await()
+                parentJob.cancel()
+                releaseFinish.complete(Unit)
+                parentJob.join()
+            } finally {
+                releaseFinish.complete(Unit)
+                parentJob.cancelAndJoin()
+            }
+
+            assertEquals(
+                listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.FAILED),
+                store.statuses
+            )
+            assertSame(transferFailure, caughtFailure)
+        }
 
     @Test
     fun `other thrown exception is recorded and rethrown`() = runBlocking {

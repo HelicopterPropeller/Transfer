@@ -14,6 +14,8 @@ interface IncomingTransferHistory {
 
     suspend fun fail(historyId: Long?, errorMessage: String?)
 
+    suspend fun cancel(historyId: Long?, errorMessage: String?)
+
     companion object {
         val None = object : IncomingTransferHistory {
             override suspend fun start(
@@ -25,6 +27,7 @@ interface IncomingTransferHistory {
 
             override suspend fun succeed(historyId: Long?, receivedUri: String?) = Unit
             override suspend fun fail(historyId: Long?, errorMessage: String?) = Unit
+            override suspend fun cancel(historyId: Long?, errorMessage: String?) = Unit
         }
     }
 }
@@ -72,6 +75,17 @@ class IncomingHistoryRecorder(
             store.finish(
                 id = historyId,
                 status = TransferHistoryStatus.FAILED,
+                errorMessage = errorMessage
+            )
+        }
+    }
+
+    override suspend fun cancel(historyId: Long?, errorMessage: String?) {
+        if (historyId == null) return
+        bestEffort {
+            store.finish(
+                id = historyId,
+                status = TransferHistoryStatus.CANCELLED,
                 errorMessage = errorMessage
             )
         }

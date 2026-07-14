@@ -22,6 +22,7 @@ import java.io.DataOutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.concurrent.atomic.AtomicReference
 
 fun interface ChunkVerifier {
     fun matches(data: ByteArray, expectedDigest: ByteArray): Boolean
@@ -46,7 +47,7 @@ class FileTransferServer(
     }
 
     @Volatile private var serverSocket: ServerSocket? = null
-    @Volatile private var activeSocket: Socket? = null
+    @Volatile private var activeReceive: ReceiveSession? = null
     private var job: Job? = null
 
     fun start(
@@ -64,35 +65,47 @@ class FileTransferServer(
                     onStarted(server.localPort)
                     while (isActive) {
                         val socket = server.accept()
-                        activeSocket = socket
-                        runCatching { receive(socket, onProgress, onComplete) }
-                            .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
-                        activeSocket = null
+                        val receiveSession = ReceiveSession(socket)
+                        activeReceive = receiveSession
+                        try {
+                            if (!isActive) {
+                                receiveSession.requestLocalStop()
+                                runCatching { socket.close() }
+                                break
+                            }
+                            runCatching { receive(receiveSession, onProgress, onComplete) }
+                                .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
+                        } finally {
+                            if (activeReceive === receiveSession) activeReceive = null
+                        }
                     }
                 }
             } catch (error: Exception) {
                 if (isActive) onError(error.message ?: "Receive service failed")
             } finally {
                 serverSocket = null
-                activeSocket = null
+                activeReceive = null
             }
         }
     }
 
     fun stop() {
+        val receiveSession = activeReceive
+        receiveSession?.requestLocalStop()
         job?.cancel()
-        runCatching { activeSocket?.close() }
+        runCatching { receiveSession?.socket?.close() }
         runCatching { serverSocket?.close() }
-        activeSocket = null
+        activeReceive = null
         serverSocket = null
         job = null
     }
 
     private suspend fun receive(
-        socket: Socket,
+        receiveSession: ReceiveSession,
         onProgress: (String, Int) -> Unit,
         onComplete: (String) -> Unit
     ) {
+        val socket = receiveSession.socket
         socket.use {
             socket.soTimeout = SOCKET_TIMEOUT_MILLIS
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
@@ -123,9 +136,16 @@ class FileTransferServer(
                 onComplete(handle.displayName)
             } catch (error: Exception) {
                 if (!committed) {
-                    handle?.let { runCatching { store.abort(it) } }
+                    val termination = receiveSession.classifyFailure(error)
                     withContext(NonCancellable) {
-                        runCatching { history.fail(historyId, error.message) }
+                        handle?.let { runCatching { store.abort(it) } }
+                        runCatching {
+                            if (termination == ReceiveTermination.LOCAL_STOP) {
+                                history.cancel(historyId, LOCAL_STOP_MESSAGE)
+                            } else {
+                                history.fail(historyId, error.message)
+                            }
+                        }
                     }
                 }
                 runCatching { output.writeByte(TransferProtocol.FATAL); output.flush() }
@@ -142,6 +162,30 @@ class FileTransferServer(
         throw error
     } catch (_: Exception) {
         null
+    }
+
+    private class ReceiveSession(val socket: Socket) {
+        private val termination = AtomicReference(ReceiveTermination.ACTIVE)
+
+        fun requestLocalStop() {
+            termination.compareAndSet(ReceiveTermination.ACTIVE, ReceiveTermination.LOCAL_STOP)
+        }
+
+        fun classifyFailure(error: Exception): ReceiveTermination {
+            val failure = if (error is kotlinx.coroutines.CancellationException) {
+                ReceiveTermination.LOCAL_STOP
+            } else {
+                ReceiveTermination.FAILURE
+            }
+            termination.compareAndSet(ReceiveTermination.ACTIVE, failure)
+            return termination.get()
+        }
+    }
+
+    private enum class ReceiveTermination {
+        ACTIVE,
+        LOCAL_STOP,
+        FAILURE
     }
 
     private fun receiveChunks(
@@ -239,5 +283,6 @@ class FileTransferServer(
         private const val DEFAULT_PAUSED_SESSION_LEASE_MILLIS = 30 * 60 * 1000
         private const val SOCKET_TIMEOUT_MILLIS = 15_000
         private const val MAX_ATTEMPTS = 3
+        private const val LOCAL_STOP_MESSAGE = "Receive service stopped"
     }
 }

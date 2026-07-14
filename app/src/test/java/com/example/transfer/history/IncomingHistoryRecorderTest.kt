@@ -65,6 +65,27 @@ class IncomingHistoryRecorderTest {
     }
 
     @Test
+    fun `cancelled incoming file records cancellation reason`() = runBlocking {
+        val store = IncomingRecordingHistoryStore()
+        val recorder = IncomingHistoryRecorder(store)
+        val historyId = recorder.start(
+            fileName = "a.bin",
+            fileSize = 4,
+            mimeType = "application/octet-stream",
+            peerAddress = "192.168.1.20"
+        )
+
+        recorder.cancel(historyId, "Receive service stopped")
+
+        assertEquals(
+            listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.CANCELLED),
+            store.statuses
+        )
+        assertEquals(listOf("Receive service stopped"), store.errorMessages)
+        assertEquals(listOf<String?>(null), store.receivedUris)
+    }
+
+    @Test
     fun `ordinary history failures are best effort`() = runBlocking {
         val recorder = IncomingHistoryRecorder(IncomingThrowingHistoryStore())
 
@@ -78,6 +99,7 @@ class IncomingHistoryRecorderTest {
         assertNull(historyId)
         recorder.succeed(1, "content://received/a.bin")
         recorder.fail(1, "Socket closed")
+        recorder.cancel(1, "Receive service stopped")
     }
 }
 

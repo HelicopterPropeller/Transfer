@@ -69,4 +69,54 @@ class HistoryStartupGateTest {
             owner.cancelAndJoin()
         }
     }
+
+    @Test
+    fun `start action waits for initialization release then runs`() = runBlocking {
+        val initializationStarted = CompletableDeferred<Unit>()
+        val releaseInitialization = CompletableDeferred<Unit>()
+        val startCalled = CompletableDeferred<Unit>()
+        val gate = HistoryStartupGate(this) {
+            initializationStarted.complete(Unit)
+            releaseInitialization.await()
+        }
+
+        val startJob = gate.launchWhenReady { startCalled.complete(Unit) }
+        initializationStarted.await()
+        assertFalse(startCalled.isCompleted)
+
+        releaseInitialization.complete(Unit)
+        startJob.join()
+        assertTrue(startCalled.isCompleted)
+    }
+
+    @Test
+    fun `ordinary initialization failure still runs start action`() = runBlocking {
+        val startCalled = CompletableDeferred<Unit>()
+        val gate = HistoryStartupGate(this) {
+            throw IOException("history unavailable")
+        }
+
+        gate.launchWhenReady { startCalled.complete(Unit) }.join()
+
+        assertTrue(startCalled.isCompleted)
+    }
+
+    @Test
+    fun `owner cancellation prevents pending start action`() = runBlocking {
+        val owner = Job()
+        val scope = CoroutineScope(Dispatchers.Default + owner)
+        val initializationStarted = CompletableDeferred<Unit>()
+        val startCalled = CompletableDeferred<Unit>()
+        val gate = HistoryStartupGate(scope) {
+            initializationStarted.complete(Unit)
+            awaitCancellation()
+        }
+        val startJob = gate.launchWhenReady { startCalled.complete(Unit) }
+        initializationStarted.await()
+
+        owner.cancel()
+        startJob.join()
+
+        assertFalse(startCalled.isCompleted)
+    }
 }

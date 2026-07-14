@@ -105,16 +105,18 @@ class TransferForegroundService : Service() {
                 )
             }
         )
-        server.start(
-            serviceScope,
-            { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
-            { name, progress -> publish { it.copy(transfer = ServiceTransfer("接收", name, progress, "正在接收", true)) } },
-            { name -> publish { it.copy(transfer = ServiceTransfer("接收", name, 100, "接收完成", false)) } },
-            { message -> publish {
-                if (it.transfer?.active == true) it
-                else it.copy(transfer = ServiceTransfer("接收", "", 0, message, false))
-            } }
-        )
+        historyStartupGate.launchWhenReady {
+            server.start(
+                serviceScope,
+                { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
+                { name, progress -> publish { it.copy(transfer = ServiceTransfer("接收", name, progress, "正在接收", true)) } },
+                { name -> publish { it.copy(transfer = ServiceTransfer("接收", name, 100, "接收完成", false)) } },
+                { message -> publish {
+                    if (it.transfer?.active == true) it
+                    else it.copy(transfer = ServiceTransfer("接收", "", 0, message, false))
+                } }
+            )
+        }
         discovery.start(
             serviceScope,
             { devices -> publish { it.copy(devices = devices) } },

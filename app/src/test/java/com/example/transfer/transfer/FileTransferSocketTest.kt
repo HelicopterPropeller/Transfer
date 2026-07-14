@@ -397,6 +397,44 @@ class FileTransferSocketTest {
     }
 
     @Test
+    fun `stopping server during active receive cancels history and aborts destination`() = runBlocking {
+        val history = RecordingIncomingTransferHistory()
+        val createCompleted = CompletableDeferred<Unit>()
+        val server = RawServerHarness(
+            store = MemoryStore(onCreate = { createCompleted.complete(Unit) }),
+            serverFactory = {
+                FileTransferServer(port = 0, store = it, history = history)
+            }
+        )
+        var socket: Socket? = null
+        try {
+            socket = Socket(InetAddress.getLoopbackAddress(), server.port())
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            TransferProtocol.writeHeader(
+                output,
+                TransferHeader("a.bin", "application/octet-stream", 4)
+            )
+            output.flush()
+            withTimeout(2_000) { createCompleted.await() }
+
+            server.stop()
+            withTimeout(2_000) { history.terminal.await() }
+
+            assertTrue(server.store.aborted)
+            assertFalse(server.store.committed)
+            assertEquals(
+                listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.CANCELLED),
+                history.statuses
+            )
+            assertEquals(null, history.lastReceivedUri)
+            assertTrue(server.errors().isEmpty())
+        } finally {
+            socket?.close()
+            server.close()
+        }
+    }
+
+    @Test
     fun `server failure is exposed by transfer result`() = runBlocking {
         val result = transfer(
             ByteArray(64) { 7 },
@@ -562,6 +600,8 @@ class FileTransferSocketTest {
 
         fun errors(): List<String> = synchronized(serverErrors) { serverErrors.toList() }
 
+        fun stop() = server.stop()
+
         suspend fun close() {
             server.stop()
             withTimeout(2_000) { scopeJob.cancelAndJoin() }
@@ -597,6 +637,7 @@ class FileTransferSocketTest {
         private val succeedFailure: Exception? = null
     ) : IncomingTransferHistory {
         val statuses = mutableListOf<TransferHistoryStatus>()
+        val terminal = CompletableDeferred<Unit>()
         var lastReceivedUri: String? = null
 
         override suspend fun start(
@@ -613,12 +654,20 @@ class FileTransferSocketTest {
             succeedFailure?.let { throw it }
             statuses += TransferHistoryStatus.SUCCESS
             lastReceivedUri = receivedUri
+            terminal.complete(Unit)
         }
 
         override suspend fun fail(historyId: Long?, errorMessage: String?) {
             failFailure?.let { throw it }
             statuses += TransferHistoryStatus.FAILED
             lastReceivedUri = null
+            terminal.complete(Unit)
+        }
+
+        override suspend fun cancel(historyId: Long?, errorMessage: String?) {
+            statuses += TransferHistoryStatus.CANCELLED
+            lastReceivedUri = null
+            terminal.complete(Unit)
         }
     }
 }

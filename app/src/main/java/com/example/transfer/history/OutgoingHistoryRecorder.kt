@@ -38,16 +38,10 @@ class OutgoingHistoryRecorder(
         val result = try {
             block()
         } catch (exception: CancellationException) {
-            try {
-                withContext(NonCancellable) {
-                    finish(historyId, TransferHistoryStatus.CANCELLED, exception.message)
-                }
-            } catch (_: Exception) {
-                // Preserve the transfer cancellation even if terminal persistence fails.
-            }
+            finishBestEffort(historyId, TransferHistoryStatus.CANCELLED, exception.message)
             throw exception
         } catch (exception: Exception) {
-            finish(historyId, TransferHistoryStatus.FAILED, exception.message)
+            finishBestEffort(historyId, TransferHistoryStatus.FAILED, exception.message)
             throw exception
         }
 
@@ -56,8 +50,22 @@ class OutgoingHistoryRecorder(
             controller.state == TransferPauseState.CANCELLED -> TransferHistoryStatus.CANCELLED
             else -> TransferHistoryStatus.FAILED
         }
-        finish(historyId, terminal, result.exceptionOrNull()?.message)
+        finishBestEffort(historyId, terminal, result.exceptionOrNull()?.message)
         return result
+    }
+
+    private suspend fun finishBestEffort(
+        historyId: Long?,
+        status: TransferHistoryStatus,
+        errorMessage: String?
+    ) {
+        try {
+            withContext(NonCancellable) {
+                finish(historyId, status, errorMessage)
+            }
+        } catch (_: Exception) {
+            // A terminal history write must not replace the transfer result or cancellation.
+        }
     }
 
     private suspend fun finish(
