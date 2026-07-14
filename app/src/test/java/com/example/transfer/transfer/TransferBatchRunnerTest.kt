@@ -345,6 +345,7 @@ class TransferBatchRunnerTest {
         displayName = name,
         mimeType = "application/octet-stream",
         length = length,
+        sourceUri = "content://$name",
         openStream = { ByteArrayInputStream(ByteArray(0)) }
     )
 }
