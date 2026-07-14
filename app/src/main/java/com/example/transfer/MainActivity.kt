@@ -212,7 +212,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun restoreHistoryRetry(retryIntent: Intent) {
         val request = HistoryRetryContract.read(retryIntent) ?: return
-        HistoryRetryContract.clear(retryIntent)
         val requestToken = latestSelectionRequest.nextToken()
         lifecycleScope.launch {
             val file = withContext(Dispatchers.IO) {
@@ -221,12 +220,17 @@ class MainActivity : AppCompatActivity() {
                     persistPermission = false
                 )
             }
-            if (!latestSelectionRequest.isLatest(requestToken)) return@launch
-            if (file == null) {
-                viewModel.showMessage(getString(R.string.history_source_unavailable))
-            } else {
-                viewModel.restoreHistoryFile(file, request.preferredPeerId)
-            }
+            latestSelectionRequest.completeIfLatest(
+                requestToken,
+                publish = {
+                    if (file == null) {
+                        viewModel.showMessage(getString(R.string.history_source_unavailable))
+                    } else {
+                        viewModel.restoreHistoryFile(file, request.preferredPeerId)
+                    }
+                },
+                consume = { HistoryRetryContract.clear(retryIntent) }
+            )
         }
     }
 

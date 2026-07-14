@@ -15,7 +15,6 @@ internal enum class HistoryOpenError {
 
 internal interface HistoryFileOpener {
     fun ensureReadable(uri: String)
-    fun hasViewHandler(uri: String, mimeType: String): Boolean
     fun open(uri: String, mimeType: String)
 }
 
@@ -65,12 +64,8 @@ object HistoryFileActions {
         val resolvedMimeType = mimeType.ifBlank { DEFAULT_MIME_TYPE }
         return try {
             opener.ensureReadable(uri)
-            if (!opener.hasViewHandler(uri, resolvedMimeType)) {
-                HistoryOpenError.NO_HANDLER
-            } else {
-                opener.open(uri, resolvedMimeType)
-                null
-            }
+            opener.open(uri, resolvedMimeType)
+            null
         } catch (_: ActivityNotFoundException) {
             HistoryOpenError.NO_HANDLER
         } catch (_: SecurityException) {
@@ -95,9 +90,6 @@ object HistoryFileActions {
             context.contentResolver.openFileDescriptor(uri.toUri(), "r")?.use { }
                 ?: throw FileNotFoundException(uri)
         }
-
-        override fun hasViewHandler(uri: String, mimeType: String): Boolean =
-            viewIntent(uri, mimeType).resolveActivity(context.packageManager) != null
 
         override fun open(uri: String, mimeType: String) {
             context.startActivity(viewIntent(uri, mimeType))

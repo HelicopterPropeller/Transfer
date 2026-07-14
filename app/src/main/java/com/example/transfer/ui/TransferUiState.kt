@@ -29,6 +29,17 @@ internal class LatestSelectionRequest {
     }
 
     fun isLatest(token: Long): Boolean = token == generation
+
+    fun completeIfLatest(
+        token: Long,
+        publish: () -> Unit,
+        consume: () -> Unit
+    ): Boolean {
+        if (!isLatest(token)) return false
+        publish()
+        consume()
+        return true
+    }
 }
 
 data class TransferStatus(

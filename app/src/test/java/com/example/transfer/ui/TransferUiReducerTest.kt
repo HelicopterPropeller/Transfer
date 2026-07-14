@@ -4,6 +4,7 @@ import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransfer
 import com.example.transfer.service.ServiceTransferState
 import com.example.transfer.transfer.TransferPauseState
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -229,5 +230,56 @@ class TransferUiReducerTest {
 
         assertFalse(requests.isLatest(token1))
         assertTrue(requests.isLatest(token2))
+    }
+
+    @Test
+    fun `current retry is consumed only after its result is published`() {
+        val requests = LatestSelectionRequest()
+        val token = requests.nextToken()
+        val events = mutableListOf<String>()
+
+        val completed = requests.completeIfLatest(
+            token,
+            publish = { events += "publish" },
+            consume = { events += "consume" }
+        )
+
+        assertTrue(completed)
+        assertEquals(listOf("publish", "consume"), events)
+    }
+
+    @Test
+    fun `obsolete retry cannot publish or consume a newer intent`() {
+        val requests = LatestSelectionRequest()
+        val obsoleteToken = requests.nextToken()
+        requests.nextToken()
+        val events = mutableListOf<String>()
+
+        val completed = requests.completeIfLatest(
+            obsoleteToken,
+            publish = { events += "publish" },
+            consume = { events += "consume" }
+        )
+
+        assertFalse(completed)
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun `canceled retry publication leaves its intent unconsumed`() {
+        val requests = LatestSelectionRequest()
+        val token = requests.nextToken()
+        var consumed = false
+
+        val result = runCatching {
+            requests.completeIfLatest(
+                token,
+                publish = { throw CancellationException("activity recreated") },
+                consume = { consumed = true }
+            )
+        }
+
+        assertTrue(result.exceptionOrNull() is CancellationException)
+        assertFalse(consumed)
     }
 }

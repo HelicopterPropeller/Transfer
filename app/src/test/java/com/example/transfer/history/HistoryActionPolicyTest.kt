@@ -1,5 +1,6 @@
 package com.example.transfer.history
 
+import android.content.ActivityNotFoundException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -46,7 +47,9 @@ class HistoryActionPolicyTest {
 
     @Test
     fun `missing view handler returns no application`() {
-        val opener = FakeHistoryFileOpener(hasHandler = false)
+        val opener = FakeHistoryFileOpener(
+            openFailure = ActivityNotFoundException("missing")
+        )
 
         assertEquals(
             HistoryOpenError.NO_HANDLER,
@@ -78,8 +81,8 @@ class HistoryActionPolicyTest {
 }
 
 private class FakeHistoryFileOpener(
-    private val hasHandler: Boolean = true,
-    private val readFailure: Exception? = null
+    private val readFailure: Exception? = null,
+    private val openFailure: Exception? = null
 ) : HistoryFileOpener {
     var openedUri: String? = null
     var openedMimeType: String? = null
@@ -88,9 +91,8 @@ private class FakeHistoryFileOpener(
         readFailure?.let { throw it }
     }
 
-    override fun hasViewHandler(uri: String, mimeType: String): Boolean = hasHandler
-
     override fun open(uri: String, mimeType: String) {
+        openFailure?.let { throw it }
         openedUri = uri
         openedMimeType = mimeType
     }
