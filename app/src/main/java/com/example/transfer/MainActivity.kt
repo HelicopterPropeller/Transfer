@@ -27,6 +27,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.example.transfer.history.HistoryActivity
 import com.example.transfer.service.TransferForegroundService
 import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.LatestSelectionRequest
@@ -107,6 +108,10 @@ class MainActivity : AppCompatActivity() {
             insets
         }
         deviceNameText.text = viewModel.deviceName
+        findViewById<MaterialButton>(R.id.historyButton).setOnClickListener {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        selectResendFileIfPresent()
         findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocuments.launch(arrayOf("*/*")) }
         sendButton.setOnClickListener { viewModel.sendSelected() }
         pauseResumeButton.setOnClickListener { viewModel.togglePause() }
@@ -210,6 +215,20 @@ class MainActivity : AppCompatActivity() {
         )
     }.getOrNull()
 
+    private fun selectResendFileIfPresent() {
+        val uri = intent.getStringExtra(EXTRA_RESEND_URI) ?: return
+        val name = intent.getStringExtra(EXTRA_RESEND_NAME)?.takeIf(String::isNotBlank) ?: return
+        val mimeType = intent.getStringExtra(EXTRA_RESEND_MIME_TYPE)
+            ?.takeIf(String::isNotBlank)
+            ?: "application/octet-stream"
+        val size = intent.getLongExtra(EXTRA_RESEND_SIZE, -1L)
+        if (size < 0) return
+        viewModel.selectFiles(
+            listOf(SelectedFile(uri, name, mimeType, size)),
+            getString(R.string.resend_file_ready)
+        )
+    }
+
     private fun validateSelectedFile(uri: Uri): SelectedFile? {
         val metadata = contentResolver.query(
             uri,
@@ -258,5 +277,12 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    companion object {
+        const val EXTRA_RESEND_URI = "com.example.transfer.extra.RESEND_URI"
+        const val EXTRA_RESEND_NAME = "com.example.transfer.extra.RESEND_NAME"
+        const val EXTRA_RESEND_MIME_TYPE = "com.example.transfer.extra.RESEND_MIME_TYPE"
+        const val EXTRA_RESEND_SIZE = "com.example.transfer.extra.RESEND_SIZE"
     }
 }

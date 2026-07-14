@@ -23,4 +23,17 @@
     <string name="pause">暂停</string>
     <string name="resume">继续</string>
     <string name="stop_service">停止服务</string>
+    <string name="history_title">传输历史</string>
+    <string name="history_empty">暂无传输记录</string>
+    <string name="clear_history">清空历史</string>
+    <string name="delete_record">删除</string>
+    <string name="resend_file">再次发送</string>
+    <string name="resend_file_ready">已载入历史文件，请选择接收设备后发送</string>
+    <string name="open_file">打开文件</string>
+    <string name="delete_history_title">删除这条记录？</string>
+    <string name="delete_history_message">仅删除历史记录，不会删除文件。</string>
+    <string name="clear_history_title">清空传输历史？</string>
+    <string name="clear_history_message">仅清空历史记录，不会删除已发送或接收的文件。</string>
+    <string name="cancel">取消</string>
+    <string name="history_action_unavailable">没有可处理此文件的应用</string>
 </resources>
