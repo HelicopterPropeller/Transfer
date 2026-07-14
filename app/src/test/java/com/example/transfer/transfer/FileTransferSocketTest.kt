@@ -364,18 +364,23 @@ class FileTransferSocketTest {
     @Test
     fun `disconnect before commit fails history and aborts destination`() = runBlocking {
         val history = RecordingIncomingTransferHistory()
-        val server = RawServerHarness(serverFactory = {
-            FileTransferServer(port = 0, store = it, history = history)
-        })
+        val createCompleted = CompletableDeferred<Unit>()
+        val server = RawServerHarness(
+            store = MemoryStore(onCreate = { createCompleted.complete(Unit) }),
+            serverFactory = {
+                FileTransferServer(port = 0, store = it, history = history)
+            }
+        )
         try {
             Socket(InetAddress.getLoopbackAddress(), server.port()).use { socket ->
-                socket.setSoLinger(true, 0)
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 TransferProtocol.writeHeader(
                     output,
                     TransferHeader("a.bin", "application/octet-stream", 4)
                 )
                 output.flush()
+                withTimeout(2_000) { createCompleted.await() }
+                socket.setSoLinger(true, 0)
             }
             withTimeout(2_000) { server.terminal.await() }
 
@@ -564,6 +569,7 @@ class FileTransferSocketTest {
     }
 
     private class MemoryStore(
+        private val onCreate: suspend () -> Unit = {},
         private val onComplete: suspend () -> Unit = {}
     ) : IncomingFileStore {
         val bytes = ByteArrayOutputStream()
@@ -571,8 +577,11 @@ class FileTransferSocketTest {
         var committed = false
         var aborted = false
 
-        override suspend fun create(fileName: String, mimeType: String) =
-            ReceivedFileHandle(bytes, displayName = fileName)
+        override suspend fun create(fileName: String, mimeType: String): ReceivedFileHandle {
+            val handle = ReceivedFileHandle(bytes, displayName = fileName)
+            onCreate()
+            return handle
+        }
 
         override suspend fun complete(handle: ReceivedFileHandle): String {
             completed = true

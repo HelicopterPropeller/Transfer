@@ -15,6 +15,38 @@ class TransferUiReducerTest {
     private val peer = DiscoveredDevice(
         "peer", "Pixel", InetAddress.getLoopbackAddress(), 42043, 1
     )
+    private val peerA = DiscoveredDevice(
+        "peer-a", "Pixel A", InetAddress.getByName("192.168.1.20"), 42043, 1
+    )
+    private val peerB = DiscoveredDevice(
+        "peer-b", "Pixel B", InetAddress.getByName("192.168.1.21"), 42043, 1
+    )
+    private val selectedFile = SelectedFile("content://a", "a.bin", "application/octet-stream", 4)
+
+    @Test
+    fun `history retry selects original peer when it later appears`() {
+        val restored = TransferUiReducer.restoreHistoryFile(
+            TransferUiState(), selectedFile, preferredPeerId = "peer-a"
+        )
+        assertNull(restored.selectedDeviceId)
+
+        val discovered = TransferUiReducer.withDevices(restored, listOf(peerA))
+
+        assertEquals("peer-a", discovered.selectedDeviceId)
+        assertEquals(listOf(selectedFile), discovered.selectedFiles)
+    }
+
+    @Test
+    fun `manual peer selection clears pending history preference`() {
+        val restored = TransferUiReducer.restoreHistoryFile(
+            TransferUiState(devices = listOf(peerA, peerB)), selectedFile, "peer-a"
+        )
+
+        val selected = TransferUiReducer.selectDevice(restored, "peer-b")
+
+        assertEquals("peer-b", selected.selectedDeviceId)
+        assertNull(selected.preferredDeviceId)
+    }
 
     @Test
     fun `invalid selection does not persist uri permission`() {

@@ -12,6 +12,11 @@ import java.util.TimeZone
 
 class HistoryItemUiTest {
     @Test
+    fun `mapper preserves peer id for retry preference`() {
+        assertEquals("peer-a", item(entry()).peerId)
+    }
+
+    @Test
     fun `outgoing rows show resend and successful incoming rows show open`() {
         val outgoing = item(
             entry(

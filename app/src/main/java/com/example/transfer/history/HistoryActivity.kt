@@ -6,7 +6,6 @@ import android.view.View
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
@@ -89,28 +88,23 @@ class HistoryActivity : AppCompatActivity() {
 
     private fun performPrimaryAction(item: HistoryItemUi) {
         if (item.showResend) {
-            startActivity(
-                Intent(this, MainActivity::class.java)
-                    .putExtra(MainActivity.EXTRA_RESEND_URI, item.sourceUri)
-                    .putExtra(MainActivity.EXTRA_RESEND_NAME, item.fileName)
-                    .putExtra(MainActivity.EXTRA_RESEND_MIME_TYPE, item.mimeType)
-                    .putExtra(MainActivity.EXTRA_RESEND_SIZE, item.fileSize)
-            )
+            resend(item)
             return
         }
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(item.receivedUri.orEmpty().toUri(), item.mimeType)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        val launched = runCatching {
-            startActivity(intent)
-        }.isSuccess
-        if (!launched) {
-            Snackbar.make(
-                findViewById(R.id.historyRoot),
-                R.string.history_action_unavailable,
-                Snackbar.LENGTH_SHORT
-            ).show()
-        }
+        HistoryFileActions.open(this, item)?.let(::showActionError)
+    }
+
+    private fun resend(item: HistoryItemUi) {
+        val sourceUri = item.sourceUri?.takeIf(String::isNotBlank) ?: return
+        val retryIntent = HistoryRetryContract.write(
+            Intent(this, MainActivity::class.java),
+            sourceUri = sourceUri,
+            preferredPeerId = item.peerId
+        ).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        startActivity(retryIntent)
+    }
+
+    private fun showActionError(message: String) {
+        Snackbar.make(findViewById(R.id.historyRoot), message, Snackbar.LENGTH_SHORT).show()
     }
 }

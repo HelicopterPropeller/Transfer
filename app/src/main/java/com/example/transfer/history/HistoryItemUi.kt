@@ -15,6 +15,7 @@ data class HistoryItemUi(
     val mimeType: String,
     val directionText: String,
     val statusText: String,
+    val peerId: String?,
     val peerText: String,
     val fileSizeText: String,
     val metadataText: String,
@@ -58,6 +59,7 @@ data class HistoryItemUi(
                     TransferHistoryStatus.CANCELLED -> "已取消"
                     TransferHistoryStatus.INTERRUPTED -> "已中断"
                 },
+                peerId = entry.peerId,
                 peerText = peer,
                 fileSizeText = size,
                 metadataText = "$peer · $size",

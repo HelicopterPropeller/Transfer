@@ -29,7 +29,10 @@
     <string name="delete_record">删除</string>
     <string name="resend_file">再次发送</string>
     <string name="resend_file_ready">已载入历史文件，请选择接收设备后发送</string>
+    <string name="history_source_unavailable">原文件已无法访问</string>
     <string name="open_file">打开文件</string>
+    <string name="history_file_unavailable">文件不存在或无法访问</string>
+    <string name="history_no_open_app">没有可打开此文件的应用</string>
     <string name="delete_history_title">删除这条记录？</string>
     <string name="delete_history_message">仅删除历史记录，不会删除文件。</string>
     <string name="clear_history_title">清空传输历史？</string>

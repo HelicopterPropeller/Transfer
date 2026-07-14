@@ -46,6 +46,7 @@ data class TransferStatus(
 data class TransferUiState(
     val devices: List<DiscoveredDevice> = emptyList(),
     val selectedDeviceId: String? = null,
+    val preferredDeviceId: String? = null,
     val selectedFiles: List<SelectedFile> = emptyList(),
     val notice: String? = null,
     val serviceStatus: String = "正在启动接收服务…",
@@ -84,11 +85,29 @@ object TransferUiReducer {
 
     fun withDevices(state: TransferUiState, devices: List<DiscoveredDevice>): TransferUiState {
         val selected = state.selectedDeviceId?.takeIf { id -> devices.any { it.id == id } }
+            ?: state.preferredDeviceId?.takeIf { id -> devices.any { it.id == id } }
         return state.copy(devices = devices, selectedDeviceId = selected)
     }
 
     fun selectDevice(state: TransferUiState, id: String): TransferUiState =
-        state.copy(selectedDeviceId = id.takeIf { candidate -> state.devices.any { it.id == candidate } })
+        state.copy(
+            selectedDeviceId = id.takeIf { candidate -> state.devices.any { it.id == candidate } },
+            preferredDeviceId = null
+        )
+
+    fun restoreHistoryFile(
+        state: TransferUiState,
+        file: SelectedFile,
+        preferredPeerId: String?
+    ): TransferUiState {
+        val preferred = preferredPeerId?.takeIf(String::isNotBlank)
+        return state.copy(
+            selectedDeviceId = preferred?.takeIf { id -> state.devices.any { it.id == id } },
+            preferredDeviceId = preferred,
+            selectedFiles = listOf(file),
+            notice = null
+        )
+    }
 
     fun selectFiles(
         state: TransferUiState,
