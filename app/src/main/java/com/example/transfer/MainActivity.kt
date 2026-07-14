@@ -73,8 +73,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pauseResumeButton: MaterialButton
 
     private val openDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        val requestToken = latestSelectionRequest.nextToken()
-        if (uris.isEmpty()) return@registerForActivityResult
+        val requestToken = latestSelectionRequest.nextTokenForSelection(uris.size)
+            ?: return@registerForActivityResult
         lifecycleScope.launch {
             val (files, skipped) = withContext(Dispatchers.IO) {
                 val readableFiles = ArrayList<SelectedFile>(uris.size)
@@ -85,9 +85,12 @@ class MainActivity : AppCompatActivity() {
                 }
                 readableFiles to skippedFiles
             }
-            if (!latestSelectionRequest.isLatest(requestToken)) return@launch
             val notice = skipped.takeIf { it > 0 }?.let { getString(R.string.files_skipped, it) }
-            viewModel.selectFiles(files, notice)
+            latestSelectionRequest.completeIfLatest(
+                requestToken,
+                publish = { viewModel.selectFiles(files, notice) },
+                consume = { HistoryRetryContract.clear(intent) }
+            )
         }
     }
 

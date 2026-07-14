@@ -28,6 +28,9 @@ internal class LatestSelectionRequest {
         return generation
     }
 
+    fun nextTokenForSelection(itemCount: Int): Long? =
+        if (itemCount > 0) nextToken() else null
+
     fun isLatest(token: Long): Boolean = token == generation
 
     fun completeIfLatest(

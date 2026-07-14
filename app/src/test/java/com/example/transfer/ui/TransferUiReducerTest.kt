@@ -233,6 +233,17 @@ class TransferUiReducerTest {
     }
 
     @Test
+    fun `empty picker does not obsolete a pending history retry`() {
+        val requests = LatestSelectionRequest()
+        val retryToken = requests.nextToken()
+
+        val emptyPickerToken = requests.nextTokenForSelection(0)
+
+        assertNull(emptyPickerToken)
+        assertTrue(requests.isLatest(retryToken))
+    }
+
+    @Test
     fun `current retry is consumed only after its result is published`() {
         val requests = LatestSelectionRequest()
         val token = requests.nextToken()
