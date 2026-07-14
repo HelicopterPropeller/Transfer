@@ -11,6 +11,7 @@ import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.example.transfer.discovery.DiscoveryManager
 import com.example.transfer.history.HistoryPeer
+import com.example.transfer.history.IncomingHistoryRecorder
 import com.example.transfer.history.OutgoingHistoryRecorder
 import com.example.transfer.history.TransferHistoryDatabase
 import com.example.transfer.history.TransferHistoryRepository
@@ -92,7 +93,17 @@ class TransferForegroundService : Service() {
         server = FileTransferServer(
             store = DownloadStorage(this),
             onTransferStart = ::beginTransfer,
-            onTransferEnd = ::endTransfer
+            onTransferEnd = ::endTransfer,
+            history = IncomingHistoryRecorder(historyRepository) { address ->
+                val device = state.value.devices.firstOrNull {
+                    it.address.hostAddress == address
+                }
+                HistoryPeer(
+                    id = device?.id,
+                    name = device?.name,
+                    address = address
+                )
+            }
         )
         server.start(
             serviceScope,

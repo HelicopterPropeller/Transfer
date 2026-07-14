@@ -10,6 +10,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -28,7 +29,7 @@ data class ReceivedFileHandle(
 
 interface IncomingFileStore {
     suspend fun create(fileName: String, mimeType: String): ReceivedFileHandle
-    suspend fun complete(handle: ReceivedFileHandle)
+    suspend fun complete(handle: ReceivedFileHandle): String?
     suspend fun abort(handle: ReceivedFileHandle)
 }
 
@@ -42,12 +43,19 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
             }
         }
 
-    override suspend fun complete(handle: ReceivedFileHandle) = withContext(Dispatchers.IO) {
+    override suspend fun complete(handle: ReceivedFileHandle): String? = withContext(Dispatchers.IO) {
         handle.output.flush()
         handle.output.close()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && handle.uri != null) {
             val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
             context.contentResolver.update(handle.uri, values, null, null)
+            handle.uri.toString()
+        } else {
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.files",
+                requireNotNull(handle.file)
+            ).toString()
         }
     }
 

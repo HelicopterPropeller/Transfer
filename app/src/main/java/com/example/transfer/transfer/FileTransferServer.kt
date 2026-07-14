@@ -1,5 +1,6 @@
 package com.example.transfer.transfer
 
+import com.example.transfer.history.IncomingTransferHistory
 import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.ProtocolException
 import com.example.transfer.protocol.TransferFrameCodec
@@ -10,8 +11,10 @@ import com.example.transfer.storage.ReceivedFileHandle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -35,7 +38,8 @@ class FileTransferServer(
     private val onTransferStart: () -> Boolean = { true },
     private val onTransferEnd: () -> Unit = {},
     private val pausedSessionLeaseMillis: Int = DEFAULT_PAUSED_SESSION_LEASE_MILLIS,
-    private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 }
+    private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val history: IncomingTransferHistory = IncomingTransferHistory.None
 ) {
     init {
         require(pausedSessionLeaseMillis > 0) { "Paused session lease must be positive" }
@@ -95,24 +99,45 @@ class FileTransferServer(
             val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             var handle: ReceivedFileHandle? = null
             var transferStarted = false
+            var historyId: Long? = null
             try {
                 val header = TransferProtocol.readHeader(input)
                 if (!onTransferStart()) error("Another transfer is active")
                 transferStarted = true
+                historyId = historyBestEffort {
+                    history.start(
+                        fileName = header.fileName,
+                        fileSize = header.fileSize,
+                        mimeType = header.mimeType,
+                        peerAddress = socket.inetAddress.hostAddress ?: socket.inetAddress.toString()
+                    )
+                }
                 handle = store.create(header.fileName, header.mimeType)
                 receiveChunks(socket, input, output, header.fileSize, handle, onProgress)
-                store.complete(handle)
+                val receivedUri = store.complete(handle)
+                historyBestEffort { history.succeed(historyId, receivedUri) }
                 output.writeByte(TransferProtocol.COMPLETE)
                 output.flush()
                 onComplete(handle.displayName)
             } catch (error: Exception) {
                 handle?.let { runCatching { store.abort(it) } }
+                withContext(NonCancellable) {
+                    runCatching { history.fail(historyId, error.message) }
+                }
                 runCatching { output.writeByte(TransferProtocol.FATAL); output.flush() }
                 throw error
             } finally {
                 if (transferStarted) onTransferEnd()
             }
         }
+    }
+
+    private suspend fun <T> historyBestEffort(block: suspend () -> T): T? = try {
+        block()
+    } catch (error: kotlinx.coroutines.CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        null
     }
 
     private fun receiveChunks(

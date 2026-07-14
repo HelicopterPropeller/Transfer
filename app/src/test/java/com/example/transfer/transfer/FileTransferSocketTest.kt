@@ -1,5 +1,7 @@
 package com.example.transfer.transfer
 
+import com.example.transfer.history.IncomingTransferHistory
+import com.example.transfer.history.TransferHistoryStatus
 import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.TransferFrameCodec
 import com.example.transfer.protocol.TransferFrameType
@@ -26,6 +28,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
 import java.util.Collections
@@ -246,6 +249,11 @@ class FileTransferSocketTest {
         assertArrayEquals(bytes, result.store.bytes.toByteArray())
         assertEquals(100, result.progress.last().percent)
         assertTrue(result.store.completed)
+        assertEquals(
+            listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.SUCCESS),
+            result.history.statuses
+        )
+        assertEquals("content://received/a.bin", result.history.lastReceivedUri)
         result.assertNoServerErrors()
     }
 
@@ -269,7 +277,27 @@ class FileTransferSocketTest {
         assertTrue(result.sendResult.isFailure)
         assertEquals(3, checks.get())
         assertTrue(result.store.aborted)
+        assertEquals(
+            listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.FAILED),
+            result.history.statuses
+        )
+        assertEquals(null, result.history.lastReceivedUri)
         assertEquals(listOf("Chunk 0 failed verification"), result.serverErrors)
+    }
+
+    @Test
+    fun `history failure never replaces original transfer failure`() = runBlocking {
+        val history = RecordingIncomingTransferHistory(failFailure = IOException("history unavailable"))
+
+        val result = transfer(
+            bytes = ByteArray(64) { 7 },
+            verifier = ChunkVerifier { _, _ -> error("original transfer failure") },
+            history = history
+        )
+
+        assertTrue(result.sendResult.isFailure)
+        assertTrue(result.store.aborted)
+        assertEquals(listOf("original transfer failure"), result.serverErrors)
     }
 
     @Test
@@ -352,7 +380,8 @@ class FileTransferSocketTest {
         verifier: ChunkVerifier = ChunkVerifier.SHA256,
         controller: TransferPauseController = TransferPauseController(),
         onProgress: (FileTransferProgress) -> Unit = {},
-        onPauseState: (TransferPauseState) -> Unit = {}
+        onPauseState: (TransferPauseState) -> Unit = {},
+        history: RecordingIncomingTransferHistory = RecordingIncomingTransferHistory()
     ): TransferResult {
         val store = MemoryStore()
         val scopeJob = SupervisorJob()
@@ -360,7 +389,7 @@ class FileTransferSocketTest {
         val ready = CompletableDeferred<Int>()
         val terminal = CompletableDeferred<Unit>()
         val serverErrors = Collections.synchronizedList(mutableListOf<String>())
-        val server = FileTransferServer(0, store, verifier)
+        val server = FileTransferServer(0, store, verifier, history = history)
         server.start(
             scope,
             { ready.complete(it) },
@@ -376,7 +405,7 @@ class FileTransferSocketTest {
             val sendResult = FileTransferClient().send(
                 InetAddress.getLoopbackAddress(),
                 withTimeout(3_000) { ready.await() },
-                SendFileSource("sample.bin", "application/octet-stream", bytes.size.toLong()) {
+                SendFileSource("a.bin", "application/octet-stream", bytes.size.toLong()) {
                     ByteArrayInputStream(bytes)
                 },
                 controller,
@@ -390,7 +419,8 @@ class FileTransferSocketTest {
                 store,
                 progress,
                 sendResult,
-                synchronized(serverErrors) { serverErrors.toList() }
+                synchronized(serverErrors) { serverErrors.toList() },
+                history
             )
         } finally {
             server.stop()
@@ -402,7 +432,8 @@ class FileTransferSocketTest {
         val store: MemoryStore,
         val progress: List<FileTransferProgress>,
         val sendResult: Result<Unit>,
-        val serverErrors: List<String>
+        val serverErrors: List<String>,
+        val history: RecordingIncomingTransferHistory
     ) {
         fun assertNoServerErrors() = assertEquals(emptyList<String>(), serverErrors)
     }
@@ -449,7 +480,38 @@ class FileTransferSocketTest {
         override suspend fun create(fileName: String, mimeType: String) =
             ReceivedFileHandle(bytes, displayName = fileName)
 
-        override suspend fun complete(handle: ReceivedFileHandle) { completed = true }
+        override suspend fun complete(handle: ReceivedFileHandle): String {
+            completed = true
+            return "content://received/${handle.displayName}"
+        }
         override suspend fun abort(handle: ReceivedFileHandle) { aborted = true; bytes.reset() }
+    }
+
+    private class RecordingIncomingTransferHistory(
+        private val failFailure: Exception? = null
+    ) : IncomingTransferHistory {
+        val statuses = mutableListOf<TransferHistoryStatus>()
+        var lastReceivedUri: String? = null
+
+        override suspend fun start(
+            fileName: String,
+            fileSize: Long,
+            mimeType: String,
+            peerAddress: String
+        ): Long {
+            statuses += TransferHistoryStatus.IN_PROGRESS
+            return 1L
+        }
+
+        override suspend fun succeed(historyId: Long?, receivedUri: String?) {
+            statuses += TransferHistoryStatus.SUCCESS
+            lastReceivedUri = receivedUri
+        }
+
+        override suspend fun fail(historyId: Long?, errorMessage: String?) {
+            failFailure?.let { throw it }
+            statuses += TransferHistoryStatus.FAILED
+            lastReceivedUri = null
+        }
     }
 }
