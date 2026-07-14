@@ -3,6 +3,8 @@ package com.example.transfer.history
 import com.example.transfer.transfer.SendFileSource
 import com.example.transfer.transfer.TransferPauseController
 import com.example.transfer.transfer.TransferPauseState
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import java.util.concurrent.CancellationException
 
 data class HistoryPeer(
@@ -36,7 +38,13 @@ class OutgoingHistoryRecorder(
         val result = try {
             block()
         } catch (exception: CancellationException) {
-            finish(historyId, TransferHistoryStatus.CANCELLED, exception.message)
+            try {
+                withContext(NonCancellable) {
+                    finish(historyId, TransferHistoryStatus.CANCELLED, exception.message)
+                }
+            } catch (_: Exception) {
+                // Preserve the transfer cancellation even if terminal persistence fails.
+            }
             throw exception
         } catch (exception: Exception) {
             finish(historyId, TransferHistoryStatus.FAILED, exception.message)

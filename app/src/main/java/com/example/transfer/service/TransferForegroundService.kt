@@ -61,6 +61,7 @@ class TransferForegroundService : Service() {
     private lateinit var server: FileTransferServer
     private lateinit var historyRepository: TransferHistoryRepository
     private lateinit var outgoingHistoryRecorder: OutgoingHistoryRecorder
+    private lateinit var historyStartupGate: HistoryStartupGate
     private val client = FileTransferClient()
     @Volatile private var activePauseController: TransferPauseController? = null
     @Volatile private var activeBatchJob: Job? = null
@@ -71,7 +72,9 @@ class TransferForegroundService : Service() {
             TransferHistoryDatabase.getInstance(this).transferHistoryDao()
         )
         outgoingHistoryRecorder = OutgoingHistoryRecorder(historyRepository)
-        serviceScope.launch { historyRepository.interruptActive() }
+        historyStartupGate = HistoryStartupGate(serviceScope) {
+            historyRepository.interruptActive()
+        }
         notificationFactory = TransferNotificationFactory(this).also { it.createChannel() }
         startForeground(
             TransferNotificationFactory.NOTIFICATION_ID,
@@ -171,6 +174,7 @@ class TransferForegroundService : Service() {
             }
             job = serviceScope.launch(start = CoroutineStart.LAZY) {
                 try {
+                    historyStartupGate.awaitReady()
                     val onPauseState: (TransferPauseState) -> Unit = {
                         publishPauseState(controller)
                     }

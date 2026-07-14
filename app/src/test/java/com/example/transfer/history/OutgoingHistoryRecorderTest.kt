@@ -2,9 +2,14 @@ package com.example.transfer.history
 
 import com.example.transfer.transfer.SendFileSource
 import com.example.transfer.transfer.TransferPauseController
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -108,6 +113,44 @@ class OutgoingHistoryRecorderTest {
     }
 
     @Test
+    fun `cancelled job still records cancelled terminal status`() = runBlocking {
+        val store = RecordingHistoryStore(beforeFinish = { yield() })
+        val recorder = OutgoingHistoryRecorder(store)
+        val sendJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            recorder.send(source("content://a"), peer, TransferPauseController()) {
+                awaitCancellation()
+            }
+        }
+
+        sendJob.cancelAndJoin()
+
+        assertEquals(
+            listOf(TransferHistoryStatus.IN_PROGRESS, TransferHistoryStatus.CANCELLED),
+            store.statuses
+        )
+    }
+
+    @Test
+    fun `finish failure does not replace original cancellation`() = runBlocking {
+        val finishFailure = IOException("history unavailable")
+        val store = RecordingHistoryStore(beforeFinish = { throw finishFailure })
+        val cancellation = CancellationException("send cancelled")
+
+        try {
+            OutgoingHistoryRecorder(store).send(
+                source("content://a"),
+                peer,
+                TransferPauseController()
+            ) {
+                throw cancellation
+            }
+            fail("Expected cancellation")
+        } catch (actual: Throwable) {
+            assertSame(cancellation, actual)
+        }
+    }
+
+    @Test
     fun `other thrown exception is recorded and rethrown`() = runBlocking {
         val store = RecordingHistoryStore()
         val failure = IOException("broken")
@@ -134,7 +177,9 @@ class OutgoingHistoryRecorderTest {
     )
 }
 
-private class RecordingHistoryStore : TransferHistoryStore {
+private class RecordingHistoryStore(
+    private val beforeFinish: suspend () -> Unit = {}
+) : TransferHistoryStore {
     val drafts = mutableListOf<TransferHistoryDraft>()
     val statuses = mutableListOf<TransferHistoryStatus>()
     val errorMessages = mutableListOf<String?>()
@@ -153,6 +198,7 @@ private class RecordingHistoryStore : TransferHistoryStore {
         errorMessage: String?,
         receivedUri: String?
     ): Boolean {
+        beforeFinish()
         statuses += status
         errorMessages += errorMessage
         return true
