@@ -1,5 +1,6 @@
 package com.example.transfer.history
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -31,6 +32,8 @@ class TransferHistoryRepository(
                     receivedUri = null
                 )
             )
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Exception) {
             null
         }
@@ -52,6 +55,8 @@ class TransferHistoryRepository(
                 errorMessage = errorMessage?.take(MAX_ERROR_MESSAGE_LENGTH),
                 receivedUri = receivedUri
             ) > 0
+        } catch (error: CancellationException) {
+            throw error
         } catch (_: Exception) {
             false
         }
@@ -59,12 +64,16 @@ class TransferHistoryRepository(
 
     override suspend fun interruptActive(): Int = try {
         dao.interruptActive(now(), INTERRUPTED_MESSAGE)
+    } catch (error: CancellationException) {
+        throw error
     } catch (_: Exception) {
         0
     }
 
     override suspend fun delete(id: Long): Boolean = try {
         dao.delete(id) > 0
+    } catch (error: CancellationException) {
+        throw error
     } catch (_: Exception) {
         false
     }
@@ -72,6 +81,8 @@ class TransferHistoryRepository(
     override suspend fun clear(): Boolean = try {
         dao.clear()
         true
+    } catch (error: CancellationException) {
+        throw error
     } catch (_: Exception) {
         false
     }
