@@ -52,7 +52,7 @@ class TransferForegroundService : Service() {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val busy = AtomicBoolean(false)
-    private val cancellationStarted = AtomicBoolean(false)
+    private val shutdownCoordinator = ServiceShutdownCoordinator()
     private val terminationGate = ServiceTerminationGate()
     private val mutableState = MutableStateFlow(ServiceTransferState())
     val state: StateFlow<ServiceTransferState> = mutableState.asStateFlow()
@@ -66,6 +66,7 @@ class TransferForegroundService : Service() {
     private val client = FileTransferClient()
     @Volatile private var activePauseController: TransferPauseController? = null
     @Volatile private var activeBatchJob: Job? = null
+    @Volatile private var incomingStartupJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -105,7 +106,7 @@ class TransferForegroundService : Service() {
                 )
             }
         )
-        historyStartupGate.launchWhenReady {
+        incomingStartupJob = historyStartupGate.launchWhenReady {
             server.start(
                 serviceScope,
                 { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
@@ -348,13 +349,21 @@ class TransferForegroundService : Service() {
     }
 
     private fun cancelResourcesOnce() {
-        if (!cancellationStarted.compareAndSet(false, true)) return
-        activePauseController?.cancel()
-        client.cancelActive()
-        if (::server.isInitialized) server.stop()
-        if (::discovery.isInitialized) discovery.stop()
-        activeBatchJob?.cancel()
-        serviceScope.cancel()
+        shutdownCoordinator.shutdown(
+            cancelOutgoing = {
+                activePauseController?.cancel()
+                client.cancelActive()
+                activeBatchJob?.cancel()
+            },
+            preventNewStarts = {
+                incomingStartupJob?.cancel()
+                serviceScope.cancel()
+            },
+            stopResources = {
+                if (::server.isInitialized) server.stop()
+                if (::discovery.isInitialized) discovery.stop()
+            }
+        )
     }
 
     override fun onDestroy() {
