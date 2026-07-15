@@ -2,6 +2,9 @@ package com.example.transfer.resume
 
 import com.example.transfer.storage.ResumableIncomingFileStore
 import com.example.transfer.storage.StoredFileLocation
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 class ResumeCleanup(
@@ -21,21 +24,26 @@ class ResumeCleanup(
             staleClaimBefore = now - DAY_MILLIS,
             token = token
         )
+        var deletionError: Exception? = null
         try {
-            var deletionError: Throwable? = null
             expired.forEach { checkpoint ->
-                try {
-                    files.delete(
-                        StoredFileLocation(
-                            kind = checkpoint.location.kind,
-                            value = checkpoint.location.value
+                val locations = listOfNotNull(checkpoint.location, checkpoint.retiredLocation)
+                locations.forEach { location ->
+                    try {
+                        files.delete(
+                            StoredFileLocation(
+                                kind = location.kind,
+                                value = location.value
+                            )
                         )
-                    )
-                } catch (error: Throwable) {
-                    if (deletionError == null) {
-                        deletionError = error
-                    } else {
-                        deletionError.addSuppressed(error)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        if (deletionError == null) {
+                            deletionError = error
+                        } else {
+                            deletionError?.addSuppressed(error)
+                        }
                     }
                 }
             }
@@ -44,11 +52,20 @@ class ResumeCleanup(
             store.deleteExpiredOutgoing(now - RETENTION_MILLIS)
             saveLastRun(now)
             return expired.size
-        } catch (error: Throwable) {
-            runCatching { store.releaseClaimedIncoming(token) }
-                .exceptionOrNull()
-                ?.let(error::addSuppressed)
+        } catch (error: CancellationException) {
+            releaseAfterFailure(token, error)
             throw error
+        } catch (error: Exception) {
+            releaseAfterFailure(token, error)
+            throw error
+        }
+    }
+
+    private suspend fun releaseAfterFailure(token: String, error: Throwable) {
+        try {
+            withContext(NonCancellable) { store.releaseClaimedIncoming(token) }
+        } catch (releaseError: Exception) {
+            error.addSuppressed(releaseError)
         }
     }
 

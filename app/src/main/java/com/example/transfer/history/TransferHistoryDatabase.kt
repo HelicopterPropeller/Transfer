@@ -46,7 +46,12 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
                         updatedAt INTEGER NOT NULL,
                         expiresAt INTEGER NOT NULL,
                         cleanupToken TEXT,
-                        cleanupClaimedAt INTEGER
+                        cleanupClaimedAt INTEGER,
+                        generation INTEGER NOT NULL,
+                        sessionToken TEXT,
+                        sessionClaimedAt INTEGER,
+                        retiredStorageKind TEXT,
+                        retiredStorageValue TEXT
                     )
                     """.trimIndent()
                 )

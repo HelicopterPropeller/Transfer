@@ -4,6 +4,7 @@ import com.example.transfer.storage.ResumableFileHandle
 import com.example.transfer.storage.ResumableIncomingFileStore
 import com.example.transfer.storage.StoredFileLocation
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -54,6 +55,7 @@ class ResumeCleanupTest {
         assertThrows<IllegalStateException> { cleanup.runIfDue(force = true) }
 
         assertEquals(store.claimToken, store.releasedClaimToken)
+        assertEquals(1, store.releaseCount)
         assertNullValue(store.deletedClaimToken)
         assertTrue(!saved)
     }
@@ -69,6 +71,20 @@ class ResumeCleanupTest {
         assertEquals(listOf("first", "second"), files.attempted.map { it.value })
         assertEquals(listOf("second"), files.deleted.map { it.value })
         assertEquals(store.claimToken, store.releasedClaimToken)
+    }
+
+    @Test
+    fun `cleanup cancellation stops deletion releases claim and rethrows`() = runBlocking {
+        val store = CleanupStore(listOf(checkpoint("first"), checkpoint("second")))
+        val files = CleanupFiles(cancelValue = "first")
+        val cleanup = ResumeCleanup(store, files, { now }, { 0L }, {})
+
+        assertThrows<CancellationException> { cleanup.runIfDue(force = true) }
+
+        assertEquals(listOf("first"), files.attempted.map { it.value })
+        assertEquals(store.claimToken, store.releasedClaimToken)
+        assertEquals(1, store.releaseCount)
+        assertNullValue(store.deletedClaimToken)
     }
 
     private fun checkpoint(id: String) = IncomingCheckpoint(
@@ -99,6 +115,7 @@ private class CleanupStore(private val expired: List<IncomingCheckpoint>) : Resu
     var claimToken: String? = null
     var deletedClaimToken: String? = null
     var releasedClaimToken: String? = null
+    var releaseCount = 0
     var outgoingCutoff: Long? = null
 
     override suspend fun claimExpiredIncoming(now: Long, staleClaimBefore: Long, token: String): List<IncomingCheckpoint> {
@@ -108,7 +125,11 @@ private class CleanupStore(private val expired: List<IncomingCheckpoint>) : Resu
         return expired
     }
     override suspend fun deleteClaimedIncoming(token: String): Int { deletedClaimToken = token; return expired.size }
-    override suspend fun releaseClaimedIncoming(token: String): Int { releasedClaimToken = token; return expired.size }
+    override suspend fun releaseClaimedIncoming(token: String): Int {
+        releasedClaimToken = token
+        releaseCount++
+        return expired.size
+    }
     override suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int { outgoingCutoff = updatedAtCutoff; return 1 }
     override suspend fun findIncoming(transferId: String) = null
     override suspend fun saveIncoming(checkpoint: IncomingCheckpoint) = Unit
@@ -124,12 +145,14 @@ private class CleanupStore(private val expired: List<IncomingCheckpoint>) : Resu
 
 private class CleanupFiles(
     private val fail: Boolean = false,
-    private val failValues: Set<String> = emptySet()
+    private val failValues: Set<String> = emptySet(),
+    private val cancelValue: String? = null
 ) : ResumableIncomingFileStore {
     val deleted = mutableListOf<StoredFileLocation>()
     val attempted = mutableListOf<StoredFileLocation>()
     override suspend fun delete(location: StoredFileLocation) {
         attempted += location
+        if (location.value == cancelValue) throw CancellationException("cancelled")
         if (fail || location.value in failValues) throw IllegalStateException("delete failed")
         deleted += location
     }

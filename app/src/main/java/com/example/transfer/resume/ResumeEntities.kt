@@ -30,10 +30,20 @@ data class IncomingCheckpoint(
     val storageValue: String,
     val createdAt: Long,
     val updatedAt: Long,
-    val expiresAt: Long
+    val expiresAt: Long,
+    val generation: Long = 0,
+    val sessionToken: String? = null,
+    val sessionClaimedAt: Long? = null,
+    val retiredStorageKind: String? = null,
+    val retiredStorageValue: String? = null
 ) {
     val location: ResumeStorageLocation
         get() = ResumeStorageLocation(storageKind, storageValue)
+
+    val retiredLocation: ResumeStorageLocation?
+        get() = retiredStorageKind?.let { kind ->
+            retiredStorageValue?.let { value -> ResumeStorageLocation(kind, value) }
+        }
 }
 
 data class OutgoingResumeLink(
@@ -68,7 +78,12 @@ data class IncomingCheckpointEntity(
     val updatedAt: Long,
     val expiresAt: Long,
     val cleanupToken: String? = null,
-    val cleanupClaimedAt: Long? = null
+    val cleanupClaimedAt: Long? = null,
+    val generation: Long = 0,
+    val sessionToken: String? = null,
+    val sessionClaimedAt: Long? = null,
+    val retiredStorageKind: String? = null,
+    val retiredStorageValue: String? = null
 )
 
 @Entity(

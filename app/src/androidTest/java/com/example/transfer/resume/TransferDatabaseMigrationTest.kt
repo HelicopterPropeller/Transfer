@@ -76,6 +76,12 @@ class TransferDatabaseMigrationTest {
         }
         assertTableEmpty(migrated, "incoming_checkpoints")
         assertTableEmpty(migrated, "outgoing_resume_links")
+        assertEquals(
+            setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue"),
+            tableColumns(migrated, "incoming_checkpoints").intersect(
+                setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue")
+            )
+        )
         migrated.close()
     }
 
@@ -103,16 +109,43 @@ class TransferDatabaseMigrationTest {
     }
 
     @Test
-    fun duplicateSourceUriAndPeerUpsertsSingleRealRoomLink() = runBlocking {
+    fun duplicateSourceUriAndPeerResolvesActualRealRoomOwner() = runBlocking {
         withResumeDatabase { database ->
             val dao = database.resumeDao()
-            dao.upsertOutgoing(outgoingEntity("t1"))
+            val first = dao.resolveOutgoing(outgoingEntity("t1"))
+            val second = dao.resolveOutgoing(outgoingEntity("t2"))
 
-            dao.upsertOutgoing(outgoingEntity("t2"))
+            assertEquals("t1", first.transferId)
+            assertEquals("t1", second.transferId)
+            assertEquals("t1", dao.findOutgoing("content://a", "peer-1")?.transferId)
+        }
+    }
 
-            assertEquals("t2", dao.findOutgoing("content://a", "peer-1")?.transferId)
-            assertEquals(0, dao.deleteOutgoing("t1"))
-            assertEquals(1, dao.deleteOutgoing("t2"))
+    @Test
+    fun realRoomSessionOwnershipHasOneWinnerAndGuardsCommit() = runBlocking {
+        withResumeDatabase { database ->
+            val dao = database.resumeDao()
+            val row = incomingEntity("t1")
+            dao.upsertIncoming(row)
+            val args = arrayOf(row.transferId, row.storageKind, row.storageValue)
+            assertEquals(1, dao.acquireIncomingSession(
+                args[0], args[1], args[2], row.generation, row.nextChunkIndex,
+                row.confirmedBytes, row.chainDigest, row.lastChunkHash,
+                "winner", 20L, 200L
+            ))
+            assertEquals(0, dao.acquireIncomingSession(
+                args[0], args[1], args[2], row.generation, row.nextChunkIndex,
+                row.confirmedBytes, row.chainDigest, row.lastChunkHash,
+                "loser", 20L, 200L
+            ))
+            assertEquals(0, dao.commitOwnedIncomingChunk(
+                row.transferId, "loser", row.generation, row.storageKind, row.storageValue,
+                row.nextChunkIndex, 16L, 2, byteArrayOf(3), byteArrayOf(4), 30L, 300L
+            ))
+            assertEquals(1, dao.commitOwnedIncomingChunk(
+                row.transferId, "winner", row.generation, row.storageKind, row.storageValue,
+                row.nextChunkIndex, 16L, 2, byteArrayOf(3), byteArrayOf(4), 30L, 300L
+            ))
         }
     }
 
@@ -204,6 +237,14 @@ class TransferDatabaseMigrationTest {
             assertEquals(0, cursor.getInt(0))
         }
     }
+
+    private fun tableColumns(database: SupportSQLiteDatabase, table: String): Set<String> =
+        database.query("PRAGMA table_info(`$table`)").use { cursor ->
+            buildSet {
+                val name = cursor.getColumnIndexOrThrow("name")
+                while (cursor.moveToNext()) add(cursor.getString(name))
+            }
+        }
 
     private suspend fun withResumeDatabase(block: suspend (TransferHistoryDatabase) -> Unit) {
         val database = Room.inMemoryDatabaseBuilder(

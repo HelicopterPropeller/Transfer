@@ -23,6 +23,8 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 
 class ResumeCoordinatorTest {
     private val now = 1_000_000L
@@ -61,6 +63,31 @@ class ResumeCoordinatorTest {
         assertNotEquals(first.offer.transferId, changedSize.offer.transferId)
         assertNotEquals(changedSize.offer.transferId, changedModified.offer.transferId)
         assertEquals(setOf(first.offer.transferId, changedSize.offer.transferId), store.deletedOutgoing.toSet())
+    }
+
+    @Test
+    fun `concurrent outgoing preparation returns one unique key owner`() {
+        val store = FakeResumeStore()
+        val start = CountDownLatch(1)
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val futures = listOf("t1", "t2").map { id ->
+                pool.submit<String> {
+                    start.await()
+                    runBlocking {
+                        ResumeCoordinator(
+                            store, FakeFiles(), clock = { now }, newTransferId = { id }
+                        ).prepareOutgoing(source(), "peer-1", "sender-1").offer.transferId
+                    }
+                }
+            }
+            start.countDown()
+            val ids = futures.map { it.get() }
+            assertEquals(1, ids.toSet().size)
+            assertEquals(ids.singleOrNull() ?: ids.first(), store.outgoing.values.single().transferId)
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
     @Test
@@ -128,6 +155,22 @@ class ResumeCoordinatorTest {
             coordinator.openIncoming(offer, TransferStartMode.RESUME, coordinator.queryIncoming(offer))
         }
         Unit
+    }
+
+    @Test
+    fun `missing receiver partial releases acquired ownership`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer(fileSize = 1L)
+        val missing = StoredFileLocation("FAKE", "missing")
+        store.saveIncoming(checkpoint(offer, missing))
+
+        assertThrows<ResumeValidationException> {
+            coordinator.openIncoming(offer, TransferStartMode.RESUME, coordinator.queryIncoming(offer))
+        }
+
+        assertNull(store.findIncoming(offer.transferId)?.sessionToken)
     }
 
     @Test
@@ -234,7 +277,7 @@ class ResumeCoordinatorTest {
         val store = FakeResumeStore()
         val files = FakeFiles()
         val coordinator = coordinator(store, files)
-        val offer = offer(fileSize = 2L)
+        val offer = offer(fileSize = 1L)
         val session = coordinator.openIncoming(offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
         session.handle.writeAt(0, byteArrayOf(8), 1)
         store.forceObserved = { (session.handle as FakeHandle).forced }
@@ -253,10 +296,177 @@ class ResumeCoordinatorTest {
     }
 
     @Test
+    fun `commit rejects non final short chunk before force`() = runBlocking {
+        val store = FakeResumeStore()
+        val coordinator = coordinator(store, FakeFiles())
+        val session = coordinator.openIncoming(
+            offer(fileSize = 2L),
+            TransferStartMode.NEW,
+            ResumeStatus(ResumeState.NONE)
+        )
+
+        assertThrows<ResumeValidationException> {
+            coordinator.commitChunk(
+                session, 1L, 1,
+                ByteArray(ChunkCodec.DIGEST_SIZE),
+                ByteArray(ChunkCodec.DIGEST_SIZE)
+            )
+        }
+        assertFalse((session.handle as FakeHandle).forced)
+    }
+
+    @Test
+    fun `commit rejects every non contiguous or malformed transition`() = runBlocking {
+        val coordinator = coordinator()
+        val session = coordinator.openIncoming(
+            offer(fileSize = TransferProtocol.CHUNK_SIZE.toLong() + 1),
+            TransferStartMode.NEW,
+            ResumeStatus(ResumeState.NONE)
+        )
+        val digest = ByteArray(ChunkCodec.DIGEST_SIZE)
+        val invalid = listOf(
+            arrayOf(0L, 1, digest, digest),
+            arrayOf(1L, 2, digest, digest),
+            arrayOf(TransferProtocol.CHUNK_SIZE.toLong() + 1, 1, digest, digest),
+            arrayOf(1L, 1, digest, digest),
+            arrayOf(TransferProtocol.CHUNK_SIZE.toLong(), 1, byteArrayOf(1), digest),
+            arrayOf(TransferProtocol.CHUNK_SIZE.toLong(), 1, digest, byteArrayOf(1))
+        )
+        invalid.forEach { values ->
+            assertThrows<ResumeValidationException> {
+                coordinator.commitChunk(
+                    session,
+                    values[0] as Long,
+                    values[1] as Int,
+                    values[2] as ByteArray,
+                    values[3] as ByteArray
+                )
+            }
+        }
+        assertFalse((session.handle as FakeHandle).forced)
+    }
+
+    @Test
+    fun `duplicate same status resume acquisition has one winner`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer(fileSize = 1L)
+        store.saveIncoming(checkpoint(offer, files.put(offer.transferId, ByteArray(0))))
+        val status = coordinator.queryIncoming(offer)
+
+        val winner = coordinator.openIncoming(offer, TransferStartMode.RESUME, status)
+
+        assertTrue(winner.sessionToken.isNotBlank())
+        assertThrows<CheckpointConflictException> {
+            coordinator.openIncoming(offer, TransferStartMode.RESUME, status)
+        }
+        Unit
+    }
+
+    @Test
+    fun `restart create failure preserves old checkpoint and partial`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles().apply { failCreate = true }
+        val coordinator = coordinator(store, files)
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        val original = checkpoint(offer, old)
+        store.saveIncoming(original)
+
+        assertThrows<IllegalStateException> {
+            coordinator.openIncoming(offer, TransferStartMode.RESTART, coordinator.queryIncoming(offer))
+        }
+
+        assertEquals(old, store.findIncoming(offer.transferId)?.location?.let { StoredFileLocation(it.kind, it.value) })
+        assertTrue(files.contains(old))
+    }
+
+    @Test
+    fun `new insert conflict deletes staged file without replacing existing row`() = runBlocking {
+        val store = FakeResumeStore().apply { allowInsert = false }
+        val files = FakeFiles()
+        val offer = offer()
+
+        assertThrows<CheckpointConflictException> {
+            coordinator(store, files).openIncoming(offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+        }
+
+        assertEquals(1, files.deleted.size)
+        assertTrue(store.incoming.isEmpty())
+    }
+
+    @Test
+    fun `restart replacement conflict deletes staged file and preserves old ownership`() = runBlocking {
+        val store = FakeResumeStore().apply { allowReplace = false }
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        store.saveIncoming(checkpoint(offer, old))
+
+        assertThrows<CheckpointConflictException> {
+            coordinator.openIncoming(offer, TransferStartMode.RESTART, coordinator.queryIncoming(offer))
+        }
+
+        assertTrue(files.contains(old))
+        assertEquals(old.value, store.findIncoming(offer.transferId)?.storageValue)
+        assertTrue(files.deleted.any { it != old })
+    }
+
+    @Test
+    fun `stale session cannot commit or complete after ownership moves`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val first = coordinator.openIncoming(
+            offer(fileSize = 1L), TransferStartMode.NEW, ResumeStatus(ResumeState.NONE)
+        )
+        coordinator.releaseIncoming(first)
+        val second = coordinator.openIncoming(
+            offer(fileSize = 1L), TransferStartMode.RESUME, coordinator.queryIncoming(offer(fileSize = 1L))
+        )
+
+        assertThrows<CheckpointConflictException> {
+            coordinator.commitChunk(first, 1L, 1, ByteArray(32), ByteArray(32))
+        }
+        assertThrows<CheckpointConflictException> { coordinator.completeIncoming(first) }
+        assertEquals(second.sessionToken, store.findIncoming(second.checkpoint.transferId)?.sessionToken)
+    }
+
+    @Test
+    fun `restart delete failure persists retired location and later resume recovers it`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        store.saveIncoming(checkpoint(offer, old))
+        files.failDeleteValues += old.value
+
+        val restarted = coordinator.openIncoming(
+            offer,
+            TransferStartMode.RESTART,
+            coordinator.queryIncoming(offer)
+        )
+
+        assertEquals(old.value, restarted.checkpoint.retiredStorageValue)
+        coordinator.releaseIncoming(restarted)
+        files.failDeleteValues.clear()
+        val resumed = coordinator.openIncoming(
+            offer,
+            TransferStartMode.RESUME,
+            coordinator.queryIncoming(offer)
+        )
+        assertNull(resumed.checkpoint.retiredStorageValue)
+        assertFalse(files.contains(old))
+    }
+
+    @Test
     fun `stale commit index throws checkpoint conflict`() = runBlocking {
         val store = FakeResumeStore().apply { allowCommit = false }
         val coordinator = coordinator(store, FakeFiles())
-        val session = coordinator.openIncoming(offer(), TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+        val session = coordinator.openIncoming(offer(fileSize = 1L), TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
 
         assertThrows<CheckpointConflictException> {
             coordinator.commitChunk(
@@ -356,6 +566,8 @@ private class FakeResumeStore : ResumeStore {
     val deletedOutgoing = mutableListOf<String>()
     val expiryUpdates = mutableListOf<String>()
     var allowCommit = true
+    var allowInsert = true
+    var allowReplace = true
     var allowExpiryUpdate = true
     var removeAfterExpiryUpdate = false
     var advanceAfterExpiryUpdate = false
@@ -363,6 +575,75 @@ private class FakeResumeStore : ResumeStore {
 
     override suspend fun findIncoming(transferId: String) = incoming[transferId]
     override suspend fun saveIncoming(checkpoint: IncomingCheckpoint) { incoming[checkpoint.transferId] = checkpoint }
+    override suspend fun insertIncoming(checkpoint: IncomingCheckpoint): Boolean {
+        if (!allowInsert) return false
+        if (incoming.containsKey(checkpoint.transferId)) return false
+        incoming[checkpoint.transferId] = checkpoint
+        return true
+    }
+    override suspend fun acquireIncomingSession(
+        expected: IncomingCheckpoint, token: String, now: Long, expiresAt: Long
+    ): IncomingCheckpoint? {
+        expiryUpdates += expected.transferId
+        val current = incoming[expected.transferId]
+        if (!allowExpiryUpdate || current == null || current.sessionToken != null ||
+            current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.nextChunkIndex != expected.nextChunkIndex ||
+            !current.chainDigest.contentEquals(expected.chainDigest)
+        ) return null
+        incoming[expected.transferId] = current.copy(
+            sessionToken = token, sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+        )
+        if (removeAfterExpiryUpdate) incoming.remove(expected.transferId)
+        if (advanceAfterExpiryUpdate) {
+            incoming[expected.transferId] = incoming.getValue(expected.transferId).copy(
+                confirmedBytes = current.fileSize, nextChunkIndex = 1,
+                chainDigest = ByteArray(ChunkCodec.DIGEST_SIZE) { 3 },
+                lastChunkHash = ByteArray(ChunkCodec.DIGEST_SIZE) { 4 }
+            )
+        }
+        return incoming[expected.transferId]
+    }
+    override suspend fun releaseIncomingSession(expected: IncomingCheckpoint, token: String): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.sessionToken != token || current.generation != expected.generation ||
+            current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex
+        ) return false
+        incoming[expected.transferId] = current.copy(sessionToken = null, sessionClaimedAt = null)
+        return true
+    }
+    override suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int {
+        val stale = incoming.values.filter { it.sessionToken != null && (it.sessionClaimedAt ?: Long.MAX_VALUE) < staleClaimBefore }
+        stale.forEach { incoming[it.transferId] = it.copy(sessionToken = null, sessionClaimedAt = null) }
+        return stale.size
+    }
+    override suspend fun replaceIncomingForRestart(
+        expected: IncomingCheckpoint, replacement: IncomingCheckpoint, token: String
+    ): Boolean {
+        if (!allowReplace) return false
+        val current = incoming[expected.transferId] ?: return false
+        if (current.sessionToken != token || current.generation != expected.generation ||
+            current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex
+        ) return false
+        incoming[expected.transferId] = replacement
+        return true
+    }
+    override suspend fun clearRetiredIncoming(expected: IncomingCheckpoint, token: String): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.sessionToken != token || current.generation != expected.generation ||
+            current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex
+        ) return false
+        incoming[expected.transferId] = current.copy(retiredStorageKind = null, retiredStorageValue = null)
+        return true
+    }
+    override suspend fun deleteOwnedIncoming(expected: IncomingCheckpoint, token: String): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.sessionToken != token || current.generation != expected.generation ||
+            current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex
+        ) return false
+        incoming.remove(expected.transferId)
+        return true
+    }
     override suspend fun commitIncomingChunk(
         transferId: String, expectedNextChunkIndex: Int, confirmedBytes: Long,
         nextChunkIndex: Int, chainDigest: ByteArray, lastChunkHash: ByteArray,
@@ -372,6 +653,24 @@ private class FakeResumeStore : ResumeStore {
         val current = incoming[transferId]
         if (!allowCommit || current == null || current.nextChunkIndex != expectedNextChunkIndex) return false
         incoming[transferId] = current.copy(
+            confirmedBytes = confirmedBytes, nextChunkIndex = nextChunkIndex,
+            chainDigest = chainDigest, lastChunkHash = lastChunkHash,
+            updatedAt = updatedAt, expiresAt = expiresAt
+        )
+        return true
+    }
+    override suspend fun commitOwnedIncomingChunk(
+        expected: IncomingCheckpoint, token: String, confirmedBytes: Long,
+        nextChunkIndex: Int, chainDigest: ByteArray, lastChunkHash: ByteArray,
+        updatedAt: Long, expiresAt: Long
+    ): Boolean {
+        check(forceObserved?.invoke() != false) { "commit happened before force" }
+        val current = incoming[expected.transferId]
+        if (!allowCommit || current == null || current.sessionToken != token ||
+            current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.nextChunkIndex != expected.nextChunkIndex
+        ) return false
+        incoming[expected.transferId] = current.copy(
             confirmedBytes = confirmedBytes, nextChunkIndex = nextChunkIndex,
             chainDigest = chainDigest, lastChunkHash = lastChunkHash,
             updatedAt = updatedAt, expiresAt = expiresAt
@@ -398,6 +697,21 @@ private class FakeResumeStore : ResumeStore {
     override suspend fun findOutgoing(sourceUri: String, peerDeviceId: String) =
         outgoing.values.singleOrNull { it.sourceUri == sourceUri && it.peerDeviceId == peerDeviceId }
     override suspend fun saveOutgoing(link: OutgoingResumeLink) { outgoing[link.transferId] = link }
+    override suspend fun resolveOutgoing(candidate: OutgoingResumeLink): OutgoingResumeLink = synchronized(this) {
+            val existing = outgoing.values.singleOrNull {
+                it.sourceUri == candidate.sourceUri && it.peerDeviceId == candidate.peerDeviceId
+            }
+            val resolved = if (existing != null && existing.fileName == candidate.fileName &&
+                existing.mimeType == candidate.mimeType && existing.fileSize == candidate.fileSize &&
+                existing.lastModified == candidate.lastModified && existing.chunkSize == candidate.chunkSize
+            ) existing.copy(updatedAt = candidate.updatedAt) else candidate
+            if (existing != null && existing.transferId != resolved.transferId) {
+                deletedOutgoing += existing.transferId
+                outgoing.remove(existing.transferId)
+            }
+            outgoing[resolved.transferId] = resolved
+            resolved
+        }
     override suspend fun updateOutgoingTimestamp(transferId: String, updatedAt: Long): Boolean {
         val link = outgoing[transferId] ?: return false
         outgoing[transferId] = link.copy(updatedAt = updatedAt)
@@ -415,6 +729,10 @@ private class FakeFiles : ResumableIncomingFileStore {
     private val entries = linkedMapOf<StoredFileLocation, FakeEntry>()
     val deleted = mutableListOf<StoredFileLocation>()
     var reopenCount = 0
+    var failCreate = false
+    val failDeleteValues = mutableSetOf<String>()
+
+    fun contains(location: StoredFileLocation) = entries.containsKey(location)
 
     fun put(id: String, bytes: ByteArray): StoredFileLocation {
         val location = StoredFileLocation("FAKE", id)
@@ -423,6 +741,7 @@ private class FakeFiles : ResumableIncomingFileStore {
     }
 
     override suspend fun create(transferId: String, fileName: String, mimeType: String): ResumableFileHandle {
+        if (failCreate) throw IllegalStateException("create failed")
         val location = StoredFileLocation("FAKE", "$transferId-${entries.size}")
         val entry = FakeEntry(fileName, ByteArray(0))
         entries[location] = entry
@@ -438,7 +757,11 @@ private class FakeFiles : ResumableIncomingFileStore {
         handle.close()
         return "fake://${handle.location.value}"
     }
-    override suspend fun delete(location: StoredFileLocation) { deleted += location; entries.remove(location) }
+    override suspend fun delete(location: StoredFileLocation) {
+        if (location.value in failDeleteValues) throw IllegalStateException("delete failed")
+        deleted += location
+        entries.remove(location)
+    }
 }
 
 private data class FakeEntry(val name: String, var bytes: ByteArray)

@@ -29,7 +29,9 @@ data class ResumeCandidate(
 data class IncomingResumeSession(
     val handle: ResumableFileHandle,
     val checkpoint: IncomingCheckpoint,
-    val prefix: PrefixDigest
+    val prefix: PrefixDigest,
+    val sessionToken: String,
+    val generation: Long = checkpoint.generation
 )
 
 class ResumeValidationException(message: String, cause: Throwable? = null) : IOException(message, cause)
@@ -40,7 +42,8 @@ class ResumeCoordinator(
     private val store: ResumeStore,
     private val files: ResumableIncomingFileStore,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val newTransferId: () -> String = { UUID.randomUUID().toString() }
+    private val newTransferId: () -> String = { UUID.randomUUID().toString() },
+    private val newSessionToken: () -> String = { UUID.randomUUID().toString() }
 ) {
     suspend fun prepareOutgoing(
         source: SendFileSource,
@@ -49,11 +52,7 @@ class ResumeCoordinator(
     ): PreparedTransfer {
         val sourceUri = requireNotNull(source.sourceUri) { "A stable source URI is required for resume" }
         val now = clock()
-        val existing = store.findOutgoing(sourceUri, peerDeviceId)
-        val saved = if (existing != null && existing.matches(source)) {
-            existing.copy(updatedAt = now).also { store.saveOutgoing(it) }
-        } else {
-            if (existing != null) store.deleteOutgoing(existing.transferId)
+        val saved = store.resolveOutgoing(
             OutgoingResumeLink(
                 transferId = newTransferId(),
                 sourceUri = sourceUri,
@@ -65,8 +64,8 @@ class ResumeCoordinator(
                 chunkSize = TransferProtocol.CHUNK_SIZE,
                 createdAt = now,
                 updatedAt = now
-            ).also { store.saveOutgoing(it) }
-        }
+            )
+        )
         return PreparedTransfer(
             offer = TransferOffer(
                 transferId = saved.transferId,
@@ -111,12 +110,13 @@ class ResumeCoordinator(
         chainDigest: ByteArray,
         lastChunkHash: ByteArray
     ): IncomingResumeSession {
+        validateChunkTransition(session.checkpoint, confirmedBytes, nextChunkIndex, chainDigest, lastChunkHash)
         session.handle.force()
         val now = clock()
         val expiresAt = now + RETENTION_MILLIS
-        val committed = store.commitIncomingChunk(
-            transferId = session.checkpoint.transferId,
-            expectedNextChunkIndex = session.checkpoint.nextChunkIndex,
+        val committed = store.commitOwnedIncomingChunk(
+            expected = session.checkpoint,
+            token = session.sessionToken,
             confirmedBytes = confirmedBytes,
             nextChunkIndex = nextChunkIndex,
             chainDigest = chainDigest,
@@ -146,10 +146,24 @@ class ResumeCoordinator(
     }
 
     suspend fun completeIncoming(session: IncomingResumeSession): String? {
+        requireOwned(session)
+        session.checkpoint.retiredLocation?.let { files.delete(it.toStoredLocation()) }
         val published = files.publish(session.handle)
-        store.deleteIncoming(session.checkpoint.transferId)
+        if (!store.deleteOwnedIncoming(session.checkpoint, session.sessionToken)) {
+            throw CheckpointConflictException("Incoming session lost ownership during completion")
+        }
         return published
     }
+
+    suspend fun releaseIncoming(session: IncomingResumeSession) {
+        session.handle.close()
+        if (!store.releaseIncomingSession(session.checkpoint, session.sessionToken)) {
+            throw CheckpointConflictException("Incoming session no longer owns checkpoint")
+        }
+    }
+
+    suspend fun clearStaleSessionClaims(staleClaimBefore: Long): Int =
+        store.clearStaleIncomingSessions(staleClaimBefore)
 
     suspend fun completeOutgoing(transferId: String) {
         store.deleteOutgoing(transferId)
@@ -159,29 +173,62 @@ class ResumeCoordinator(
         offer: TransferOffer,
         expectedStatus: ResumeStatus
     ): IncomingResumeSession {
-        if (expectedStatus.state != ResumeState.NONE || store.findIncoming(offer.transferId) != null) {
+        if (expectedStatus.state != ResumeState.NONE) {
             throw CheckpointConflictException("Incoming checkpoint already exists")
         }
-        val handle = files.create(offer.transferId, offer.fileName, offer.mimeType)
+        val token = newSessionToken()
+        val handle = files.create(stagingId(offer.transferId, token, 1), offer.fileName, offer.mimeType)
         val prefix = emptyPrefix()
-        val checkpoint = newCheckpoint(offer, handle, prefix)
-        store.saveIncoming(checkpoint)
-        return IncomingResumeSession(handle, checkpoint, prefix)
+        val checkpoint = newCheckpoint(offer, handle, prefix, generation = 1, token = token)
+        try {
+            if (!store.insertIncoming(checkpoint)) {
+                throw CheckpointConflictException("Incoming checkpoint already exists")
+            }
+        } catch (error: Exception) {
+            cleanupStaged(handle, error)
+            throw error
+        }
+        return IncomingResumeSession(handle, checkpoint, prefix, token)
     }
 
     private suspend fun openRestart(
         offer: TransferOffer,
         expectedStatus: ResumeStatus
     ): IncomingResumeSession {
-        val beforeLease = requireCurrent(offer, expectedStatus)
-        val current = refreshLease(beforeLease.transferId)
-        requireExpectedStatus(current, offer, expectedStatus)
-        files.delete(current.location.toStoredLocation())
-        val handle = files.create(offer.transferId, offer.fileName, offer.mimeType)
+        val acquired = acquireCurrent(offer, expectedStatus)
+        val current = recoverRetired(acquired.first, acquired.second, requireSuccess = true)
+        val token = acquired.second
+        val handle = try {
+            files.create(stagingId(offer.transferId, token, current.generation + 1), offer.fileName, offer.mimeType)
+        } catch (error: Exception) {
+            store.releaseIncomingSession(current, token)
+            throw error
+        }
         val prefix = emptyPrefix()
-        val checkpoint = newCheckpoint(offer, handle, prefix, createdAt = current.createdAt)
-        store.saveIncoming(checkpoint)
-        return IncomingResumeSession(handle, checkpoint, prefix)
+        val replacement = newCheckpoint(
+            offer, handle, prefix, createdAt = current.createdAt,
+            generation = current.generation + 1, token = token,
+            retired = current.location
+        )
+        try {
+            if (!store.replaceIncomingForRestart(current, replacement, token)) {
+                throw CheckpointConflictException("Incoming checkpoint changed during restart")
+            }
+        } catch (error: Exception) {
+            cleanupStaged(handle, error)
+            store.releaseIncomingSession(current, token)
+            throw error
+        }
+        var active = replacement
+        try {
+            files.delete(current.location.toStoredLocation())
+            if (store.clearRetiredIncoming(active, token)) {
+                active = active.copy(retiredStorageKind = null, retiredStorageValue = null)
+            }
+        } catch (_: Exception) {
+            // Retired location remains durable and is retried by later open/cleanup.
+        }
+        return IncomingResumeSession(handle, active, prefix, token)
     }
 
     private suspend fun openResume(
@@ -191,12 +238,15 @@ class ResumeCoordinator(
         if (expectedStatus.state != ResumeState.AVAILABLE) {
             throw ResumeValidationException("Checkpoint is not resumable")
         }
-        val beforeLease = requireCurrent(offer, expectedStatus)
-        val current = refreshLease(beforeLease.transferId)
-        requireExpectedStatus(current, offer, expectedStatus)
+        val acquired = acquireCurrent(offer, expectedStatus)
+        val token = acquired.second
+        var current = recoverRetired(acquired.first, token, requireSuccess = false)
         val location = current.location.toStoredLocation()
         val handle = files.reopen(location, current.displayName)
-            ?: throw ResumeValidationException("Partial file is missing")
+        if (handle == null) {
+            store.releaseIncomingSession(current, token)
+            throw ResumeValidationException("Partial file is missing")
+        }
         try {
             val length = handle.length()
             if (length < current.confirmedBytes) {
@@ -218,9 +268,10 @@ class ResumeCoordinator(
             if (!validatePrefix(expectedStatus, prefix)) {
                 throw ResumeValidationException("Partial file prefix does not match checkpoint")
             }
-            return IncomingResumeSession(handle, current, prefix)
-        } catch (error: Throwable) {
+            return IncomingResumeSession(handle, current, prefix, token)
+        } catch (error: Exception) {
             runCatching { handle.close() }
+            store.releaseIncomingSession(current, token)
             throw error
         }
     }
@@ -250,22 +301,33 @@ class ResumeCoordinator(
         }
     }
 
-    private suspend fun refreshLease(transferId: String): IncomingCheckpoint {
+    private suspend fun acquireCurrent(
+        offer: TransferOffer,
+        expectedStatus: ResumeStatus
+    ): Pair<IncomingCheckpoint, String> {
+        val expected = requireCurrent(offer, expectedStatus)
+        val token = newSessionToken()
         val now = clock()
         val expiresAt = now + RETENTION_MILLIS
-        if (!store.updateIncomingExpiry(transferId, now, expiresAt)) {
-            throw CheckpointConflictException("Incoming checkpoint is being cleaned up")
+        val acquired = store.acquireIncomingSession(expected, token, now, expiresAt)
+            ?: throw CheckpointConflictException("Incoming checkpoint is already owned or being cleaned up")
+        try {
+            requireExpectedStatus(acquired, offer, expectedStatus)
+        } catch (error: Exception) {
+            store.releaseIncomingSession(acquired, token)
+            throw error
         }
-        val refreshed = store.findIncoming(transferId)
-            ?: throw CheckpointConflictException("Incoming checkpoint disappeared during lease refresh")
-        return refreshed.copy(updatedAt = now, expiresAt = expiresAt)
+        return acquired to token
     }
 
     private fun newCheckpoint(
         offer: TransferOffer,
         handle: ResumableFileHandle,
         prefix: PrefixDigest,
-        createdAt: Long = clock()
+        createdAt: Long = clock(),
+        generation: Long,
+        token: String,
+        retired: ResumeStorageLocation? = null
     ): IncomingCheckpoint {
         val now = clock()
         return IncomingCheckpoint(
@@ -284,22 +346,73 @@ class ResumeCoordinator(
             storageValue = handle.location.value,
             createdAt = createdAt,
             updatedAt = now,
-            expiresAt = now + RETENTION_MILLIS
+            expiresAt = now + RETENTION_MILLIS,
+            generation = generation,
+            sessionToken = token,
+            sessionClaimedAt = now,
+            retiredStorageKind = retired?.kind,
+            retiredStorageValue = retired?.value
         )
     }
+
+    private suspend fun recoverRetired(
+        checkpoint: IncomingCheckpoint,
+        token: String,
+        requireSuccess: Boolean
+    ): IncomingCheckpoint {
+        val retired = checkpoint.retiredLocation ?: return checkpoint
+        return try {
+            files.delete(retired.toStoredLocation())
+            if (!store.clearRetiredIncoming(checkpoint, token)) {
+                throw CheckpointConflictException("Retired location changed during recovery")
+            }
+            checkpoint.copy(retiredStorageKind = null, retiredStorageValue = null)
+        } catch (error: Exception) {
+            if (requireSuccess) {
+                store.releaseIncomingSession(checkpoint, token)
+                throw error
+            }
+            checkpoint
+        }
+    }
+
+    private suspend fun requireOwned(session: IncomingResumeSession) {
+        val current = store.findIncoming(session.checkpoint.transferId)
+        if (current == null || current.sessionToken != session.sessionToken ||
+            current.generation != session.generation || current.storageKind != session.checkpoint.storageKind ||
+            current.storageValue != session.checkpoint.storageValue ||
+            current.nextChunkIndex != session.checkpoint.nextChunkIndex
+        ) throw CheckpointConflictException("Incoming session no longer owns checkpoint")
+    }
+
+    private fun validateChunkTransition(
+        old: IncomingCheckpoint,
+        confirmedBytes: Long,
+        nextChunkIndex: Int,
+        chainDigest: ByteArray,
+        lastChunkHash: ByteArray
+    ) {
+        val delta = confirmedBytes - old.confirmedBytes
+        val valid = nextChunkIndex == old.nextChunkIndex + 1 && delta in 1..old.chunkSize.toLong() &&
+            confirmedBytes <= old.fileSize &&
+            (confirmedBytes == old.fileSize || delta == old.chunkSize.toLong()) &&
+            chainDigest.size == ChunkCodec.DIGEST_SIZE && lastChunkHash.size == ChunkCodec.DIGEST_SIZE
+        if (!valid) throw ResumeValidationException("Invalid incoming chunk transition")
+    }
+
+    private suspend fun cleanupStaged(handle: ResumableFileHandle, original: Exception) {
+        runCatching { handle.close() }.exceptionOrNull()?.let(original::addSuppressed)
+        runCatching { files.delete(handle.location) }.exceptionOrNull()?.let(original::addSuppressed)
+    }
+
+    private fun stagingId(transferId: String, token: String, generation: Long) =
+        "$transferId-$generation-$token"
 
     private fun emptyPrefix(): PrefixDigest = PrefixDigestScanner.scan(
         input = ByteArray(0).inputStream(),
         bytes = 0,
         chunkSize = TransferProtocol.CHUNK_SIZE
     )
-
-    private fun OutgoingResumeLink.matches(source: SendFileSource): Boolean =
-        fileName == source.displayName &&
-            mimeType == source.mimeType &&
-            fileSize == source.length &&
-            lastModified == source.lastModified &&
-            chunkSize == TransferProtocol.CHUNK_SIZE
 
     private fun IncomingCheckpoint.matches(offer: TransferOffer): Boolean =
         senderDeviceId == offer.senderDeviceId &&

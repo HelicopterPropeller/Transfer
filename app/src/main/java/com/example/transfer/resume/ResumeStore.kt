@@ -3,6 +3,27 @@ package com.example.transfer.resume
 interface ResumeStore {
     suspend fun findIncoming(transferId: String): IncomingCheckpoint?
     suspend fun saveIncoming(checkpoint: IncomingCheckpoint)
+    suspend fun insertIncoming(checkpoint: IncomingCheckpoint): Boolean =
+        error("insertIncoming is not implemented")
+    suspend fun acquireIncomingSession(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? = error("acquireIncomingSession is not implemented")
+    suspend fun releaseIncomingSession(expected: IncomingCheckpoint, token: String): Boolean =
+        error("releaseIncomingSession is not implemented")
+    suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int =
+        error("clearStaleIncomingSessions is not implemented")
+    suspend fun replaceIncomingForRestart(
+        expected: IncomingCheckpoint,
+        replacement: IncomingCheckpoint,
+        token: String
+    ): Boolean = error("replaceIncomingForRestart is not implemented")
+    suspend fun clearRetiredIncoming(expected: IncomingCheckpoint, token: String): Boolean =
+        error("clearRetiredIncoming is not implemented")
+    suspend fun deleteOwnedIncoming(expected: IncomingCheckpoint, token: String): Boolean =
+        error("deleteOwnedIncoming is not implemented")
 
     suspend fun commitIncomingChunk(
         transferId: String,
@@ -14,12 +35,24 @@ interface ResumeStore {
         updatedAt: Long,
         expiresAt: Long
     ): Boolean
+    suspend fun commitOwnedIncomingChunk(
+        expected: IncomingCheckpoint,
+        token: String,
+        confirmedBytes: Long,
+        nextChunkIndex: Int,
+        chainDigest: ByteArray,
+        lastChunkHash: ByteArray,
+        updatedAt: Long,
+        expiresAt: Long
+    ): Boolean = error("commitOwnedIncomingChunk is not implemented")
 
     suspend fun updateIncomingExpiry(transferId: String, updatedAt: Long, expiresAt: Long): Boolean
     suspend fun deleteIncoming(transferId: String)
 
     suspend fun findOutgoing(sourceUri: String, peerDeviceId: String): OutgoingResumeLink?
     suspend fun saveOutgoing(link: OutgoingResumeLink)
+    suspend fun resolveOutgoing(candidate: OutgoingResumeLink): OutgoingResumeLink =
+        error("resolveOutgoing is not implemented")
     suspend fun updateOutgoingTimestamp(transferId: String, updatedAt: Long): Boolean
     suspend fun deleteOutgoing(transferId: String)
 
@@ -44,6 +77,78 @@ class RoomResumeStore(
         dao.upsertIncoming(checkpoint.toEntity())
     }
 
+    override suspend fun insertIncoming(checkpoint: IncomingCheckpoint): Boolean =
+        dao.insertIncoming(checkpoint.toEntity()) != -1L
+
+    override suspend fun acquireIncomingSession(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? {
+        val acquired = dao.acquireIncomingSession(
+            transferId = expected.transferId,
+            storageKind = expected.storageKind,
+            storageValue = expected.storageValue,
+            generation = expected.generation,
+            nextChunkIndex = expected.nextChunkIndex,
+            confirmedBytes = expected.confirmedBytes,
+            chainDigest = expected.chainDigest,
+            lastChunkHash = expected.lastChunkHash,
+            token = token,
+            now = now,
+            expiresAt = expiresAt
+        ) > 0
+        return if (acquired) dao.findIncoming(expected.transferId)?.toDomain() else null
+    }
+
+    override suspend fun releaseIncomingSession(expected: IncomingCheckpoint, token: String): Boolean =
+        dao.releaseIncomingSession(
+            expected.transferId, token, expected.generation, expected.storageKind,
+            expected.storageValue, expected.nextChunkIndex
+        ) > 0
+
+    override suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int =
+        dao.clearStaleIncomingSessions(staleClaimBefore)
+
+    override suspend fun replaceIncomingForRestart(
+        expected: IncomingCheckpoint,
+        replacement: IncomingCheckpoint,
+        token: String
+    ): Boolean = dao.replaceIncomingForRestart(
+        transferId = expected.transferId,
+        token = token,
+        expectedGeneration = expected.generation,
+        expectedStorageKind = expected.storageKind,
+        expectedStorageValue = expected.storageValue,
+        expectedNextChunkIndex = expected.nextChunkIndex,
+        newGeneration = replacement.generation,
+        newStorageKind = replacement.storageKind,
+        newStorageValue = replacement.storageValue,
+        displayName = replacement.displayName,
+        mimeType = replacement.mimeType,
+        fileSize = replacement.fileSize,
+        chunkSize = replacement.chunkSize,
+        chainDigest = replacement.chainDigest,
+        lastChunkHash = replacement.lastChunkHash,
+        now = replacement.updatedAt,
+        expiresAt = replacement.expiresAt
+    ) > 0
+
+    override suspend fun clearRetiredIncoming(expected: IncomingCheckpoint, token: String): Boolean {
+        val retired = expected.retiredLocation ?: return true
+        return dao.clearRetiredIncoming(
+            expected.transferId, token, expected.generation, expected.storageKind,
+            expected.storageValue, expected.nextChunkIndex, retired.kind, retired.value
+        ) > 0
+    }
+
+    override suspend fun deleteOwnedIncoming(expected: IncomingCheckpoint, token: String): Boolean =
+        dao.deleteOwnedIncoming(
+            expected.transferId, token, expected.generation, expected.storageKind,
+            expected.storageValue, expected.nextChunkIndex
+        ) > 0
+
     override suspend fun commitIncomingChunk(
         transferId: String,
         expectedNextChunkIndex: Int,
@@ -64,6 +169,21 @@ class RoomResumeStore(
         expiresAt = expiresAt
     ) > 0
 
+    override suspend fun commitOwnedIncomingChunk(
+        expected: IncomingCheckpoint,
+        token: String,
+        confirmedBytes: Long,
+        nextChunkIndex: Int,
+        chainDigest: ByteArray,
+        lastChunkHash: ByteArray,
+        updatedAt: Long,
+        expiresAt: Long
+    ): Boolean = dao.commitOwnedIncomingChunk(
+        expected.transferId, token, expected.generation, expected.storageKind,
+        expected.storageValue, expected.nextChunkIndex, confirmedBytes,
+        nextChunkIndex, chainDigest, lastChunkHash, updatedAt, expiresAt
+    ) > 0
+
     override suspend fun updateIncomingExpiry(
         transferId: String,
         updatedAt: Long,
@@ -82,6 +202,9 @@ class RoomResumeStore(
     override suspend fun saveOutgoing(link: OutgoingResumeLink) {
         dao.upsertOutgoing(link.toEntity())
     }
+
+    override suspend fun resolveOutgoing(candidate: OutgoingResumeLink): OutgoingResumeLink =
+        dao.resolveOutgoing(candidate.toEntity()).toDomain()
 
     override suspend fun updateOutgoingTimestamp(transferId: String, updatedAt: Long): Boolean =
         dao.updateOutgoingTimestamp(transferId, updatedAt) > 0
@@ -128,7 +251,12 @@ class RoomResumeStore(
         updatedAt = updatedAt,
         expiresAt = expiresAt,
         cleanupToken = null,
-        cleanupClaimedAt = null
+        cleanupClaimedAt = null,
+        generation = generation,
+        sessionToken = sessionToken,
+        sessionClaimedAt = sessionClaimedAt,
+        retiredStorageKind = retiredStorageKind,
+        retiredStorageValue = retiredStorageValue
     )
 
     private fun IncomingCheckpointEntity.toDomain() = IncomingCheckpoint(
@@ -147,7 +275,12 @@ class RoomResumeStore(
         storageValue = storageValue,
         createdAt = createdAt,
         updatedAt = updatedAt,
-        expiresAt = expiresAt
+        expiresAt = expiresAt,
+        generation = generation,
+        sessionToken = sessionToken,
+        sessionClaimedAt = sessionClaimedAt,
+        retiredStorageKind = retiredStorageKind,
+        retiredStorageValue = retiredStorageValue
     )
 
     private fun OutgoingResumeLink.toEntity() = OutgoingResumeLinkEntity(
