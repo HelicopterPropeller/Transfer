@@ -89,6 +89,15 @@ class DownloadStorage(private val context: Context) :
             try {
                 when (location.kind) {
                     StoredFileLocation.MEDIA_STORE -> {
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                            check(
+                                DownloadStorageApiPolicy.decide(
+                                    Build.VERSION.SDK_INT,
+                                    MediaStoreLocationOperation.REOPEN
+                                ) == MediaStoreLocationDecision.RETURN_NULL
+                            )
+                            return@withContext null
+                        }
                         val uri = ownedPendingMediaStoreUri(location) ?: return@withContext null
                         openMediaStoreHandle(uri, FileNamePolicy.sanitize(displayName))
                     }
@@ -104,6 +113,15 @@ class DownloadStorage(private val context: Context) :
         withContext(Dispatchers.IO) {
             when (location.kind) {
                 StoredFileLocation.MEDIA_STORE -> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        check(
+                            DownloadStorageApiPolicy.decide(
+                                Build.VERSION.SDK_INT,
+                                MediaStoreLocationOperation.OPEN_INPUT
+                            ) == MediaStoreLocationDecision.RETURN_NULL
+                        )
+                        return@withContext null
+                    }
                     val uri = ownedPendingMediaStoreUri(location) ?: return@withContext null
                     try {
                         context.contentResolver.openInputStream(uri)
@@ -124,7 +142,20 @@ class DownloadStorage(private val context: Context) :
     override suspend fun publish(handle: ResumableFileHandle): String? =
         withContext(Dispatchers.IO) {
             when (handle.location.kind) {
-                StoredFileLocation.MEDIA_STORE -> publishMediaStoreFile(handle)
+                StoredFileLocation.MEDIA_STORE -> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        check(
+                            DownloadStorageApiPolicy.decide(
+                                Build.VERSION.SDK_INT,
+                                MediaStoreLocationOperation.PUBLISH
+                            ) == MediaStoreLocationDecision.THROW_UNSUPPORTED
+                        )
+                        throw IOException(
+                            "MediaStore resume locations require Android 10 or newer"
+                        )
+                    }
+                    publishMediaStoreFile(handle)
+                }
                 StoredFileLocation.LEGACY_FILE -> publishLegacyFile(handle)
                 else -> error("Unsupported stored file location: ${handle.location.kind}")
             }
@@ -136,7 +167,15 @@ class DownloadStorage(private val context: Context) :
     ): String? = withContext(Dispatchers.IO) {
         when (location.kind) {
             StoredFileLocation.MEDIA_STORE -> {
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return@withContext null
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    check(
+                        DownloadStorageApiPolicy.decide(
+                            Build.VERSION.SDK_INT,
+                            MediaStoreLocationOperation.RECOVER_PUBLISHED
+                        ) == MediaStoreLocationDecision.RETURN_NULL
+                    )
+                    return@withContext null
+                }
                 val uri = mediaStoreDownloadsUri(location)
                 val pending = ownedMediaStorePendingState(uri) ?: return@withContext null
                 if (!pending) uri.toString() else null
@@ -157,6 +196,15 @@ class DownloadStorage(private val context: Context) :
     override suspend fun delete(location: StoredFileLocation) = withContext(Dispatchers.IO) {
         when (location.kind) {
             StoredFileLocation.MEDIA_STORE -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    check(
+                        DownloadStorageApiPolicy.decide(
+                            Build.VERSION.SDK_INT,
+                            MediaStoreLocationOperation.DELETE
+                        ) == MediaStoreLocationDecision.IGNORE
+                    )
+                    return@withContext
+                }
                 val uri = ownedPendingMediaStoreUri(location) ?: return@withContext
                 context.contentResolver.delete(uri, null, null)
             }
