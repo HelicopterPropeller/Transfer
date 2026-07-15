@@ -25,23 +25,15 @@ object TransferProtocol {
     const val SUCCESS = COMPLETE
     const val FAILURE = FAILED
     private const val VERSION = 3
-    private const val MAX_FILE_NAME_BYTES = 1024
-    private const val MAX_MIME_BYTES = 256
     private val MAGIC = byteArrayOf('L'.code.toByte(), 'T'.code.toByte(), 'F'.code.toByte(), '3'.code.toByte())
 
     fun writeHeader(output: DataOutputStream, header: TransferHeader) {
         validateFileSize(header.fileSize)
         if (header.chunkSize != CHUNK_SIZE) throw ProtocolException("Invalid chunk size")
-        val fileName = header.fileName.toByteArray(Charsets.UTF_8)
-        val mime = header.mimeType.toByteArray(Charsets.UTF_8)
-        validateMetadata(fileName, MAX_FILE_NAME_BYTES, "file name")
-        validateMetadata(mime, MAX_MIME_BYTES, "MIME")
         output.write(MAGIC)
         output.writeByte(VERSION)
-        output.writeInt(fileName.size)
-        output.write(fileName)
-        output.writeInt(mime.size)
-        output.write(mime)
+        output.writeBoundedText(header.fileName, ResumeProtocol.MAX_FILE_NAME_BYTES, "file name")
+        output.writeBoundedText(header.mimeType, ResumeProtocol.MAX_MIME_BYTES, "MIME")
         output.writeLong(header.fileSize)
         output.writeInt(header.chunkSize)
     }
@@ -51,22 +43,12 @@ object TransferProtocol {
         input.readFully(magic)
         if (!magic.contentEquals(MAGIC)) throw ProtocolException("Invalid transfer magic")
         if (input.readUnsignedByte() != VERSION) throw ProtocolException("Unsupported protocol version")
-        val fileName = readText(input, MAX_FILE_NAME_BYTES, "file name")
-        val mime = readText(input, MAX_MIME_BYTES, "MIME")
+        val fileName = input.readBoundedText(ResumeProtocol.MAX_FILE_NAME_BYTES, "file name")
+        val mime = input.readBoundedText(ResumeProtocol.MAX_MIME_BYTES, "MIME")
         val fileSize = input.readLong().also(::validateFileSize)
         val chunkSize = input.readInt()
         if (chunkSize != CHUNK_SIZE) throw ProtocolException("Invalid chunk size")
         return TransferHeader(fileName, mime, fileSize, chunkSize)
-    }
-
-    private fun readText(input: DataInputStream, maximum: Int, label: String): String {
-        val length = input.readInt()
-        if (length !in 1..maximum) throw ProtocolException("Invalid $label length")
-        return ByteArray(length).also(input::readFully).toString(Charsets.UTF_8)
-    }
-
-    private fun validateMetadata(bytes: ByteArray, maximum: Int, label: String) {
-        if (bytes.isEmpty() || bytes.size > maximum) throw ProtocolException("Invalid $label length")
     }
 
     private fun validateFileSize(size: Long) {
