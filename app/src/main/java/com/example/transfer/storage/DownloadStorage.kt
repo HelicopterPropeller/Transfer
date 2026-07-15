@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
@@ -14,8 +15,14 @@ import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.OutputStream
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -33,7 +40,10 @@ interface IncomingFileStore {
     suspend fun abort(handle: ReceivedFileHandle)
 }
 
-class DownloadStorage(private val context: Context) : IncomingFileStore {
+class DownloadStorage(private val context: Context) :
+    IncomingFileStore,
+    ResumableIncomingFileStore {
+
     override suspend fun create(fileName: String, mimeType: String): ReceivedFileHandle =
         withContext(Dispatchers.IO) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -43,23 +53,93 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
             }
         }
 
-    override suspend fun complete(handle: ReceivedFileHandle): String? = withContext(Dispatchers.IO) {
-        handle.output.flush()
-        handle.output.close()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && handle.uri != null) {
-            val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-            check(context.contentResolver.update(handle.uri, values, null, null) > 0) {
-                "Unable to publish received file"
-            }
-            handle.uri.toString()
+    override suspend fun create(
+        transferId: String,
+        fileName: String,
+        mimeType: String
+    ): ResumableFileHandle = withContext(Dispatchers.IO) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            createMediaStoreResumableFile(fileName, mimeType)
         } else {
-            FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.files",
-                requireNotNull(handle.file)
-            ).toString()
+            createLegacyResumableFile(transferId, fileName)
         }
     }
+
+    override suspend fun reopen(
+        location: StoredFileLocation,
+        displayName: String
+    ): ResumableFileHandle? =
+        withContext(Dispatchers.IO) {
+            try {
+                when (location.kind) {
+                    StoredFileLocation.MEDIA_STORE -> reopenMediaStoreFile(location, displayName)
+                    StoredFileLocation.LEGACY_FILE -> reopenLegacyFile(location, displayName)
+                    else -> null
+                }
+            } catch (_: FileNotFoundException) {
+                null
+            }
+        }
+
+    override suspend fun openInput(location: StoredFileLocation): InputStream? =
+        withContext(Dispatchers.IO) {
+            when (location.kind) {
+                StoredFileLocation.MEDIA_STORE ->
+                    context.contentResolver.openInputStream(mediaStoreUri(location))
+
+                StoredFileLocation.LEGACY_FILE -> {
+                    val file = checkedLegacyFile(location)
+                    if (file.isFile) FileInputStream(file) else null
+                }
+
+                else -> null
+            }
+        }
+
+    override suspend fun publish(handle: ResumableFileHandle): String? =
+        withContext(Dispatchers.IO) {
+            when (handle.location.kind) {
+                StoredFileLocation.MEDIA_STORE -> publishMediaStoreFile(handle)
+                StoredFileLocation.LEGACY_FILE -> publishLegacyFile(handle)
+                else -> error("Unsupported stored file location: ${handle.location.kind}")
+            }
+        }
+
+    override suspend fun delete(location: StoredFileLocation) = withContext(Dispatchers.IO) {
+        when (location.kind) {
+            StoredFileLocation.MEDIA_STORE ->
+                context.contentResolver.delete(mediaStoreUri(location), null, null)
+
+            StoredFileLocation.LEGACY_FILE -> {
+                val file = checkedLegacyFile(location)
+                check(!file.exists() || file.delete()) { "Unable to delete partial download" }
+            }
+
+            else -> Unit
+        }
+        Unit
+    }
+
+    override suspend fun complete(handle: ReceivedFileHandle): String? =
+        withContext(Dispatchers.IO) {
+            handle.output.flush()
+            handle.output.close()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && handle.uri != null) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                check(context.contentResolver.update(handle.uri, values, null, null) > 0) {
+                    "Unable to publish received file"
+                }
+                handle.uri.toString()
+            } else {
+                FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.files",
+                    requireNotNull(handle.file)
+                ).toString()
+            }
+        }
 
     override suspend fun abort(handle: ReceivedFileHandle) = withContext(Dispatchers.IO) {
         runCatching { handle.output.close() }
@@ -68,6 +148,170 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
             handle.file != null -> handle.file.delete()
         }
         Unit
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun createMediaStoreResumableFile(
+        requestedName: String,
+        mimeType: String
+    ): ResumableFileHandle {
+        val resolver = context.contentResolver
+        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/Transfer"
+        val displayName = uniqueMediaStoreName(FileNamePolicy.sanitize(requestedName), relativePath)
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType.ifBlank { "application/octet-stream" })
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: error("Unable to create a file in Download/Transfer")
+        return try {
+            openMediaStoreHandle(uri, displayName)
+                ?: error("Unable to open the received file")
+        } catch (failure: Throwable) {
+            resolver.delete(uri, null, null)
+            throw failure
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun reopenMediaStoreFile(
+        location: StoredFileLocation,
+        displayName: String
+    ): ResumableFileHandle? {
+        val uri = mediaStoreUri(location)
+        return openMediaStoreHandle(uri, FileNamePolicy.sanitize(displayName))
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun openMediaStoreHandle(uri: Uri, displayName: String): ResumableFileHandle? {
+        val descriptor = context.contentResolver.openFileDescriptor(uri, "rw") ?: return null
+        return try {
+            val output = FileOutputStream(descriptor.fileDescriptor)
+            ChannelResumableFileHandle(
+                location = StoredFileLocation(StoredFileLocation.MEDIA_STORE, uri.toString()),
+                displayName = displayName,
+                channel = output.channel,
+                closeResources = { closeMediaStoreResources(output, descriptor) }
+            )
+        } catch (failure: Throwable) {
+            runCatching { descriptor.close() }
+            throw failure
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun publishMediaStoreFile(handle: ResumableFileHandle): String {
+        val uri = mediaStoreUri(handle.location)
+        handle.close()
+        val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+        check(context.contentResolver.update(uri, values, null, null) > 0) {
+            "Unable to publish received file"
+        }
+        return uri.toString()
+    }
+
+    private fun closeMediaStoreResources(
+        output: FileOutputStream,
+        descriptor: ParcelFileDescriptor
+    ) {
+        val outputFailure = runCatching { output.close() }.exceptionOrNull()
+        val descriptorFailure = runCatching { descriptor.close() }.exceptionOrNull()
+        when {
+            outputFailure != null -> {
+                descriptorFailure?.let(outputFailure::addSuppressed)
+                throw outputFailure
+            }
+
+            descriptorFailure != null -> throw descriptorFailure
+        }
+    }
+
+    private fun createLegacyResumableFile(
+        transferId: String,
+        requestedName: String
+    ): ResumableFileHandle {
+        val directory = legacyDirectory()
+        val safeTransferId = FileNamePolicy.sanitize(transferId)
+        val partialFile = File(directory, ".transfer-$safeTransferId.part").canonicalFile
+        check(partialFile.parentFile == directory) { "Invalid partial download path" }
+        val randomAccessFile = RandomAccessFile(partialFile, "rw")
+        return try {
+            randomAccessFile.setLength(0)
+            legacyHandle(partialFile, FileNamePolicy.sanitize(requestedName), randomAccessFile)
+        } catch (failure: Throwable) {
+            runCatching { randomAccessFile.close() }
+            throw failure
+        }
+    }
+
+    private fun reopenLegacyFile(
+        location: StoredFileLocation,
+        displayName: String
+    ): ResumableFileHandle? {
+        val file = checkedLegacyFile(location)
+        if (!file.isFile) return null
+        val randomAccessFile = RandomAccessFile(file, "rw")
+        return legacyHandle(file, FileNamePolicy.sanitize(displayName), randomAccessFile)
+    }
+
+    private fun legacyHandle(
+        file: File,
+        displayName: String,
+        randomAccessFile: RandomAccessFile
+    ): ResumableFileHandle = ChannelResumableFileHandle(
+        location = StoredFileLocation(
+            StoredFileLocation.LEGACY_FILE,
+            file.canonicalPath
+        ),
+        displayName = displayName,
+        channel = randomAccessFile.channel,
+        closeResources = randomAccessFile::close
+    )
+
+    private fun publishLegacyFile(handle: ResumableFileHandle): String {
+        val partialFile = checkedLegacyFile(handle.location)
+        val finalName = FileNamePolicy.sanitize(handle.displayName)
+        handle.close()
+        val finalFile = uniqueLegacyFile(finalName)
+        check(partialFile.renameTo(finalFile)) { "Unable to publish received file" }
+        return FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.files",
+            finalFile
+        ).toString()
+    }
+
+    private fun checkedLegacyFile(location: StoredFileLocation): File {
+        check(location.kind == StoredFileLocation.LEGACY_FILE) {
+            "Expected a legacy file location"
+        }
+        val directory = legacyDirectory()
+        val file = File(location.value).canonicalFile
+        check(file.parentFile == directory) { "Invalid partial download path" }
+        return file
+    }
+
+    @Suppress("DEPRECATION")
+    private fun legacyDirectory(): File {
+        check(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+                PackageManager.PERMISSION_GRANTED
+        ) { "Storage permission is required to save to Download/Transfer" }
+        val directory = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "Transfer"
+        ).canonicalFile
+        check(directory.exists() || directory.mkdirs()) { "Unable to create Download/Transfer" }
+        return directory
+    }
+
+    private fun mediaStoreUri(location: StoredFileLocation): Uri {
+        check(location.kind == StoredFileLocation.MEDIA_STORE) {
+            "Expected a MediaStore location"
+        }
+        return Uri.parse(location.value)
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
@@ -82,10 +326,10 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("无法在 Download/Transfer 创建文件")
+            ?: error("Unable to create a file in Download/Transfer")
         val output = resolver.openOutputStream(uri, "w") ?: run {
             resolver.delete(uri, null, null)
-            error("无法打开接收文件")
+            error("Unable to open the received file")
         }
         return ReceivedFileHandle(output, uri = uri, displayName = displayName)
     }
@@ -104,7 +348,8 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun mediaStoreNameExists(name: String, relativePath: String): Boolean {
         val projection = arrayOf(MediaStore.MediaColumns._ID)
-        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+        val selection =
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
         context.contentResolver.query(
             MediaStore.Downloads.EXTERNAL_CONTENT_URI,
             projection,
@@ -117,16 +362,12 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
 
     @Suppress("DEPRECATION")
     private fun createLegacyFile(requestedName: String): ReceivedFileHandle {
-        check(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
-                PackageManager.PERMISSION_GRANTED
-        ) { "没有存储权限，无法保存到 Download/Transfer" }
-        val directory = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "Transfer"
-        )
-        check(directory.exists() || directory.mkdirs()) { "无法创建 Download/Transfer" }
-        val safeName = FileNamePolicy.sanitize(requestedName)
+        val file = uniqueLegacyFile(FileNamePolicy.sanitize(requestedName))
+        return ReceivedFileHandle(FileOutputStream(file), file = file, displayName = file.name)
+    }
+
+    private fun uniqueLegacyFile(safeName: String): File {
+        val directory = legacyDirectory()
         var file = File(directory, safeName)
         if (file.exists()) {
             val stamp = timestamp()
@@ -135,9 +376,48 @@ class DownloadStorage(private val context: Context) : IncomingFileStore {
                 file = File(directory, FileNamePolicy.withTimestamp(safeName, stamp, attempt++))
             } while (file.exists())
         }
-        return ReceivedFileHandle(FileOutputStream(file), file = file, displayName = file.name)
+        return file
     }
 
     private fun timestamp(): String =
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+}
+
+private class ChannelResumableFileHandle(
+    override val location: StoredFileLocation,
+    override val displayName: String,
+    private val channel: FileChannel,
+    private val closeResources: () -> Unit
+) : ResumableFileHandle {
+    private var closed = false
+
+    override fun length(): Long = channel.size()
+
+    override fun writeAt(offset: Long, source: ByteArray, length: Int) {
+        require(offset >= 0) { "Offset must not be negative" }
+        require(length in 0..source.size) { "Invalid source length" }
+        Math.addExact(offset, length.toLong())
+        val buffer = ByteBuffer.wrap(source, 0, length)
+        var writeOffset = offset
+        while (buffer.hasRemaining()) {
+            val written = channel.write(buffer, writeOffset)
+            check(written > 0) { "Unable to make progress writing received file" }
+            writeOffset += written
+        }
+    }
+
+    override fun truncate(length: Long) {
+        require(length >= 0) { "Length must not be negative" }
+        channel.truncate(length)
+    }
+
+    override fun force() {
+        channel.force(true)
+    }
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        closeResources()
+    }
 }
