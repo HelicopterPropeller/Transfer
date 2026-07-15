@@ -95,7 +95,7 @@ class ResumeCoordinator(
     }
 
     suspend fun queryCompleted(offer: TransferOffer): ResumeStatus? =
-        store.findCompletedReceipt(offer.transferId)?.let { receipt ->
+        store.findCompletedReceipt(offer.transferId, clock())?.let { receipt ->
             if (receipt.matches(offer)) {
                 ResumeStatus(ResumeState.COMPLETED, finalDigest = receipt.finalDigest.copyOf())
             } else {
@@ -277,9 +277,10 @@ class ResumeCoordinator(
             if (store.deleteStagingJournal(journal)) recovered++
         }
 
-        store.findCompletingIncoming().forEach { checkpoint ->
-            if (!recoverRetiredAfterProcessDeath(checkpoint)) return@forEach
+        store.findCompletingIncoming().forEach { original ->
+            if (!recoverRetiredAfterProcessDeath(original)) return@forEach
             try {
+                val checkpoint = recoverCompletingDigest(original) ?: return@forEach
                 val finalDigest = checkpoint.completingFinalDigest ?: return@forEach
                 val alreadyPublished = files.recoverPublished(
                     checkpoint.location.toStoredLocation(), checkpoint.displayName
@@ -303,6 +304,26 @@ class ResumeCoordinator(
         }
         recovered += store.clearStaleIncomingSessions(staleClaimBefore)
         return recovered
+    }
+
+    private suspend fun recoverCompletingDigest(
+        checkpoint: IncomingCheckpoint
+    ): IncomingCheckpoint? {
+        if (checkpoint.completingFinalDigest != null) return checkpoint
+        if (checkpoint.confirmedBytes != checkpoint.fileSize) return null
+        val input = files.openCompletionInput(
+            checkpoint.location.toStoredLocation(), checkpoint.displayName
+        ) ?: return null
+        val coroutineContext = currentCoroutineContext()
+        val digest = input.use {
+            PrefixDigestScanner.scan(it, checkpoint.fileSize, checkpoint.chunkSize) {
+                coroutineContext.ensureActive()
+            }.wholeDigest.digest()
+        }
+        val now = clock()
+        return store.persistRecoveredCompletingDigest(
+            checkpoint, digest, now, now + RETENTION_MILLIS
+        )
     }
 
     suspend fun completeOutgoing(transferId: String) {

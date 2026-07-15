@@ -50,6 +50,10 @@ class DownloadStorageInstrumentedTest {
         requireNotNull(reopened).writeAt(2, byteArrayOf(8, 9), 2)
         reopened.force()
         assertArrayEquals(byteArrayOf(1, 2, 8, 9), storage.openInput(created.location)?.readBytes())
+        assertArrayEquals(
+            byteArrayOf(1, 2, 8, 9),
+            storage.openCompletionInput(created.location, "resume.bin")?.readBytes()
+        )
         reopened.close()
 
         storage.delete(created.location)
@@ -67,9 +71,15 @@ class DownloadStorageInstrumentedTest {
         )
         val uri = Uri.parse(created.location.value)
         createdUris += uri
+        created.writeAt(0, byteArrayOf(4, 5, 6), 3)
+        created.force()
 
         assertEquals(uri.toString(), storage.publish(created))
         assertEquals(uri.toString(), storage.recoverPublished(created.location, "publish.bin"))
+        assertArrayEquals(
+            byteArrayOf(4, 5, 6),
+            storage.openCompletionInput(created.location, "publish.bin")?.readBytes()
+        )
 
         resolver.query(
             uri,

@@ -241,9 +241,35 @@ class RoomResumeStoreTest {
         assertTrue(store.finishIncomingCompletion(completing, receipt))
 
         assertNull(store.findIncoming("t1"))
-        val stored = requireNotNull(store.findCompletedReceipt("t1"))
+        val stored = requireNotNull(store.findCompletedReceipt("t1", now = 150L))
         assertArrayEquals(digest, stored.finalDigest)
         assertEquals(receipt.publishedUri, stored.publishedUri)
+        assertNull(store.findCompletedReceipt("t1", now = 200L))
+    }
+
+    @Test
+    fun `legacy completing digest is persisted only for exact full checkpoint`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        val completing = incoming("t1").copy(
+            confirmedBytes = 32L,
+            nextChunkIndex = 4,
+            operationState = IncomingOperationState.COMPLETING,
+            completingFinalDigest = null
+        )
+        store.saveIncoming(completing)
+        val digest = ByteArray(32) { 3 }
+
+        val recovered = store.persistRecoveredCompletingDigest(
+            completing, digest, now = 50L, expiresAt = 500L
+        )
+
+        assertArrayEquals(digest, recovered?.completingFinalDigest)
+        assertEquals(50L, recovered?.updatedAt)
+        assertNull(
+            store.persistRecoveredCompletingDigest(
+                completing, ByteArray(32) { 9 }, now = 60L, expiresAt = 600L
+            )
+        )
     }
 
     @Test
@@ -418,6 +444,27 @@ private class FakeResumeDao : ResumeDao {
     override suspend fun findCompletingIncoming(): List<IncomingCheckpointEntity> =
         incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
 
+    override suspend fun persistRecoveredCompletingDigest(
+        transferId: String,
+        generation: Long,
+        storageKind: String,
+        storageValue: String,
+        finalDigest: ByteArray,
+        now: Long,
+        expiresAt: Long
+    ): Int {
+        val current = incoming[transferId] ?: return 0
+        if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.completingFinalDigest != null || current.confirmedBytes != current.fileSize ||
+            current.generation != generation || current.storageKind != storageKind ||
+            current.storageValue != storageValue
+        ) return 0
+        incoming[transferId] = current.copy(
+            completingFinalDigest = finalDigest, updatedAt = now, expiresAt = expiresAt
+        )
+        return 1
+    }
+
     override suspend fun deleteCompletingIncoming(
         transferId: String, generation: Long, storageKind: String, storageValue: String,
         finalDigest: ByteArray
@@ -434,6 +481,13 @@ private class FakeResumeDao : ResumeDao {
 
     override suspend fun findCompletedReceipt(transferId: String): CompletedReceiptEntity? =
         receipts[transferId]
+
+    override suspend fun deleteExpiredCompletedReceipt(transferId: String, now: Long): Int {
+        val current = receipts[transferId] ?: return 0
+        if (current.expiresAt > now) return 0
+        receipts.remove(transferId)
+        return 1
+    }
 
     override suspend fun insertCompletedReceipt(receipt: CompletedReceiptEntity): Long {
         if (receipts.containsKey(receipt.transferId)) return -1

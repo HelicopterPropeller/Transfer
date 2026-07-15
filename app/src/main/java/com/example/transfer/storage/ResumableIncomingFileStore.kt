@@ -38,6 +38,11 @@ interface ResumableIncomingFileStore {
         displayName: String
     ): ResumableFileHandle?
     suspend fun openInput(location: StoredFileLocation): InputStream?
+    /** Opens the committed bytes whether the resumable location is still pending or already published. */
+    suspend fun openCompletionInput(
+        location: StoredFileLocation,
+        displayName: String
+    ): InputStream? = openInput(location)
     suspend fun publish(handle: ResumableFileHandle): String?
     /** Returns the result of an already-completed publish without publishing a second file. */
     suspend fun recoverPublished(location: StoredFileLocation, displayName: String): String? = null

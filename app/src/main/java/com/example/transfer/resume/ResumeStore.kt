@@ -38,9 +38,15 @@ interface ResumeStore {
         expiresAt: Long
     ): Boolean = error("beginIncomingCompletion is not implemented")
     suspend fun findCompletingIncoming(): List<IncomingCheckpoint> = emptyList()
+    suspend fun persistRecoveredCompletingDigest(
+        expected: IncomingCheckpoint,
+        finalDigest: ByteArray,
+        now: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? = error("persistRecoveredCompletingDigest is not implemented")
     suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
         error("deleteCompletingIncoming is not implemented")
-    suspend fun findCompletedReceipt(transferId: String): CompletedReceipt? = null
+    suspend fun findCompletedReceipt(transferId: String, now: Long): CompletedReceipt? = null
     suspend fun finishIncomingCompletion(
         expected: IncomingCheckpoint,
         receipt: CompletedReceipt
@@ -202,14 +208,27 @@ class RoomResumeStore(
     override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
         dao.findCompletingIncoming().map { it.toDomain() }
 
+    override suspend fun persistRecoveredCompletingDigest(
+        expected: IncomingCheckpoint,
+        finalDigest: ByteArray,
+        now: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? {
+        val updated = dao.persistRecoveredCompletingDigest(
+            expected.transferId, expected.generation, expected.storageKind,
+            expected.storageValue, finalDigest, now, expiresAt
+        ) > 0
+        return if (updated) dao.findIncoming(expected.transferId)?.toDomain() else null
+    }
+
     override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
         dao.deleteCompletingIncoming(
             expected.transferId, expected.generation, expected.storageKind, expected.storageValue,
             requireNotNull(expected.completingFinalDigest)
         ) > 0
 
-    override suspend fun findCompletedReceipt(transferId: String): CompletedReceipt? =
-        dao.findCompletedReceipt(transferId)?.toDomain()
+    override suspend fun findCompletedReceipt(transferId: String, now: Long): CompletedReceipt? =
+        dao.findValidCompletedReceipt(transferId, now)?.toDomain()
 
     override suspend fun finishIncomingCompletion(
         expected: IncomingCheckpoint,

@@ -139,6 +139,30 @@ class DownloadStorage(private val context: Context) :
             }
         }
 
+    override suspend fun openCompletionInput(
+        location: StoredFileLocation,
+        displayName: String
+    ): InputStream? = withContext(Dispatchers.IO) {
+        when (location.kind) {
+            StoredFileLocation.MEDIA_STORE -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return@withContext null
+                val uri = mediaStoreDownloadsUri(location)
+                ownedMediaStorePendingState(uri) ?: return@withContext null
+                try {
+                    context.contentResolver.openInputStream(uri)
+                } catch (_: FileNotFoundException) {
+                    null
+                }
+            }
+            StoredFileLocation.LEGACY_FILE -> {
+                val partial = checkedLegacyFile(location)
+                val file = if (partial.isFile) partial else legacyPublishedFile(location, displayName)
+                if (file.isFile) FileInputStream(file) else null
+            }
+            else -> null
+        }
+    }
+
     override suspend fun publish(handle: ResumableFileHandle): String? =
         withContext(Dispatchers.IO) {
             when (handle.location.kind) {

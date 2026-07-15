@@ -6,6 +6,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.transfer.history.TransferHistoryDatabase
+import com.example.transfer.storage.ResumableFileHandle
+import com.example.transfer.storage.ResumableIncomingFileStore
+import com.example.transfer.storage.StoredFileLocation
+import java.io.ByteArrayInputStream
+import java.io.InputStream
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -90,7 +95,7 @@ class TransferDatabaseMigrationTest {
     }
 
     @Test
-    fun migration3To4PreservesCheckpointAndAddsCompletionReceipts() {
+    fun migration3To4PreservesCheckpointAndRecoversLegacyCompletionReceipt() = runBlocking {
         helper.createDatabase(TEST_DATABASE, 3).apply {
             createVersionOneHistoryTable()
             TransferHistoryDatabase.MIGRATION_1_2.migrate(this)
@@ -119,6 +124,29 @@ class TransferDatabaseMigrationTest {
         }
         assertTableEmpty(migrated, "completed_receipts")
         migrated.close()
+
+        val room = Room.databaseBuilder(
+            InstrumentationRegistry.getInstrumentation().targetContext,
+            TransferHistoryDatabase::class.java,
+            TEST_DATABASE
+        ).addMigrations(
+            TransferHistoryDatabase.MIGRATION_1_2,
+            TransferHistoryDatabase.MIGRATION_2_3,
+            TransferHistoryDatabase.MIGRATION_3_4
+        ).build()
+        try {
+            val files = MigrationRecoveryFiles(ByteArray(0))
+            val coordinator = ResumeCoordinator(RoomResumeStore(room.resumeDao()), files, clock = { 100L })
+
+            assertEquals(1, coordinator.recoverInterruptedState(Long.MAX_VALUE))
+
+            assertEquals(1, files.publishCount)
+            assertNull(room.resumeDao().findIncoming("kept"))
+            val receipt = requireNotNull(room.resumeDao().findValidCompletedReceipt("kept", 100L))
+            assertTrue(receipt.finalDigest.contentEquals(com.example.transfer.protocol.ChunkCodec.sha256(ByteArray(0))))
+        } finally {
+            room.close()
+        }
     }
 
     @Test
@@ -255,6 +283,30 @@ class TransferDatabaseMigrationTest {
             val stored = requireNotNull(dao.findCompletedReceipt(checkpoint.transferId))
             assertTrue(digest.contentEquals(stored.finalDigest))
             assertEquals(receipt.publishedUri, stored.publishedUri)
+        }
+    }
+
+    @Test
+    fun realRoomReceiptQueryDeletesAtExpiryBoundary() = runBlocking {
+        withResumeDatabase { database ->
+            val receipt = CompletedReceiptEntity(
+                transferId = "expired",
+                senderDeviceId = "sender",
+                fileName = "a.bin",
+                mimeType = "application/octet-stream",
+                fileSize = 0,
+                chunkSize = 1_048_576,
+                finalDigest = ByteArray(32),
+                publishedUri = "content://received/a.bin",
+                publishedName = "a.bin",
+                completedAt = 1L,
+                expiresAt = 10L
+            )
+            database.resumeDao().insertCompletedReceipt(receipt)
+
+            assertEquals(receipt, database.resumeDao().findValidCompletedReceipt("expired", 9L))
+            assertNull(database.resumeDao().findValidCompletedReceipt("expired", 10L))
+            assertNull(database.resumeDao().findCompletedReceipt("expired"))
         }
     }
 
@@ -403,5 +455,45 @@ class TransferDatabaseMigrationTest {
 
     private companion object {
         const val TEST_DATABASE = "resume-migration-test"
+    }
+}
+
+private class MigrationRecoveryFiles(private val bytes: ByteArray) : ResumableIncomingFileStore {
+    var publishCount = 0
+    private val location = StoredFileLocation(ResumeStorageKind.LEGACY_FILE, "old.part")
+
+    override suspend fun create(
+        transferId: String,
+        fileName: String,
+        mimeType: String
+    ): ResumableFileHandle = error("unused")
+
+    override suspend fun reopen(
+        location: StoredFileLocation,
+        displayName: String
+    ): ResumableFileHandle? = if (location == this.location) handle(displayName) else null
+
+    override suspend fun openInput(location: StoredFileLocation): InputStream? = null
+
+    override suspend fun openCompletionInput(
+        location: StoredFileLocation,
+        displayName: String
+    ): InputStream? = if (location == this.location) ByteArrayInputStream(bytes) else null
+
+    override suspend fun publish(handle: ResumableFileHandle): String {
+        publishCount++
+        return "content://received/${handle.displayName}"
+    }
+
+    override suspend fun delete(location: StoredFileLocation) = Unit
+
+    private fun handle(displayName: String) = object : ResumableFileHandle {
+        override val location = this@MigrationRecoveryFiles.location
+        override val displayName = displayName
+        override fun length() = bytes.size.toLong()
+        override fun writeAt(offset: Long, source: ByteArray, length: Int) = error("unused")
+        override fun truncate(length: Long) = error("unused")
+        override fun force() = Unit
+        override fun close() = Unit
     }
 }

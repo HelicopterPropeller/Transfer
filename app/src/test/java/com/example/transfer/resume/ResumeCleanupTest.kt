@@ -75,6 +75,29 @@ class ResumeCleanupTest {
     }
 
     @Test
+    fun `partial cleanup failure cannot keep an expired receipt query alive`() = runBlocking {
+        val expiredReceipt = CompletedReceipt(
+            transferId = "done",
+            senderDeviceId = "sender",
+            fileName = "a.bin",
+            mimeType = "application/octet-stream",
+            fileSize = 0,
+            chunkSize = 1_048_576,
+            finalDigest = ByteArray(32),
+            publishedUri = "fake://done",
+            publishedName = "a.bin",
+            completedAt = now - ResumeCleanup.RETENTION_MILLIS,
+            expiresAt = now
+        )
+        val store = CleanupStore(listOf(checkpoint("broken")), expiredReceipt)
+        val cleanup = ResumeCleanup(store, CleanupFiles(fail = true), { now }, { 0L }, {})
+
+        assertThrows<IllegalStateException> { cleanup.runIfDue(force = true) }
+
+        assertEquals(null, store.findCompletedReceipt("done", now))
+    }
+
+    @Test
     fun `cleanup cancellation stops deletion releases claim and rethrows`() = runBlocking {
         val store = CleanupStore(listOf(checkpoint("first"), checkpoint("second")))
         val files = CleanupFiles(cancelValue = "first")
@@ -110,7 +133,13 @@ class ResumeCleanupTest {
 
 private fun assertNullValue(value: Any?) = assertEquals(null, value)
 
-private class CleanupStore(private val expired: List<IncomingCheckpoint>) : ResumeStore {
+private class CleanupStore(
+    private val expired: List<IncomingCheckpoint>,
+    receipt: CompletedReceipt? = null
+) : ResumeStore {
+    private val receipts = linkedMapOf<String, CompletedReceipt>().apply {
+        receipt?.let { put(it.transferId, it) }
+    }
     var claimNow: Long? = null
     var staleClaimBefore: Long? = null
     var claimToken: String? = null
@@ -134,6 +163,14 @@ private class CleanupStore(private val expired: List<IncomingCheckpoint>) : Resu
     }
     override suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int { outgoingCutoff = updatedAtCutoff; return 1 }
     override suspend fun deleteExpiredCompletedReceipts(now: Long): Int { receiptExpiryNow = now; return 1 }
+    override suspend fun findCompletedReceipt(transferId: String, now: Long): CompletedReceipt? {
+        val receipt = receipts[transferId] ?: return null
+        if (receipt.expiresAt <= now) {
+            receipts.remove(transferId)
+            return null
+        }
+        return receipt
+    }
     override suspend fun findIncoming(transferId: String) = null
     override suspend fun saveIncoming(checkpoint: IncomingCheckpoint) = Unit
     override suspend fun commitIncomingChunk(transferId: String, expectedNextChunkIndex: Int, confirmedBytes: Long, nextChunkIndex: Int, chainDigest: ByteArray, lastChunkHash: ByteArray, updatedAt: Long, expiresAt: Long) = false

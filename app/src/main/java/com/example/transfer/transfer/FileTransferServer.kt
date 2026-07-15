@@ -32,6 +32,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Semaphore
 
 fun interface ChunkVerifier {
@@ -52,6 +53,7 @@ class FileTransferServer(
     private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
     private val history: IncomingTransferHistory = IncomingTransferHistory.None,
     private val beforeClientRegister: () -> Unit = {},
+    private val afterClientRegisterBeforeStart: () -> Unit = {},
     private val onClientStarted: () -> Unit = {},
     private val onServerStopping: () -> Unit = {},
     maxActiveConnections: Int = MAX_ACTIVE_CONNECTIONS,
@@ -103,20 +105,31 @@ class FileTransferServer(
                             throw error
                         }
                         val receiveSession = ReceiveSession(socket)
-                        val child = launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                        lateinit var child: Job
+                        val released = AtomicBoolean(false)
+                        val releaseRegistration = {
+                            if (released.compareAndSet(false, true)) {
+                                receiveSession.requestLocalStop()
+                                runCatching { socket.close() }
+                                synchronized(lifecycleLock) {
+                                    clients -= receiveSession
+                                    clientJobs -= child
+                                }
+                                activeConnections.release()
+                            }
+                            Unit
+                        }
+                        child = launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                             try {
                                 onClientStarted()
                                 if (!isActive) receiveSession.requestLocalStop()
                                 runCatching { receive(receiveSession, onProgress, onComplete) }
                                     .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
                             } finally {
-                                activeConnections.release()
-                                synchronized(lifecycleLock) {
-                                    clients -= receiveSession
-                                    coroutineContext[Job]?.let { clientJobs.remove(it) }
-                                }
+                                releaseRegistration()
                             }
                         }
+                        child.invokeOnCompletion { releaseRegistration() }
                         val clientRegistered = synchronized(lifecycleLock) {
                             if (stopping) false else {
                                 clients += receiveSession
@@ -125,12 +138,17 @@ class FileTransferServer(
                             }
                         }
                         if (clientRegistered) {
-                            child.start()
+                            try {
+                                afterClientRegisterBeforeStart()
+                                if (!child.start()) releaseRegistration()
+                            } catch (error: Exception) {
+                                child.cancel()
+                                releaseRegistration()
+                                throw error
+                            }
                         } else {
-                            activeConnections.release()
-                            receiveSession.requestLocalStop()
-                            runCatching { socket.close() }
                             child.cancel()
+                            releaseRegistration()
                         }
                     }
                 }
@@ -172,6 +190,11 @@ class FileTransferServer(
             children.forEach { runCatching { it.cancelAndJoin() } }
             serverJob?.let { runCatching { it.cancelAndJoin() } }
         }
+    }
+
+    internal fun registeredClientCount(): Int = synchronized(lifecycleLock) {
+        check(clients.size == clientJobs.size) { "Client registry is inconsistent" }
+        clients.size
     }
 
     private data class StopSnapshot(

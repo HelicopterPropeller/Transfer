@@ -968,6 +968,92 @@ class ResumeCoordinatorTest {
         assertNull(store.findIncoming(offer.transferId))
     }
 
+    @Test
+    fun `v3 completing pending file derives persists digest then publishes once`() = runBlocking {
+        val bytes = byteArrayOf(3, 4, 5)
+        val offer = offer(bytes.size.toLong())
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val location = files.put(offer.transferId, bytes)
+        val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(bytes), bytes.size.toLong())
+        store.saveIncoming(
+            checkpoint(offer, location, prefix).copy(
+                operationState = IncomingOperationState.COMPLETING,
+                completingFinalDigest = null
+            )
+        )
+
+        assertEquals(1, coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE))
+
+        assertEquals(1, files.publishCount)
+        assertArrayEquals(ChunkCodec.sha256(bytes), store.receipts.getValue(offer.transferId).finalDigest)
+        assertTrue(store.persistedCompletingDigests.contains(offer.transferId))
+    }
+
+    @Test
+    fun `v3 completing already published file derives digest without republishing`() = runBlocking {
+        val bytes = byteArrayOf(7, 8)
+        val offer = offer(bytes.size.toLong())
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val location = files.put(offer.transferId, bytes)
+        val handle = requireNotNull(files.reopen(location, offer.fileName))
+        files.publish(handle)
+        val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(bytes), bytes.size.toLong())
+        store.saveIncoming(
+            checkpoint(offer, location, prefix).copy(
+                operationState = IncomingOperationState.COMPLETING,
+                completingFinalDigest = null
+            )
+        )
+
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+
+        assertEquals(1, files.publishCount)
+        assertArrayEquals(ChunkCodec.sha256(bytes), store.receipts.getValue(offer.transferId).finalDigest)
+    }
+
+    @Test
+    fun `missing legacy completing file remains retryable and later recovery succeeds`() = runBlocking {
+        val bytes = byteArrayOf(9)
+        val offer = offer(bytes.size.toLong())
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val location = StoredFileLocation("FAKE", offer.transferId)
+        val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(bytes), bytes.size.toLong())
+        store.saveIncoming(
+            checkpoint(offer, location, prefix).copy(
+                operationState = IncomingOperationState.COMPLETING,
+                completingFinalDigest = null
+            )
+        )
+
+        assertEquals(0, coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE))
+        assertEquals(IncomingOperationState.COMPLETING, store.findIncoming(offer.transferId)?.operationState)
+
+        files.put(offer.transferId, bytes)
+        assertEquals(1, coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE))
+        assertEquals(ResumeState.COMPLETED, coordinator(store, files).queryIncoming(offer).state)
+    }
+
+    @Test
+    fun `receipt is completed before expiry and atomically becomes none at expiry`() = runBlocking {
+        var time = now
+        val offer = offer(fileSize = 0)
+        val store = FakeResumeStore()
+        store.receipts[offer.transferId] = CompletedReceipt(
+            offer.transferId, offer.senderDeviceId, offer.fileName, offer.mimeType,
+            offer.fileSize, offer.chunkSize, ChunkCodec.sha256(ByteArray(0)),
+            "fake://done", offer.fileName, time, time + 10
+        )
+        val coordinator = ResumeCoordinator(store, FakeFiles(), clock = { time })
+
+        assertEquals(ResumeState.COMPLETED, coordinator.queryIncoming(offer).state)
+        time += 10
+        assertEquals(ResumeState.NONE, coordinator.queryIncoming(offer).state)
+        assertNull(store.receipts[offer.transferId])
+    }
+
     private fun coordinator(
         store: FakeResumeStore = FakeResumeStore(),
         files: FakeFiles = FakeFiles()
@@ -1040,6 +1126,7 @@ private class FakeResumeStore : ResumeStore {
     val incoming = linkedMapOf<String, IncomingCheckpoint>()
     val outgoing = linkedMapOf<String, OutgoingResumeLink>()
     val receipts = linkedMapOf<String, CompletedReceipt>()
+    val persistedCompletingDigests = mutableListOf<String>()
     val deletedOutgoing = mutableListOf<String>()
     val expiryUpdates = mutableListOf<String>()
     var allowCommit = true
@@ -1176,6 +1263,24 @@ private class FakeResumeStore : ResumeStore {
     }
     override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
         incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
+    override suspend fun persistRecoveredCompletingDigest(
+        expected: IncomingCheckpoint,
+        finalDigest: ByteArray,
+        now: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? {
+        val current = incoming[expected.transferId] ?: return null
+        if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.completingFinalDigest != null || current.confirmedBytes != current.fileSize ||
+            current.generation != expected.generation || current.storageValue != expected.storageValue
+        ) return null
+        val updated = current.copy(
+            completingFinalDigest = finalDigest.copyOf(), updatedAt = now, expiresAt = expiresAt
+        )
+        incoming[expected.transferId] = updated
+        persistedCompletingDigests += expected.transferId
+        return updated
+    }
     override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean {
         val current = incoming[expected.transferId] ?: return false
         if (current.operationState != IncomingOperationState.COMPLETING ||
@@ -1184,7 +1289,14 @@ private class FakeResumeStore : ResumeStore {
         incoming.remove(expected.transferId)
         return true
     }
-    override suspend fun findCompletedReceipt(transferId: String): CompletedReceipt? = receipts[transferId]
+    override suspend fun findCompletedReceipt(transferId: String, now: Long): CompletedReceipt? {
+        val receipt = receipts[transferId] ?: return null
+        if (receipt.expiresAt <= now) {
+            receipts.remove(transferId)
+            return null
+        }
+        return receipt
+    }
     override suspend fun finishIncomingCompletion(
         expected: IncomingCheckpoint,
         receipt: CompletedReceipt
@@ -1321,6 +1433,7 @@ private class FakeFiles : ResumableIncomingFileStore {
     private val entries = linkedMapOf<StoredFileLocation, FakeEntry>()
     private val staging = linkedMapOf<String, StoredFileLocation>()
     private val published = mutableSetOf<StoredFileLocation>()
+    private val publishedEntries = linkedMapOf<StoredFileLocation, FakeEntry>()
     val deleted = mutableListOf<StoredFileLocation>()
     var reopenCount = 0
     var failCreate = false
@@ -1364,6 +1477,11 @@ private class FakeFiles : ResumableIncomingFileStore {
     }
     override suspend fun openInput(location: StoredFileLocation): InputStream? =
         openInputFailure?.let { throw it } ?: entries[location]?.let { ByteArrayInputStream(it.bytes) }
+    override suspend fun openCompletionInput(
+        location: StoredFileLocation,
+        displayName: String
+    ): InputStream? = openInputFailure?.let { throw it } ?:
+        (entries[location] ?: publishedEntries[location])?.let { ByteArrayInputStream(it.bytes) }
     override suspend fun publish(handle: ResumableFileHandle): String {
         if (failBeforePublishOnce) {
             failBeforePublishOnce = false
@@ -1371,7 +1489,7 @@ private class FakeFiles : ResumableIncomingFileStore {
         }
         publishCount++
         handle.close()
-        entries.remove(handle.location)
+        entries.remove(handle.location)?.let { publishedEntries[handle.location] = it.copy(bytes = it.bytes.copyOf()) }
         staging.entries.removeAll { it.value == handle.location }
         published += handle.location
         if (crashAfterPublish) throw SimulatedProcessDeath()

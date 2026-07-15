@@ -352,6 +352,62 @@ class FileTransferServerV4Test {
     }
 
     @Test
+    fun `stop after lazy child registration releases permit and registry before restart`() = runBlocking {
+        val registered = CountDownLatch(1)
+        val releaseStart = CountDownLatch(1)
+        val hookCalls = AtomicInteger()
+        val childStarts = AtomicInteger()
+        val job = SupervisorJob()
+        val scope = CoroutineScope(job + Dispatchers.IO)
+        val server = FileTransferServer(
+            port = 0,
+            resumeCoordinator = ResumeCoordinator(SocketResumeStore(), SocketFiles()),
+            onClientStarted = { childStarts.incrementAndGet() },
+            afterClientRegisterBeforeStart = {
+                if (hookCalls.incrementAndGet() == 1) {
+                    registered.countDown()
+                    check(releaseStart.await(2, TimeUnit.SECONDS))
+                }
+            }
+        )
+        val firstReady = CompletableDeferred<Int>()
+        server.start(scope, { firstReady.complete(it) }, { _, _ -> }, {}, {})
+        val first = Socket(InetAddress.getLoopbackAddress(), withTimeout(2_000) { firstReady.await() })
+        try {
+            assertTrue(registered.await(2, TimeUnit.SECONDS))
+            val stopping = async(Dispatchers.IO) { server.stop() }
+            releaseStart.countDown()
+            withTimeout(2_000) { stopping.await() }
+            assertEquals(0, server.registeredClientCount())
+
+            repeat(3) { cycle ->
+                val ready = CompletableDeferred<Int>()
+                server.start(scope, { ready.complete(it) }, { _, _ -> }, {}, {})
+                val port = withTimeout(2_000) { ready.await() }
+                val sockets = (1..FileTransferServer.MAX_ACTIVE_CONNECTIONS).map {
+                    Socket(InetAddress.getLoopbackAddress(), port)
+                }
+                try {
+                    withTimeout(2_000) {
+                        val expectedStarts = (cycle + 1) * FileTransferServer.MAX_ACTIVE_CONNECTIONS
+                        while (childStarts.get() < expectedStarts) delay(10)
+                    }
+                    assertEquals(FileTransferServer.MAX_ACTIVE_CONNECTIONS, server.registeredClientCount())
+                } finally {
+                    server.stop()
+                    sockets.forEach { runCatching { it.close() } }
+                }
+                assertEquals(0, server.registeredClientCount())
+            }
+        } finally {
+            releaseStart.countDown()
+            first.close()
+            server.stop()
+            job.cancelAndJoin()
+        }
+    }
+
+    @Test
     fun `stop cancels resume query during cooperative large prefix scan`() = runBlocking {
         val harness = V4Harness()
         val chunk = ByteArray(TransferProtocol.CHUNK_SIZE) { 5 }
@@ -1025,7 +1081,13 @@ private class SocketResumeStore : ResumeStore {
         val current = incoming[expected.transferId]
         if (current?.operationState != IncomingOperationState.COMPLETING) false else { incoming.remove(expected.transferId); true }
     }
-    override suspend fun findCompletedReceipt(transferId: String) = synchronized(this) { receipts[transferId] }
+    override suspend fun findCompletedReceipt(transferId: String, now: Long) = synchronized(this) {
+        val receipt = receipts[transferId]
+        if (receipt != null && receipt.expiresAt <= now) {
+            receipts.remove(transferId)
+            null
+        } else receipt
+    }
     override suspend fun finishIncomingCompletion(expected: IncomingCheckpoint, receipt: CompletedReceipt) = synchronized(this) {
         val current = incoming[expected.transferId]
         if (current?.operationState != IncomingOperationState.COMPLETING ||
