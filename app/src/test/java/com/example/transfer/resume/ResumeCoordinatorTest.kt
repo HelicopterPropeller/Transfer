@@ -296,6 +296,28 @@ class ResumeCoordinatorTest {
     }
 
     @Test
+    fun `cold start recovery clears active ownership dated in the future`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer()
+        val location = files.put(offer.transferId, ByteArray(0))
+        store.saveIncoming(
+            checkpoint(offer, location).copy(
+                operationState = IncomingOperationState.ACTIVE,
+                sessionToken = "dead-process",
+                sessionClaimedAt = now + 365L * 24 * 60 * 60 * 1000
+            )
+        )
+
+        coordinator.recoverInterruptedState(Long.MAX_VALUE)
+
+        val recovered = store.findIncoming(offer.transferId)
+        assertEquals(IncomingOperationState.IDLE, recovered?.operationState)
+        assertNull(recovered?.sessionToken)
+    }
+
+    @Test
     fun `restart leases then deletes old partial and creates zero checkpoint`() = runBlocking {
         val store = FakeResumeStore()
         val files = FakeFiles()

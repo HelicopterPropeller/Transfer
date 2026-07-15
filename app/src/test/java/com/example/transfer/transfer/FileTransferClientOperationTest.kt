@@ -46,6 +46,20 @@ class FileTransferClientOperationTest {
     }
 
     @Test
+    fun `resume query timeout safely bounds invalid and extreme file sizes`() {
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            FileTransferClient.queryReadTimeoutMillis(-1)
+        }
+        val protocolMaximum = FileTransferClient.queryReadTimeoutMillis(
+            TransferProtocol.MAX_FILE_SIZE
+        )
+
+        assertEquals(40_975_000, protocolMaximum)
+        assertEquals(protocolMaximum, FileTransferClient.queryReadTimeoutMillis(Long.MAX_VALUE))
+        assertTrue(protocolMaximum <= Int.MAX_VALUE)
+    }
+
+    @Test
     fun `cancel active closes a source blocked during resumed prefix scan`() = runBlocking {
         val prefix = ByteArray(TransferProtocol.CHUNK_SIZE) { (it % 251).toByte() }
         val bytes = prefix + byteArrayOf(9)

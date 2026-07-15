@@ -3,6 +3,7 @@ package com.example.transfer.service
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 
@@ -20,8 +21,17 @@ internal class ResumeStartupGate(
         initialization.await()
     }
 
-    fun launchWhenReady(action: suspend () -> Unit): Job = scope.launch {
-        awaitReady()
-        action()
+    fun launchWhenReady(
+        onFailure: (Throwable) -> Unit = {},
+        action: suspend () -> Unit
+    ): Job = scope.launch {
+        try {
+            awaitReady()
+            action()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            runCatching { onFailure(error) }
+        }
     }
 }

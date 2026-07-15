@@ -363,12 +363,21 @@ class FileTransferClient {
 
         internal fun queryReadTimeoutMillis(fileSize: Long): Int {
             require(fileSize >= 0)
-            val scanSeconds = if (fileSize == 0L) 0L else {
-                (fileSize + QUERY_MIN_BYTES_PER_SECOND - 1) / QUERY_MIN_BYTES_PER_SECOND
+            val boundedSize = fileSize.coerceAtMost(TransferProtocol.MAX_FILE_SIZE)
+            val wholeSeconds = boundedSize / QUERY_MIN_BYTES_PER_SECOND
+            val scanSeconds = wholeSeconds +
+                if (boundedSize % QUERY_MIN_BYTES_PER_SECOND == 0L) 0 else 1
+            val maximum = Int.MAX_VALUE.toLong()
+            val scanMillis = if (scanSeconds > maximum / 1_000L) {
+                maximum
+            } else {
+                scanSeconds * 1_000L
             }
-            return (SOCKET_TIMEOUT_MILLIS.toLong() + scanSeconds * 1_000L)
-                .coerceAtMost(Int.MAX_VALUE.toLong())
-                .toInt()
+            return if (scanMillis > maximum - SOCKET_TIMEOUT_MILLIS) {
+                Int.MAX_VALUE
+            } else {
+                (scanMillis + SOCKET_TIMEOUT_MILLIS).toInt()
+            }
         }
     }
 

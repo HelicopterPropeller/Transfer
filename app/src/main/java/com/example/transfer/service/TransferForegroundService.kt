@@ -105,7 +105,7 @@ class TransferForegroundService : Service() {
         resumeStartupGate = ResumeStartupGate(
             scope = serviceScope,
             recover = {
-                resumeCoordinator.recoverInterruptedState(System.currentTimeMillis() + 1)
+                resumeCoordinator.recoverInterruptedState(Long.MAX_VALUE)
             },
             cleanup = {
                 ResumeCleanup(
@@ -134,7 +134,24 @@ class TransferForegroundService : Service() {
                 )
             }
         )
-        incomingStartupJob = resumeStartupGate.launchWhenReady {
+        incomingStartupJob = resumeStartupGate.launchWhenReady(
+            onFailure = { error ->
+                runCatching {
+                    publish { current ->
+                        current.copy(
+                            serviceMessage = "断点恢复初始化失败",
+                            transfer = ServiceTransfer(
+                                "接收",
+                                "",
+                                0,
+                                error.message ?: "无法恢复未完成传输",
+                                false
+                            )
+                        )
+                    }
+                }
+            }
+        ) {
             historyStartupGate.awaitReady()
             server.start(
                 serviceScope,

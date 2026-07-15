@@ -2,6 +2,11 @@ package com.example.transfer.service
 
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
@@ -11,6 +16,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ResumeStartupGateTest {
+    @Test
+    fun `recover failure is reported once without reaching coroutine exception handler`() = runBlocking {
+        assertLaunchFailureIsHandled(failCleanup = false)
+    }
+
+    @Test
+    fun `cleanup failure is reported once without reaching coroutine exception handler`() = runBlocking {
+        assertLaunchFailureIsHandled(failCleanup = true)
+    }
+
     @Test
     fun `recovery then cleanup complete before sender and receiver entry`() = runBlocking {
         val recoveryStarted = CompletableDeferred<Unit>()
@@ -60,4 +75,31 @@ class ResumeStartupGateTest {
         assertEquals("resume database unavailable", failure?.message)
         assertFalse(entered.isCompleted)
     } }
+
+    private suspend fun assertLaunchFailureIsHandled(failCleanup: Boolean) {
+        val unhandled = mutableListOf<Throwable>()
+        val handler = CoroutineExceptionHandler { _, error -> unhandled += error }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined + handler)
+        val failures = mutableListOf<Throwable>()
+        var serverStarted = false
+        val expectedMessage = if (failCleanup) "cleanup failed" else "recover failed"
+        val gate = ResumeStartupGate(
+            scope = scope,
+            recover = { if (!failCleanup) throw IOException(expectedMessage) },
+            cleanup = { if (failCleanup) throw IOException(expectedMessage) }
+        )
+        try {
+            gate.launchWhenReady(
+                onFailure = { failures += it },
+                action = { serverStarted = true }
+            ).join()
+
+            assertEquals(listOf(expectedMessage), failures.map { it.message })
+            assertFalse(serverStarted)
+            assertTrue(unhandled.isEmpty())
+            assertEquals(expectedMessage, runCatching { gate.awaitReady() }.exceptionOrNull()?.message)
+        } finally {
+            scope.cancel()
+        }
+    }
 }
