@@ -24,8 +24,14 @@ interface ResumeStore {
     suspend fun deleteOutgoing(transferId: String)
 
     suspend fun deleteCompleted(transferId: String)
-    suspend fun findExpiredIncoming(now: Long): List<IncomingCheckpoint>
-    suspend fun deleteExpired(now: Long, outgoingUpdatedAtCutoff: Long): Int
+    suspend fun claimExpiredIncoming(
+        now: Long,
+        staleClaimBefore: Long,
+        token: String
+    ): List<IncomingCheckpoint>
+    suspend fun deleteClaimedIncoming(token: String): Int
+    suspend fun releaseClaimedIncoming(token: String): Int
+    suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int
 }
 
 class RoomResumeStore(
@@ -88,11 +94,21 @@ class RoomResumeStore(
         dao.deleteCompleted(transferId)
     }
 
-    override suspend fun findExpiredIncoming(now: Long): List<IncomingCheckpoint> =
-        dao.findExpiredIncoming(now).map { it.toDomain() }
+    override suspend fun claimExpiredIncoming(
+        now: Long,
+        staleClaimBefore: Long,
+        token: String
+    ): List<IncomingCheckpoint> =
+        dao.claimExpiredIncoming(now, staleClaimBefore, token).map { it.toDomain() }
 
-    override suspend fun deleteExpired(now: Long, outgoingUpdatedAtCutoff: Long): Int =
-        dao.deleteExpired(now, outgoingUpdatedAtCutoff)
+    override suspend fun deleteClaimedIncoming(token: String): Int =
+        dao.deleteClaimedIncoming(token)
+
+    override suspend fun releaseClaimedIncoming(token: String): Int =
+        dao.releaseClaimedIncoming(token)
+
+    override suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int =
+        dao.deleteExpiredOutgoing(updatedAtCutoff)
 
     private fun IncomingCheckpoint.toEntity() = IncomingCheckpointEntity(
         transferId = transferId,
@@ -110,7 +126,9 @@ class RoomResumeStore(
         storageValue = storageValue,
         createdAt = createdAt,
         updatedAt = updatedAt,
-        expiresAt = expiresAt
+        expiresAt = expiresAt,
+        cleanupToken = null,
+        cleanupClaimedAt = null
     )
 
     private fun IncomingCheckpointEntity.toDomain() = IncomingCheckpoint(

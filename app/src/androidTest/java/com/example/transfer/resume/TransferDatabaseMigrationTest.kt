@@ -1,11 +1,14 @@
 package com.example.transfer.resume
 
+import androidx.room.Room
 import androidx.room.testing.MigrationTestHelper
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.transfer.history.TransferHistoryDatabase
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -76,6 +79,102 @@ class TransferDatabaseMigrationTest {
         migrated.close()
     }
 
+    @Test
+    fun staleExpectedChunkIndexDoesNotAdvanceRealRoomCheckpoint() = runBlocking {
+        withResumeDatabase { database ->
+            val dao = database.resumeDao()
+            dao.upsertIncoming(incomingEntity("t1").copy(nextChunkIndex = 2, confirmedBytes = 16L))
+
+            val updated = dao.commitIncomingChunk(
+                transferId = "t1",
+                expectedNextChunkIndex = 1,
+                confirmedBytes = 24L,
+                nextChunkIndex = 3,
+                chainDigest = byteArrayOf(3),
+                lastChunkHash = byteArrayOf(4),
+                updatedAt = 20L,
+                expiresAt = 200L
+            )
+
+            assertEquals(0, updated)
+            assertEquals(16L, dao.findIncoming("t1")?.confirmedBytes)
+            assertEquals(2, dao.findIncoming("t1")?.nextChunkIndex)
+        }
+    }
+
+    @Test
+    fun duplicateSourceUriAndPeerUpsertsSingleRealRoomLink() = runBlocking {
+        withResumeDatabase { database ->
+            val dao = database.resumeDao()
+            dao.upsertOutgoing(outgoingEntity("t1"))
+
+            dao.upsertOutgoing(outgoingEntity("t2"))
+
+            assertEquals("t2", dao.findOutgoing("content://a", "peer-1")?.transferId)
+            assertEquals(0, dao.deleteOutgoing("t1"))
+            assertEquals(1, dao.deleteOutgoing("t2"))
+        }
+    }
+
+    @Test
+    fun atomicClaimReturnsOnlyRowsOwnedByItsToken() = runBlocking {
+        withResumeDatabase { database ->
+            val dao = database.resumeDao()
+            dao.upsertIncoming(incomingEntity("expired-1").copy(expiresAt = 90L))
+            dao.upsertIncoming(incomingEntity("expired-2").copy(expiresAt = 100L))
+            dao.upsertIncoming(incomingEntity("fresh").copy(expiresAt = 101L))
+            dao.upsertIncoming(
+                incomingEntity("recent-claim").copy(
+                    expiresAt = 90L,
+                    cleanupToken = "other",
+                    cleanupClaimedAt = 90L
+                )
+            )
+            dao.upsertIncoming(
+                incomingEntity("stale-claim").copy(
+                    expiresAt = 90L,
+                    cleanupToken = "old",
+                    cleanupClaimedAt = 50L
+                )
+            )
+
+            val claimed = dao.claimExpiredIncoming(100L, staleClaimBefore = 80L, token = "ours")
+            val competing = dao.claimExpiredIncoming(100L, staleClaimBefore = 80L, token = "theirs")
+
+            assertEquals(setOf("expired-1", "expired-2", "stale-claim"), claimed.map { it.transferId }.toSet())
+            assertTrue(claimed.all { it.cleanupToken == "ours" && it.cleanupClaimedAt == 100L })
+            assertTrue(competing.isEmpty())
+            assertEquals("other", dao.findIncoming("recent-claim")?.cleanupToken)
+            assertNull(dao.findIncoming("fresh")?.cleanupToken)
+        }
+    }
+
+    @Test
+    fun claimedRealRoomCheckpointRejectsProgressAndExpiryUpdates() = runBlocking {
+        withResumeDatabase { database ->
+            val dao = database.resumeDao()
+            dao.upsertIncoming(incomingEntity("t1").copy(expiresAt = 40L))
+            dao.claimExpiredIncoming(50L, staleClaimBefore = 0L, token = "claim-1")
+
+            assertEquals(
+                0,
+                dao.commitIncomingChunk(
+                    transferId = "t1",
+                    expectedNextChunkIndex = 1,
+                    confirmedBytes = 16L,
+                    nextChunkIndex = 2,
+                    chainDigest = byteArrayOf(3),
+                    lastChunkHash = byteArrayOf(4),
+                    updatedAt = 60L,
+                    expiresAt = 200L
+                )
+            )
+            assertEquals(0, dao.updateIncomingExpiry("t1", updatedAt = 60L, expiresAt = 200L))
+            assertEquals(8L, dao.findIncoming("t1")?.confirmedBytes)
+            assertEquals(40L, dao.findIncoming("t1")?.expiresAt)
+        }
+    }
+
     private fun SupportSQLiteDatabase.createVersionOneHistoryTable() {
         execSQL(
             """
@@ -105,6 +204,52 @@ class TransferDatabaseMigrationTest {
             assertEquals(0, cursor.getInt(0))
         }
     }
+
+    private suspend fun withResumeDatabase(block: suspend (TransferHistoryDatabase) -> Unit) {
+        val database = Room.inMemoryDatabaseBuilder(
+            InstrumentationRegistry.getInstrumentation().targetContext,
+            TransferHistoryDatabase::class.java
+        ).build()
+        try {
+            block(database)
+        } finally {
+            database.close()
+        }
+    }
+
+    private fun incomingEntity(transferId: String) = IncomingCheckpointEntity(
+        transferId = transferId,
+        senderDeviceId = "sender-1",
+        fileName = "a.bin",
+        displayName = "a.bin",
+        mimeType = "application/octet-stream",
+        fileSize = 32L,
+        chunkSize = 8,
+        confirmedBytes = 8L,
+        nextChunkIndex = 1,
+        chainDigest = byteArrayOf(1),
+        lastChunkHash = byteArrayOf(2),
+        storageKind = ResumeStorageKind.MEDIA_STORE,
+        storageValue = "content://pending/t1",
+        createdAt = 10L,
+        updatedAt = 10L,
+        expiresAt = 100L,
+        cleanupToken = null,
+        cleanupClaimedAt = null
+    )
+
+    private fun outgoingEntity(transferId: String) = OutgoingResumeLinkEntity(
+        transferId = transferId,
+        sourceUri = "content://a",
+        peerDeviceId = "peer-1",
+        fileName = "a.bin",
+        mimeType = "application/octet-stream",
+        fileSize = 8L,
+        lastModified = 10L,
+        chunkSize = 1,
+        createdAt = 1L,
+        updatedAt = 1L
+    )
 
     private companion object {
         const val TEST_DATABASE = "resume-migration-test"

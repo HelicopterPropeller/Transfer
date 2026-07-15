@@ -66,7 +66,9 @@ data class IncomingCheckpointEntity(
     val storageValue: String,
     val createdAt: Long,
     val updatedAt: Long,
-    val expiresAt: Long
+    val expiresAt: Long,
+    val cleanupToken: String? = null,
+    val cleanupClaimedAt: Long? = null
 )
 
 @Entity(

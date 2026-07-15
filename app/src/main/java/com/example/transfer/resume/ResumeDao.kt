@@ -26,6 +26,7 @@ interface ResumeDao {
             expiresAt = :expiresAt
         WHERE transferId = :transferId
           AND nextChunkIndex = :expectedNextChunkIndex
+          AND cleanupToken IS NULL
         """
     )
     suspend fun commitIncomingChunk(
@@ -43,7 +44,7 @@ interface ResumeDao {
         """
         UPDATE incoming_checkpoints
         SET updatedAt = :updatedAt, expiresAt = :expiresAt
-        WHERE transferId = :transferId
+        WHERE transferId = :transferId AND cleanupToken IS NULL
         """
     )
     suspend fun updateIncomingExpiry(transferId: String, updatedAt: Long, expiresAt: Long): Int
@@ -83,20 +84,45 @@ interface ResumeDao {
 
     @Query(
         """
-        SELECT * FROM incoming_checkpoints
+        UPDATE incoming_checkpoints
+        SET cleanupToken = :token, cleanupClaimedAt = :now
         WHERE expiresAt <= :now
+          AND (cleanupToken IS NULL OR cleanupClaimedAt < :staleClaimBefore)
+        """
+    )
+    suspend fun markExpiredIncomingClaimed(now: Long, staleClaimBefore: Long, token: String): Int
+
+    @Query(
+        """
+        SELECT * FROM incoming_checkpoints
+        WHERE cleanupToken = :token
         ORDER BY expiresAt ASC, transferId ASC
         """
     )
-    suspend fun findExpiredIncoming(now: Long): List<IncomingCheckpointEntity>
+    suspend fun findIncomingByCleanupToken(token: String): List<IncomingCheckpointEntity>
 
-    @Query("DELETE FROM incoming_checkpoints WHERE expiresAt <= :now")
-    suspend fun deleteExpiredIncoming(now: Long): Int
+    @Transaction
+    suspend fun claimExpiredIncoming(
+        now: Long,
+        staleClaimBefore: Long,
+        token: String
+    ): List<IncomingCheckpointEntity> {
+        markExpiredIncomingClaimed(now, staleClaimBefore, token)
+        return findIncomingByCleanupToken(token)
+    }
+
+    @Query("DELETE FROM incoming_checkpoints WHERE cleanupToken = :token")
+    suspend fun deleteClaimedIncoming(token: String): Int
+
+    @Query(
+        """
+        UPDATE incoming_checkpoints
+        SET cleanupToken = NULL, cleanupClaimedAt = NULL
+        WHERE cleanupToken = :token
+        """
+    )
+    suspend fun releaseClaimedIncoming(token: String): Int
 
     @Query("DELETE FROM outgoing_resume_links WHERE updatedAt <= :updatedAtCutoff")
     suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int
-
-    @Transaction
-    suspend fun deleteExpired(now: Long, outgoingUpdatedAtCutoff: Long): Int =
-        deleteExpiredIncoming(now) + deleteExpiredOutgoing(outgoingUpdatedAtCutoff)
 }

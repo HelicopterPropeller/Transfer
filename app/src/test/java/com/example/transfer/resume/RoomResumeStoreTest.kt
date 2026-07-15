@@ -71,7 +71,7 @@ class RoomResumeStoreTest {
     }
 
     @Test
-    fun `cleanup exposes expired storage locations before deleting rows`() = runBlocking {
+    fun `cleanup claim atomically excludes a competing worker`() = runBlocking {
         val store = RoomResumeStore(FakeResumeDao())
         store.saveIncoming(incoming("expired-media").copy(expiresAt = 90L))
         store.saveIncoming(
@@ -82,21 +82,88 @@ class RoomResumeStoreTest {
             )
         )
         store.saveIncoming(incoming("fresh").copy(expiresAt = 101L))
-        store.saveOutgoing(outgoing("old-outgoing").copy(updatedAt = 50L))
 
-        val locations = store.findExpiredIncoming(now = 100L).map { it.location }
+        val firstClaim = store.claimExpiredIncoming(
+            now = 100L,
+            staleClaimBefore = 80L,
+            token = "claim-1"
+        )
+        val competingClaim = store.claimExpiredIncoming(
+            now = 100L,
+            staleClaimBefore = 80L,
+            token = "claim-2"
+        )
 
         assertEquals(
             setOf(
                 ResumeStorageLocation(ResumeStorageKind.MEDIA_STORE, "content://pending/t1"),
                 ResumeStorageLocation(ResumeStorageKind.LEGACY_FILE, "/tmp/a.part")
             ),
-            locations.toSet()
+            firstClaim.map { it.location }.toSet()
         )
-        assertEquals(3, store.deleteExpired(now = 100L, outgoingUpdatedAtCutoff = 50L))
-        assertNull(store.findIncoming("expired-media"))
-        assertNull(store.findIncoming("expired-file"))
+        assertTrue(competingClaim.isEmpty())
         assertEquals("fresh", store.findIncoming("fresh")?.transferId)
+    }
+
+    @Test
+    fun `stale cleanup claim can be reclaimed and released`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(incoming("t1").copy(expiresAt = 40L))
+        assertEquals(
+            listOf("t1"),
+            store.claimExpiredIncoming(50L, staleClaimBefore = 0L, token = "claim-1")
+                .map { it.transferId }
+        )
+
+        assertEquals(
+            listOf("t1"),
+            store.claimExpiredIncoming(100L, staleClaimBefore = 51L, token = "claim-2")
+                .map { it.transferId }
+        )
+        assertEquals(1, store.releaseClaimedIncoming("claim-2"))
+        assertEquals(
+            listOf("t1"),
+            store.claimExpiredIncoming(100L, staleClaimBefore = 90L, token = "claim-3")
+                .map { it.transferId }
+        )
+    }
+
+    @Test
+    fun `claimed checkpoint rejects progress and expiry updates`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(incoming("t1").copy(expiresAt = 40L))
+        store.claimExpiredIncoming(50L, staleClaimBefore = 0L, token = "claim-1")
+
+        assertFalse(
+            store.commitIncomingChunk(
+                transferId = "t1",
+                expectedNextChunkIndex = 1,
+                confirmedBytes = 16L,
+                nextChunkIndex = 2,
+                chainDigest = byteArrayOf(3),
+                lastChunkHash = byteArrayOf(4),
+                updatedAt = 60L,
+                expiresAt = 200L
+            )
+        )
+        assertFalse(store.updateIncomingExpiry("t1", updatedAt = 60L, expiresAt = 200L))
+        assertEquals(8L, store.findIncoming("t1")?.confirmedBytes)
+        assertEquals(40L, store.findIncoming("t1")?.expiresAt)
+    }
+
+    @Test
+    fun `cleanup mutates only rows owned by its token`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(incoming("claim-1-row").copy(expiresAt = 40L))
+        store.claimExpiredIncoming(50L, staleClaimBefore = 0L, token = "claim-1")
+        store.saveIncoming(incoming("claim-2-row").copy(expiresAt = 40L))
+        store.claimExpiredIncoming(50L, staleClaimBefore = 0L, token = "claim-2")
+        store.saveOutgoing(outgoing("old-outgoing").copy(updatedAt = 50L))
+
+        assertEquals(1, store.deleteClaimedIncoming("claim-1"))
+        assertNull(store.findIncoming("claim-1-row"))
+        assertEquals("claim-2-row", store.findIncoming("claim-2-row")?.transferId)
+        assertEquals(1, store.deleteExpiredOutgoing(updatedAtCutoff = 50L))
         assertNull(store.findOutgoing("content://a", "peer-1"))
     }
 
@@ -158,7 +225,11 @@ private class FakeResumeDao : ResumeDao {
         expiresAt: Long
     ): Int {
         val current = incoming[transferId]
-        if (current == null || current.nextChunkIndex != expectedNextChunkIndex) return 0
+        if (
+            current == null ||
+            current.cleanupToken != null ||
+            current.nextChunkIndex != expectedNextChunkIndex
+        ) return 0
         incoming[transferId] = current.copy(
             confirmedBytes = confirmedBytes,
             nextChunkIndex = nextChunkIndex,
@@ -175,7 +246,7 @@ private class FakeResumeDao : ResumeDao {
         updatedAt: Long,
         expiresAt: Long
     ): Int {
-        val current = incoming[transferId] ?: return 0
+        val current = incoming[transferId]?.takeIf { it.cleanupToken == null } ?: return 0
         incoming[transferId] = current.copy(updatedAt = updatedAt, expiresAt = expiresAt)
         return 1
     }
@@ -211,13 +282,48 @@ private class FakeResumeDao : ResumeDao {
         outgoing.remove(transferId)
     }
 
-    override suspend fun findExpiredIncoming(now: Long): List<IncomingCheckpointEntity> =
-        incoming.values.filter { it.expiresAt <= now }
+    override suspend fun markExpiredIncomingClaimed(
+        now: Long,
+        staleClaimBefore: Long,
+        token: String
+    ): Int {
+        val eligible = incoming.values.filter {
+            it.expiresAt <= now &&
+                (it.cleanupToken == null || (it.cleanupClaimedAt ?: Long.MIN_VALUE) < staleClaimBefore)
+        }
+        eligible.forEach { entity ->
+            incoming[entity.transferId] = entity.copy(
+                cleanupToken = token,
+                cleanupClaimedAt = now
+            )
+        }
+        return eligible.size
+    }
 
-    override suspend fun deleteExpiredIncoming(now: Long): Int {
-        val ids = incoming.values.filter { it.expiresAt <= now }.map { it.transferId }
+    override suspend fun findIncomingByCleanupToken(token: String): List<IncomingCheckpointEntity> =
+        incoming.values.filter { it.cleanupToken == token }
+
+    override suspend fun claimExpiredIncoming(
+        now: Long,
+        staleClaimBefore: Long,
+        token: String
+    ): List<IncomingCheckpointEntity> {
+        markExpiredIncomingClaimed(now, staleClaimBefore, token)
+        return findIncomingByCleanupToken(token)
+    }
+
+    override suspend fun deleteClaimedIncoming(token: String): Int {
+        val ids = incoming.values.filter { it.cleanupToken == token }.map { it.transferId }
         ids.forEach(incoming::remove)
         return ids.size
+    }
+
+    override suspend fun releaseClaimedIncoming(token: String): Int {
+        val claimed = incoming.values.filter { it.cleanupToken == token }
+        claimed.forEach { entity ->
+            incoming[entity.transferId] = entity.copy(cleanupToken = null, cleanupClaimedAt = null)
+        }
+        return claimed.size
     }
 
     override suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int {
@@ -226,11 +332,4 @@ private class FakeResumeDao : ResumeDao {
         return ids.size
     }
 
-    override suspend fun deleteExpired(now: Long, outgoingUpdatedAtCutoff: Long): Int {
-        val incomingIds = incoming.values.filter { it.expiresAt <= now }.map { it.transferId }
-        val outgoingIds = outgoing.values.filter { it.updatedAt <= outgoingUpdatedAtCutoff }.map { it.transferId }
-        incomingIds.forEach(incoming::remove)
-        outgoingIds.forEach(outgoing::remove)
-        return incomingIds.size + outgoingIds.size
-    }
 }
