@@ -299,9 +299,13 @@ class ResumeCoordinator(
             stagingId(offer.transferId, current.generation + 1),
             clock()
         )
-        if (!store.insertStagingJournal(journal)) {
-            store.releaseIncomingSession(current, token)
-            throw CheckpointConflictException("Incoming staging operation already exists")
+        try {
+            if (!store.insertStagingJournal(journal)) {
+                throw CheckpointConflictException("Incoming staging operation already exists")
+            }
+        } catch (error: Exception) {
+            releaseSessionAfterFailure(current, token, error)
+            throw error
         }
         val handle = try {
             files.create(journal.stagingId, offer.fileName, offer.mimeType)

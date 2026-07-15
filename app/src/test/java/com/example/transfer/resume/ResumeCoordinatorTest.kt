@@ -13,6 +13,7 @@ import com.example.transfer.storage.ResumableIncomingFileStore
 import com.example.transfer.storage.StoredFileLocation
 import com.example.transfer.transfer.SendFileSource
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -487,6 +488,85 @@ class ResumeCoordinatorTest {
     }
 
     @Test
+    fun `restart releases ownership when staging journal insert throws`() = runBlocking {
+        val store = FakeResumeStore().apply {
+            journalInsertFailure = IllegalStateException("journal insert failed")
+        }
+        val files = FakeFiles()
+        val offer = offer()
+        store.saveIncoming(checkpoint(offer, files.put(offer.transferId, byteArrayOf(1))))
+
+        val error = assertThrows<IllegalStateException> {
+            coordinator(store, files).openIncoming(
+                offer, TransferStartMode.RESTART, coordinator(store, files).queryIncoming(offer)
+            )
+        }
+
+        assertEquals("journal insert failed", error.message)
+        assertNull(store.findIncoming(offer.transferId)?.sessionToken)
+        assertEquals(IncomingOperationState.IDLE, store.findIncoming(offer.transferId)?.operationState)
+    }
+
+    @Test
+    fun `restart releases ownership when staging journal insert is cancelled`() = runBlocking {
+        val store = FakeResumeStore().apply {
+            journalInsertFailure = CancellationException("journal insert cancelled")
+        }
+        val files = FakeFiles()
+        val offer = offer()
+        store.saveIncoming(checkpoint(offer, files.put(offer.transferId, byteArrayOf(1))))
+
+        val error = assertThrows<CancellationException> {
+            coordinator(store, files).openIncoming(
+                offer, TransferStartMode.RESTART, coordinator(store, files).queryIncoming(offer)
+            )
+        }
+
+        assertEquals("journal insert cancelled", error.message)
+        assertNull(store.findIncoming(offer.transferId)?.sessionToken)
+        assertEquals(IncomingOperationState.IDLE, store.findIncoming(offer.transferId)?.operationState)
+    }
+
+    @Test
+    fun `restart false staging journal conflict releases ownership`() = runBlocking {
+        val store = FakeResumeStore().apply { allowJournalInsert = false }
+        val files = FakeFiles()
+        val offer = offer()
+        store.saveIncoming(checkpoint(offer, files.put(offer.transferId, byteArrayOf(1))))
+
+        assertThrows<CheckpointConflictException> {
+            coordinator(store, files).openIncoming(
+                offer, TransferStartMode.RESTART, coordinator(store, files).queryIncoming(offer)
+            )
+        }
+
+        assertNull(store.findIncoming(offer.transferId)?.sessionToken)
+        assertEquals(IncomingOperationState.IDLE, store.findIncoming(offer.transferId)?.operationState)
+    }
+
+    @Test
+    fun `restart journal and ownership release failures are aggregated`() = runBlocking {
+        val store = FakeResumeStore().apply {
+            journalInsertFailure = IllegalStateException("journal insert failed")
+            releaseFailureAfterClear = IllegalArgumentException("release failed")
+        }
+        val files = FakeFiles()
+        val offer = offer()
+        store.saveIncoming(checkpoint(offer, files.put(offer.transferId, byteArrayOf(1))))
+
+        val error = assertThrows<IllegalStateException> {
+            coordinator(store, files).openIncoming(
+                offer, TransferStartMode.RESTART, coordinator(store, files).queryIncoming(offer)
+            )
+        }
+
+        assertEquals("journal insert failed", error.message)
+        assertEquals("release failed", error.suppressed.single().message)
+        assertNull(store.findIncoming(offer.transferId)?.sessionToken)
+        assertEquals(IncomingOperationState.IDLE, store.findIncoming(offer.transferId)?.operationState)
+    }
+
+    @Test
     fun `release clears ownership even when handle close fails`() = runBlocking {
         val store = FakeResumeStore()
         val coordinator = coordinator(store, FakeFiles())
@@ -784,6 +864,9 @@ private class FakeResumeStore : ResumeStore {
     var allowInsert = true
     var allowReplace = true
     var allowRelease = true
+    var allowJournalInsert = true
+    var journalInsertFailure: Throwable? = null
+    var releaseFailureAfterClear: Throwable? = null
     var allowExpiryUpdate = true
     var removeAfterExpiryUpdate = false
     var advanceAfterExpiryUpdate = false
@@ -839,6 +922,7 @@ private class FakeResumeStore : ResumeStore {
             sessionClaimedAt = null,
             operationState = IncomingOperationState.IDLE
         )
+        releaseFailureAfterClear?.let { throw it }
         return true
     }
     override suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int {
@@ -926,6 +1010,8 @@ private class FakeResumeStore : ResumeStore {
         return true
     }
     override suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean {
+        journalInsertFailure?.let { throw it }
+        if (!allowJournalInsert) return false
         if (stagingJournals.containsKey(journal.transferId)) return false
         stagingJournals[journal.transferId] = journal
         return true
