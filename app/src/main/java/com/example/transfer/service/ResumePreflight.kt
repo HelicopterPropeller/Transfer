@@ -140,13 +140,13 @@ internal fun publishResumePromptSafely(
     cancelPending: (Long) -> Boolean,
     publishPrompt: (ResumePrompt) -> Unit,
     clearPublicPrompt: (Long) -> Unit,
-    publishError: (Throwable) -> Unit
+    publishError: (Long, Throwable) -> Unit
 ): Boolean = try {
     publishPrompt(prompt)
     true
 } catch (error: Exception) {
     cancelPending(token)
     runCatching { clearPublicPrompt(token) }
-    runCatching { publishError(error) }
+    runCatching { publishError(token, error) }
     false
 }

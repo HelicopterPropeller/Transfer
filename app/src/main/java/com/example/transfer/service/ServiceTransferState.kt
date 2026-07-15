@@ -92,6 +92,14 @@ internal fun ServiceTransferState.withInactiveBatchFailure(message: String): Ser
     })
 }
 
+internal fun ServiceTransferState.withResumePromptPublicationFailure(
+    failedPromptId: Long,
+    message: String
+): ServiceTransferState = copy(
+    serviceMessage = message,
+    resumePrompt = resumePrompt?.takeUnless { it.id == failedPromptId }
+)
+
 internal fun servicePauseMessage(state: TransferPauseState): String = when (state) {
     TransferPauseState.RUNNING -> "正在发送"
     TransferPauseState.PAUSING -> "正在暂停"

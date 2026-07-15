@@ -211,12 +211,65 @@ class ResumePreflightTest {
             clearPublicPrompt = { failedToken ->
                 if (publicPrompt?.id == failedToken) publicPrompt = null
             },
-            publishError = { error("notification still failed") }
+            publishError = { _, _ -> error("notification still failed") }
         )
 
         assertFalse(published)
         assertNull(preflight.prompt)
         assertNull(publicPrompt)
+    }
+
+    @Test
+    fun `failed prompt error publication preserves newer internal and public prompt`() {
+        val preflight = ResumePreflight<String>()
+        val tokenA = requireNotNull(preflight.reserve())
+        val promptA = (preflight.finish(
+            tokenA, listOf(file("a", ResumeState.AVAILABLE))
+        ) as ResumePreflightResult.Waiting).prompt
+        val publicState = java.util.concurrent.atomic.AtomicReference(
+            ServiceTransferState(resumePrompt = promptA)
+        )
+        val aCleared = CountDownLatch(1)
+        val bPublished = CountDownLatch(1)
+
+        val failedPublisher = thread {
+            publishResumePromptSafely(
+                token = tokenA,
+                prompt = promptA,
+                cancelPending = preflight::cancelReservation,
+                publishPrompt = { error("A notification failed") },
+                clearPublicPrompt = { failedToken ->
+                    publicState.updateAndGet { current ->
+                        if (current.resumePrompt?.id == failedToken) {
+                            current.copy(resumePrompt = null)
+                        } else current
+                    }
+                    aCleared.countDown()
+                    assertTrue(bPublished.await(2, TimeUnit.SECONDS))
+                },
+                publishError = { failedToken, error ->
+                    publicState.updateAndGet { current ->
+                        current.withResumePromptPublicationFailure(
+                            failedToken,
+                            "prompt failed: ${error.message}"
+                        )
+                    }
+                }
+            )
+        }
+
+        assertTrue(aCleared.await(2, TimeUnit.SECONDS))
+        val tokenB = requireNotNull(preflight.reserve())
+        val promptB = (preflight.finish(
+            tokenB, listOf(file("b", ResumeState.AVAILABLE))
+        ) as ResumePreflightResult.Waiting).prompt
+        publicState.updateAndGet { it.copy(resumePrompt = promptB) }
+        bPublished.countDown()
+        failedPublisher.join(2_000)
+
+        assertEquals(promptB, preflight.prompt)
+        assertEquals(promptB, publicState.get().resumePrompt)
+        assertEquals("prompt failed: A notification failed", publicState.get().serviceMessage)
     }
 
     private fun waitingBatch(): ResumePreflight<String> = ResumePreflight<String>().also { preflight ->

@@ -253,11 +253,11 @@ class TransferForegroundService : Service() {
                                     }
                                 }
                             },
-                            publishError = { error ->
+                            publishError = { failedToken, error ->
                                 publish { current ->
-                                    current.copy(
-                                        resumePrompt = null,
-                                        serviceMessage = "续传提示发布失败：${error.message ?: "未知错误"}"
+                                    current.withResumePromptPublicationFailure(
+                                        failedToken,
+                                        "续传提示发布失败：${error.message ?: "未知错误"}"
                                     )
                                 }
                             }
