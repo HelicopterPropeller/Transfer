@@ -7,5 +7,6 @@ data class SendFileSource(
     val mimeType: String,
     val length: Long,
     val sourceUri: String? = null,
+    val lastModified: Long? = null,
     val openStream: () -> InputStream
 )
