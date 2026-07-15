@@ -7,6 +7,7 @@ interface TransferServiceApi {
     val state: StateFlow<ServiceTransferState>
     fun send(deviceId: String, files: List<SelectedFile>): Boolean
     fun send(deviceId: String, file: SelectedFile): Boolean = send(deviceId, listOf(file))
+    fun confirmResume(promptId: Long, choice: ResumeChoice): Boolean
     fun pause(): Boolean
     fun resume(): Boolean
 }

@@ -17,6 +17,54 @@ import java.util.concurrent.CancellationException
 
 class TransferBatchRunnerTest {
     @Test
+    fun `resumed item emits initial file and batch progress before sender chunks`() = runBlocking {
+        val events = mutableListOf<String>()
+        val runner = TransferBatchRunner(TransferPauseController()) { file, progress ->
+            events += "send:${file.displayName}"
+            progress(FileTransferProgress(80, file.length))
+            Result.success(Unit)
+        }
+        val snapshots = mutableListOf<BatchTransferProgress>()
+
+        runner.runItems(
+            listOf(BatchTransferItem(source("resume", 100), initialConfirmedBytes = 40)),
+            onProgress = { snapshots += it; events += "progress:${it.fileProgress}" },
+            onPauseState = {}
+        )
+
+        assertEquals("progress:40", events.first())
+        assertEquals(40, snapshots.first().fileProgress)
+        assertEquals(40, snapshots.first().batchProgress)
+    }
+
+    @Test
+    fun `failed resumed file contributes latest confirmed bytes once to following file`() = runBlocking {
+        val runner = TransferBatchRunner(TransferPauseController()) { file, progress ->
+            when (file.displayName) {
+                "a" -> {
+                    progress(FileTransferProgress(50, file.length))
+                    Result.failure(IOException("lost"))
+                }
+                else -> Result.success(Unit)
+            }
+        }
+        val snapshots = mutableListOf<BatchTransferProgress>()
+
+        runner.runItems(
+            listOf(
+                BatchTransferItem(source("a", 100), initialConfirmedBytes = 40),
+                BatchTransferItem(source("b", 100), initialConfirmedBytes = 20)
+            ),
+            snapshots::add,
+            {}
+        )
+
+        val initialB = snapshots.first { it.fileName == "b" }
+        assertEquals(35, initialB.batchProgress)
+        assertEquals(20, initialB.fileProgress)
+    }
+
+    @Test
     fun `failure summary includes two details and remaining count`() {
         val result = BatchTransferResult(
             successCount = 1,

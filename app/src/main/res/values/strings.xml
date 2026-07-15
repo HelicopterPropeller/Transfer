@@ -39,4 +39,11 @@
     <string name="clear_history_message">仅清空历史记录，不会删除已发送或接收的文件。</string>
     <string name="cancel">取消</string>
     <string name="history_action_unavailable">没有可处理此文件的应用</string>
+    <string name="resume_transfer_title">继续传输？</string>
+    <string name="resume_available">继续传输</string>
+    <string name="restart_all">全部重传</string>
+    <plurals name="resume_transfer_message">
+        <item quantity="one">%d 个中断文件可以继续传输</item>
+        <item quantity="other">%d 个中断文件可以继续传输</item>
+    </plurals>
 </resources>

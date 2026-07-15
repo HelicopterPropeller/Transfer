@@ -29,13 +29,16 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.example.transfer.history.HistoryActivity
 import com.example.transfer.history.HistoryRetryContract
 import com.example.transfer.service.TransferForegroundService
+import com.example.transfer.service.ResumeChoice
 import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.ui.LatestSelectionRequest
+import com.example.transfer.ui.ResumePromptDisplayTracker
 import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.SelectedFileResolver
 import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -43,6 +46,7 @@ import kotlinx.coroutines.withContext
 class MainActivity : AppCompatActivity() {
     private val viewModel: TransferViewModel by viewModels()
     private val latestSelectionRequest = LatestSelectionRequest()
+    private val resumePromptDisplayTracker = ResumePromptDisplayTracker()
     private val selectedFileResolver by lazy { SelectedFileResolver(this) }
     private var serviceBound = false
     private val serviceConnection = object : ServiceConnection {
@@ -209,6 +213,30 @@ class MainActivity : AppCompatActivity() {
                 transferMessageText.text = getString(R.string.transfer_message, transfer.progress, transfer.message)
                 pauseResumeButton.visibility = if (state.canPause || state.canResume) View.VISIBLE else View.GONE
                 pauseResumeButton.setText(if (state.canPause) R.string.pause else R.string.resume)
+            }
+        }
+        state.resumePrompt?.let { prompt ->
+            if (resumePromptDisplayTracker.shouldShow(prompt.id)) {
+                MaterialAlertDialogBuilder(this)
+                    .setTitle(R.string.resume_transfer_title)
+                    .setMessage(resources.getQuantityString(
+                        R.plurals.resume_transfer_message,
+                        prompt.resumableFileNames.size,
+                        prompt.resumableFileNames.size
+                    ))
+                    .setPositiveButton(R.string.resume_available) { _, _ ->
+                        viewModel.confirmResume(prompt.id, ResumeChoice.RESUME_AVAILABLE)
+                    }
+                    .setNegativeButton(R.string.restart_all) { _, _ ->
+                        viewModel.confirmResume(prompt.id, ResumeChoice.RESTART_ALL)
+                    }
+                    .setNeutralButton(android.R.string.cancel) { _, _ ->
+                        viewModel.confirmResume(prompt.id, ResumeChoice.CANCEL)
+                    }
+                    .setOnCancelListener {
+                        viewModel.confirmResume(prompt.id, ResumeChoice.CANCEL)
+                    }
+                    .show()
             }
         }
     }

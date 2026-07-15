@@ -3,6 +3,7 @@ package com.example.transfer.ui
 import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransfer
 import com.example.transfer.service.ServiceTransferState
+import com.example.transfer.service.ResumePrompt
 import com.example.transfer.transfer.TransferPauseState
 import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
@@ -13,6 +14,30 @@ import org.junit.Test
 import java.net.InetAddress
 
 class TransferUiReducerTest {
+    @Test
+    fun `service prompt is surfaced and later cleared`() {
+        val prompt = ResumePrompt(7, listOf("a.bin"), 2)
+
+        val waiting = TransferUiReducer.withServiceState(
+            TransferUiState(), ServiceTransferState(resumePrompt = prompt)
+        )
+        val cleared = TransferUiReducer.withServiceState(
+            waiting, ServiceTransferState(resumePrompt = null)
+        )
+
+        assertEquals(prompt, waiting.resumePrompt)
+        assertNull(cleared.resumePrompt)
+    }
+
+    @Test
+    fun `prompt display tracker allows each id only once`() {
+        val tracker = ResumePromptDisplayTracker()
+
+        assertTrue(tracker.shouldShow(9))
+        assertFalse(tracker.shouldShow(9))
+        assertTrue(tracker.shouldShow(10))
+    }
+
     private val peer = DiscoveredDevice(
         "peer", "Pixel", InetAddress.getLoopbackAddress(), 42043, 1
     )
@@ -35,6 +60,22 @@ class TransferUiReducerTest {
 
         assertEquals("peer-a", discovered.selectedDeviceId)
         assertEquals(listOf(selectedFile), discovered.selectedFiles)
+    }
+
+    @Test
+    fun `history retry uses the normal service prompt path`() {
+        val restored = TransferUiReducer.restoreHistoryFile(
+            TransferUiState(devices = listOf(peerA)), selectedFile, preferredPeerId = "peer-a"
+        )
+        val prompt = ResumePrompt(12, listOf(selectedFile.displayName), 1)
+
+        val waiting = TransferUiReducer.withServiceState(
+            restored, ServiceTransferState(devices = listOf(peerA), resumePrompt = prompt)
+        )
+
+        assertEquals(listOf(selectedFile), waiting.selectedFiles)
+        assertEquals("peer-a", waiting.selectedDeviceId)
+        assertEquals(prompt, waiting.resumePrompt)
     }
 
     @Test

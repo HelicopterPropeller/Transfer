@@ -18,7 +18,8 @@ data class ServiceTransfer(
 data class ServiceTransferState(
     val devices: List<DiscoveredDevice> = emptyList(),
     val serviceMessage: String = "等待设备或文件",
-    val transfer: ServiceTransfer? = null
+    val transfer: ServiceTransfer? = null,
+    val resumePrompt: ResumePrompt? = null
 )
 
 internal class ServiceTerminationGate {

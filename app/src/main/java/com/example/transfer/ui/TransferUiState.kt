@@ -2,6 +2,7 @@ package com.example.transfer.ui
 
 import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransferState
+import com.example.transfer.service.ResumePrompt
 import com.example.transfer.transfer.TransferPauseState
 
 data class SelectedFile(
@@ -45,6 +46,16 @@ internal class LatestSelectionRequest {
     }
 }
 
+internal class ResumePromptDisplayTracker {
+    private var lastShownId: Long? = null
+
+    fun shouldShow(promptId: Long): Boolean {
+        if (lastShownId == promptId) return false
+        lastShownId = promptId
+        return true
+    }
+}
+
 data class TransferStatus(
     val direction: String,
     val fileName: String,
@@ -64,7 +75,8 @@ data class TransferUiState(
     val selectedFiles: List<SelectedFile> = emptyList(),
     val notice: String? = null,
     val serviceStatus: String = "正在启动接收服务…",
-    val transfer: TransferStatus? = null
+    val transfer: TransferStatus? = null,
+    val resumePrompt: ResumePrompt? = null
 ) {
     val canSend: Boolean
         get() = selectedDeviceId != null &&
@@ -94,7 +106,11 @@ object TransferUiReducer {
                 it.fileIndex, it.fileCount, it.batchProgress, it.pauseState
             )
         }
-        return withDevices.copy(serviceStatus = service.serviceMessage, transfer = transfer)
+        return withDevices.copy(
+            serviceStatus = service.serviceMessage,
+            transfer = transfer,
+            resumePrompt = service.resumePrompt
+        )
     }
 
     fun withDevices(state: TransferUiState, devices: List<DiscoveredDevice>): TransferUiState {

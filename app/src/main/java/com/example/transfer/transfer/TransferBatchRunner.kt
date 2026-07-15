@@ -20,6 +20,11 @@ data class BatchTransferResult(
     val failures: List<BatchFailure>
 )
 
+data class BatchTransferItem(
+    val source: SendFileSource,
+    val initialConfirmedBytes: Long = 0
+)
+
 fun formatBatchCompletion(result: BatchTransferResult): String {
     val summary = "发送完成：成功 ${result.successCount}，失败 ${result.failures.size}"
     if (result.failures.isEmpty()) return summary
@@ -43,11 +48,23 @@ class TransferBatchRunner(
         files: List<SendFileSource>,
         onProgress: (BatchTransferProgress) -> Unit,
         onPauseState: (TransferPauseState) -> Unit
-    ): BatchTransferResult {
-        require(files.isNotEmpty())
+    ): BatchTransferResult = runItems(
+        files.map(::BatchTransferItem), onProgress, onPauseState
+    )
 
-        val totalBytes = files.fold(0L) { total, file ->
+    suspend fun runItems(
+        items: List<BatchTransferItem>,
+        onProgress: (BatchTransferProgress) -> Unit,
+        onPauseState: (TransferPauseState) -> Unit
+    ): BatchTransferResult {
+        require(items.isNotEmpty())
+
+        val totalBytes = items.fold(0L) { total, item ->
+            val file = item.source
             require(file.length >= 0) { "File length must not be negative" }
+            require(item.initialConfirmedBytes in 0..file.length) {
+                "Initial confirmed bytes must be within the file"
+            }
             checkedAdd(total, file.length, "Total file length exceeds Long.MAX_VALUE")
         }
         var completedBytes = 0L
@@ -55,12 +72,28 @@ class TransferBatchRunner(
         var lastFileProgress = 100
         val failures = mutableListOf<BatchFailure>()
 
-        files.forEachIndexed { index, file ->
+        items.forEachIndexed { index, item ->
+            val file = item.source
             throwIfCancelled()
             pauseController.awaitBetweenFiles(onPauseState)
             throwIfCancelled()
             lastFileProgress = if (file.length == 0L) 100 else 0
-            var confirmedBytes = 0L
+            var confirmedBytes = item.initialConfirmedBytes
+            lastFileProgress = FileTransferProgress(confirmedBytes, file.length).percent
+            if (confirmedBytes > 0L) {
+                onProgress(
+                    BatchTransferProgress(
+                        fileIndex = index + 1,
+                        fileCount = items.size,
+                        fileName = file.displayName,
+                        fileProgress = lastFileProgress,
+                        batchProgress = TransferProgress.percent(
+                            checkedAdd(completedBytes, confirmedBytes, "Batch progress exceeds Long.MAX_VALUE"),
+                            totalBytes
+                        )
+                    )
+                )
+            }
 
             val result = try {
                 sendOne(file) { current ->
@@ -69,7 +102,7 @@ class TransferBatchRunner(
                     onProgress(
                         BatchTransferProgress(
                             fileIndex = index + 1,
-                            fileCount = files.size,
+                            fileCount = items.size,
                             fileName = file.displayName,
                             fileProgress = current.percent,
                             batchProgress = TransferProgress.percent(
@@ -113,11 +146,11 @@ class TransferBatchRunner(
             }
         }
 
-        val lastFile = files.last()
+        val lastFile = items.last().source
         onProgress(
             BatchTransferProgress(
-                fileIndex = files.size,
-                fileCount = files.size,
+                fileIndex = items.size,
+                fileCount = items.size,
                 fileName = lastFile.displayName,
                 fileProgress = lastFileProgress,
                 batchProgress = 100

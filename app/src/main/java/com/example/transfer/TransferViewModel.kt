@@ -5,6 +5,7 @@ import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.transfer.service.TransferServiceApi
+import com.example.transfer.service.ResumeChoice
 import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.TransferUiReducer
 import com.example.transfer.ui.TransferUiState
@@ -78,6 +79,10 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
             snapshot.canPause -> service?.pause()
             snapshot.canResume -> service?.resume()
         }
+    }
+
+    fun confirmResume(promptId: Long, choice: ResumeChoice) {
+        service?.confirmResume(promptId, choice)
     }
 
     override fun onCleared() {
