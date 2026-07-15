@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.transfer.service.TransferServiceApi
 import com.example.transfer.service.ResumeChoice
 import com.example.transfer.ui.SelectedFile
+import com.example.transfer.ui.PendingResumeConfirmationController
 import com.example.transfer.ui.TransferUiReducer
 import com.example.transfer.ui.TransferUiState
 import kotlinx.coroutines.Job
@@ -23,13 +24,18 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
     val state: StateFlow<TransferUiState> = mutableState.asStateFlow()
     private var service: TransferServiceApi? = null
     private var serviceCollection: Job? = null
+    private val pendingResumeConfirmation = PendingResumeConfirmationController()
 
     fun attachService(newService: TransferServiceApi) {
         if (service === newService && serviceCollection?.isActive == true) return
         serviceCollection?.cancel()
         service = newService
+        pendingResumeConfirmation.attach { confirmation ->
+            newService.confirmResume(confirmation.promptId, confirmation.choice)
+        }
         serviceCollection = viewModelScope.launch {
             newService.state.collect { serviceState ->
+                pendingResumeConfirmation.onPromptChanged(serviceState.resumePrompt?.id)
                 mutableState.update { TransferUiReducer.withServiceState(it, serviceState) }
             }
         }
@@ -39,6 +45,7 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
         serviceCollection?.cancel()
         serviceCollection = null
         service = null
+        pendingResumeConfirmation.detach()
     }
 
     fun selectDevice(id: String) {
@@ -82,7 +89,7 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun confirmResume(promptId: Long, choice: ResumeChoice) {
-        service?.confirmResume(promptId, choice)
+        pendingResumeConfirmation.confirm(promptId, choice)
     }
 
     override fun onCleared() {

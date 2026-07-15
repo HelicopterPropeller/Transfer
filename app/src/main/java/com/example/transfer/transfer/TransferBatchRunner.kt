@@ -70,6 +70,7 @@ class TransferBatchRunner(
         var completedBytes = 0L
         var successCount = 0
         var lastFileProgress = 100
+        var lastFileSucceeded = false
         val failures = mutableListOf<BatchFailure>()
 
         items.forEachIndexed { index, item ->
@@ -117,14 +118,27 @@ class TransferBatchRunner(
                     )
                 }
             } catch (exception: CancellationException) {
+                onProgress(nonSuccessProgress(
+                    index, items.size, file, completedBytes, confirmedBytes, totalBytes
+                ))
                 throw exception
             } catch (exception: Exception) {
                 Result.failure(exception)
             }
 
             val failure = result.exceptionOrNull()
-            if (failure is CancellationException) throw failure
-            throwIfCancelled()
+            if (failure is CancellationException) {
+                onProgress(nonSuccessProgress(
+                    index, items.size, file, completedBytes, confirmedBytes, totalBytes
+                ))
+                throw failure
+            }
+            if (pauseController.state == TransferPauseState.CANCELLED) {
+                onProgress(nonSuccessProgress(
+                    index, items.size, file, completedBytes, confirmedBytes, totalBytes
+                ))
+                throw CancellationException("Transfer cancelled")
+            }
 
             if (result.isSuccess) {
                 completedBytes = checkedAdd(
@@ -133,6 +147,7 @@ class TransferBatchRunner(
                     "Completed byte count exceeds Long.MAX_VALUE"
                 )
                 successCount++
+                lastFileSucceeded = true
             } else {
                 completedBytes = checkedAdd(
                     completedBytes,
@@ -143,17 +158,19 @@ class TransferBatchRunner(
                     fileName = file.displayName,
                     message = failure?.message ?: "发送失败"
                 )
+                lastFileSucceeded = false
             }
         }
 
         val lastFile = items.last().source
+        val byteBatchProgress = TransferProgress.percent(completedBytes, totalBytes)
         onProgress(
             BatchTransferProgress(
                 fileIndex = items.size,
                 fileCount = items.size,
                 fileName = lastFile.displayName,
-                fileProgress = lastFileProgress,
-                batchProgress = 100
+                fileProgress = if (lastFileSucceeded) lastFileProgress else nonSuccessPercent(lastFileProgress),
+                batchProgress = if (failures.isEmpty()) byteBatchProgress else nonSuccessPercent(byteBatchProgress)
             )
         )
         return BatchTransferResult(successCount, failures)
@@ -164,6 +181,26 @@ class TransferBatchRunner(
             throw CancellationException("Transfer cancelled")
         }
     }
+
+    private fun nonSuccessProgress(
+        index: Int,
+        fileCount: Int,
+        file: SendFileSource,
+        completedBytes: Long,
+        confirmedBytes: Long,
+        totalBytes: Long
+    ): BatchTransferProgress = BatchTransferProgress(
+        fileIndex = index + 1,
+        fileCount = fileCount,
+        fileName = file.displayName,
+        fileProgress = nonSuccessPercent(FileTransferProgress(confirmedBytes, file.length).percent),
+        batchProgress = nonSuccessPercent(TransferProgress.percent(
+            checkedAdd(completedBytes, confirmedBytes, "Batch progress exceeds Long.MAX_VALUE"),
+            totalBytes
+        ))
+    )
+
+    private fun nonSuccessPercent(percent: Int): Int = percent.coerceAtMost(99)
 
     private fun checkedAdd(left: Long, right: Long, message: String): Long = try {
         Math.addExact(left, right)

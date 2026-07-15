@@ -36,6 +36,7 @@ class TransferUiReducerTest {
         assertTrue(tracker.shouldShow(9))
         assertFalse(tracker.shouldShow(9))
         assertTrue(tracker.shouldShow(10))
+        assertFalse(tracker.shouldShow(9))
     }
 
     private val peer = DiscoveredDevice(

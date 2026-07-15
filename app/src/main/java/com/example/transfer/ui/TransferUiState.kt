@@ -47,12 +47,42 @@ internal class LatestSelectionRequest {
 }
 
 internal class ResumePromptDisplayTracker {
-    private var lastShownId: Long? = null
+    private val seenIds = mutableSetOf<Long>()
 
-    fun shouldShow(promptId: Long): Boolean {
-        if (lastShownId == promptId) return false
-        lastShownId = promptId
-        return true
+    fun shouldShow(promptId: Long): Boolean = seenIds.add(promptId)
+}
+
+internal data class PendingResumeConfirmation(
+    val promptId: Long,
+    val choice: com.example.transfer.service.ResumeChoice
+)
+
+internal class PendingResumeConfirmationController {
+    private var sender: ((PendingResumeConfirmation) -> Unit)? = null
+    private val acceptedPromptIds = mutableSetOf<Long>()
+    var pending: PendingResumeConfirmation? = null
+        private set
+
+    fun attach(newSender: (PendingResumeConfirmation) -> Unit) {
+        sender = newSender
+        val queued = pending ?: return
+        pending = null
+        newSender(queued)
+    }
+
+    fun detach() {
+        sender = null
+    }
+
+    fun confirm(promptId: Long, choice: com.example.transfer.service.ResumeChoice) {
+        if (!acceptedPromptIds.add(promptId)) return
+        val confirmation = PendingResumeConfirmation(promptId, choice)
+        val currentSender = sender
+        if (currentSender == null) pending = confirmation else currentSender(confirmation)
+    }
+
+    fun onPromptChanged(promptId: Long?) {
+        if (pending?.promptId != null && pending?.promptId != promptId) pending = null
     }
 }
 

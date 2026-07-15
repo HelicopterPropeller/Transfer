@@ -28,17 +28,16 @@ internal data class ResumeSelectedFile<T>(
 internal sealed interface ResumePreflightResult<out T> {
     data class Ready<T>(val files: List<ResumeSelectedFile<T>>) : ResumePreflightResult<T>
     data class Waiting(val prompt: ResumePrompt) : ResumePreflightResult<Nothing>
+    data object Busy : ResumePreflightResult<Nothing>
     data object Ignored : ResumePreflightResult<Nothing>
 }
 
 internal sealed interface ResumeConfirmation<out T> {
     data class Ready<T>(val files: List<ResumeSelectedFile<T>>) : ResumeConfirmation<T>
+    data object Busy : ResumeConfirmation<Nothing>
     data object Cancelled : ResumeConfirmation<Nothing>
     data object Ignored : ResumeConfirmation<Nothing>
 }
-
-internal fun <T> ResumeConfirmation<T>.startIfReady(start: (List<ResumeSelectedFile<T>>) -> Boolean): Boolean =
-    this is ResumeConfirmation.Ready && start(files)
 
 internal class ResumePreflight<T> {
     private sealed interface Slot<out T> {
@@ -56,19 +55,26 @@ internal class ResumePreflight<T> {
     val hasPendingBatch: Boolean
         get() = synchronized(lock) { slot != null }
 
-    fun reserve(): Long? = synchronized(lock) {
-        if (slot != null) return@synchronized null
+    fun reserve(isBusy: () -> Boolean = { false }): Long? = synchronized(lock) {
+        if (slot != null || isBusy()) return@synchronized null
         ids.incrementAndGet().also { slot = Slot.Reserved(it) }
     }
 
-    fun finish(token: Long, files: List<ResumePreflightFile<T>>): ResumePreflightResult<T> =
+    fun finish(
+        token: Long,
+        files: List<ResumePreflightFile<T>>,
+        acquireBusy: () -> Boolean = { true }
+    ): ResumePreflightResult<T> =
         synchronized(lock) {
             val reserved = slot as? Slot.Reserved
             if (reserved?.token != token) return@synchronized ResumePreflightResult.Ignored
             val resumable = files.filter { it.status.state == ResumeState.AVAILABLE }
             if (resumable.isEmpty()) {
+                val selected = select(files, ResumeChoice.RESUME_AVAILABLE)
+                val acquired = acquireBusy()
                 slot = null
-                ResumePreflightResult.Ready(select(files, ResumeChoice.RESUME_AVAILABLE))
+                if (acquired) ResumePreflightResult.Ready(selected)
+                else ResumePreflightResult.Busy
             } else {
                 val prompt = ResumePrompt(
                     id = token,
@@ -91,12 +97,22 @@ internal class ResumePreflight<T> {
         true
     }
 
-    fun confirm(promptId: Long, choice: ResumeChoice): ResumeConfirmation<T> = synchronized(lock) {
+    fun confirm(
+        promptId: Long,
+        choice: ResumeChoice,
+        acquireBusy: () -> Boolean = { true }
+    ): ResumeConfirmation<T> = synchronized(lock) {
         val waiting = slot as? Slot.Waiting<T>
         if (waiting?.prompt?.id != promptId) return@synchronized ResumeConfirmation.Ignored
-        slot = null
-        if (choice == ResumeChoice.CANCEL) ResumeConfirmation.Cancelled
-        else ResumeConfirmation.Ready(select(waiting.files, choice))
+        if (choice == ResumeChoice.CANCEL) {
+            slot = null
+            ResumeConfirmation.Cancelled
+        } else {
+            val selected = select(waiting.files, choice)
+            val acquired = acquireBusy()
+            slot = null
+            if (acquired) ResumeConfirmation.Ready(selected) else ResumeConfirmation.Busy
+        }
     }
 
     fun clear() = synchronized(lock) { slot = null }
@@ -116,4 +132,21 @@ internal class ResumePreflight<T> {
         }
         ResumeSelectedFile(file.value, file.status, mode)
     }
+}
+
+internal fun publishResumePromptSafely(
+    token: Long,
+    prompt: ResumePrompt,
+    cancelPending: (Long) -> Boolean,
+    publishPrompt: (ResumePrompt) -> Unit,
+    clearPublicPrompt: (Long) -> Unit,
+    publishError: (Throwable) -> Unit
+): Boolean = try {
+    publishPrompt(prompt)
+    true
+} catch (error: Exception) {
+    cancelPending(token)
+    runCatching { clearPublicPrompt(token) }
+    runCatching { publishError(error) }
+    false
 }

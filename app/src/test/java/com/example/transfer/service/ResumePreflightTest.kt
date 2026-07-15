@@ -9,6 +9,10 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
 class ResumePreflightTest {
     @Test
@@ -116,13 +120,103 @@ class ResumePreflightTest {
     fun `busy race after confirmation leaves no pending batch`() {
         val preflight = waitingBatch()
         val prompt = requireNotNull(preflight.prompt)
-        val confirmation = preflight.confirm(prompt.id, ResumeChoice.RESUME_AVAILABLE)
+        val confirmation = preflight.confirm(
+            prompt.id, ResumeChoice.RESUME_AVAILABLE, acquireBusy = { false }
+        )
 
-        val started = confirmation.startIfReady { false }
-
-        assertFalse(started)
+        assertTrue(confirmation is ResumeConfirmation.Busy)
         assertNull(preflight.prompt)
         assertFalse(preflight.hasPendingBatch)
+    }
+
+    @Test
+    fun `confirm handoff atomically blocks second reservation until busy is visible`() {
+        val busy = AtomicBoolean(false)
+        val preflight = ResumePreflight<String>()
+        val firstToken = requireNotNull(preflight.reserve(busy::get))
+        val prompt = (preflight.finish(
+            firstToken,
+            listOf(file("resume", ResumeState.AVAILABLE)),
+            acquireBusy = { busy.compareAndSet(false, true) }
+        ) as ResumePreflightResult.Waiting).prompt
+        val busyAcquired = CountDownLatch(1)
+        val releaseHandoff = CountDownLatch(1)
+        var confirmation: ResumeConfirmation<String>? = null
+        val first = thread {
+            confirmation = preflight.confirm(
+                prompt.id,
+                ResumeChoice.RESUME_AVAILABLE,
+                acquireBusy = {
+                    val acquired = busy.compareAndSet(false, true)
+                    busyAcquired.countDown()
+                    releaseHandoff.await(2, TimeUnit.SECONDS)
+                    acquired
+                }
+            )
+        }
+        assertTrue(busyAcquired.await(2, TimeUnit.SECONDS))
+        var secondToken: Long? = -1
+        var secondClientQueries = 0
+        val secondStarted = CountDownLatch(1)
+        val secondFinished = CountDownLatch(1)
+        val second = thread {
+            secondStarted.countDown()
+            secondToken = preflight.reserve(busy::get)
+            if (secondToken != null) secondClientQueries++
+            secondFinished.countDown()
+        }
+
+        assertTrue(secondStarted.await(2, TimeUnit.SECONDS))
+        assertFalse(secondFinished.await(100, TimeUnit.MILLISECONDS))
+        releaseHandoff.countDown()
+        first.join(2_000)
+        second.join(2_000)
+
+        assertTrue(confirmation is ResumeConfirmation.Ready)
+        assertNull(secondToken)
+        assertEquals(0, secondClientQueries)
+    }
+
+    @Test
+    fun `immediate batch acquires busy before releasing reservation`() {
+        val busy = AtomicBoolean(false)
+        val preflight = ResumePreflight<String>()
+        val token = requireNotNull(preflight.reserve(busy::get))
+
+        val result = preflight.finish(
+            token,
+            listOf(file("new", ResumeState.NONE)),
+            acquireBusy = { busy.compareAndSet(false, true) }
+        )
+
+        assertTrue(result is ResumePreflightResult.Ready)
+        assertTrue(busy.get())
+        assertNull(preflight.reserve(busy::get))
+    }
+
+    @Test
+    fun `prompt publication failure clears internal and public prompt even if reporting fails`() {
+        val preflight = ResumePreflight<String>()
+        val token = requireNotNull(preflight.reserve())
+        val prompt = (preflight.finish(
+            token, listOf(file("resume", ResumeState.AVAILABLE))
+        ) as ResumePreflightResult.Waiting).prompt
+        var publicPrompt: ResumePrompt? = prompt
+
+        val published = publishResumePromptSafely(
+            token = token,
+            prompt = prompt,
+            cancelPending = preflight::cancelReservation,
+            publishPrompt = { error("notification failed") },
+            clearPublicPrompt = { failedToken ->
+                if (publicPrompt?.id == failedToken) publicPrompt = null
+            },
+            publishError = { error("notification still failed") }
+        )
+
+        assertFalse(published)
+        assertNull(preflight.prompt)
+        assertNull(publicPrompt)
     }
 
     private fun waitingBatch(): ResumePreflight<String> = ResumePreflight<String>().also { preflight ->

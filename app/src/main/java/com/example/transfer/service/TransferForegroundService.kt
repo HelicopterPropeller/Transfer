@@ -201,8 +201,7 @@ class TransferForegroundService : Service() {
         var accepted = false
         terminationGate.runIfOpen gate@{
             val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return@gate
-            if (busy.get()) return@gate
-            val reservation = resumePreflight.reserve() ?: return@gate
+            val reservation = resumePreflight.reserve(busy::get) ?: return@gate
             val sources = files.map { file ->
                 SendFileSource(
                     displayName = file.displayName,
@@ -232,13 +231,38 @@ class TransferForegroundService : Service() {
                             status = status
                         )
                     }
-                    when (val result = resumePreflight.finish(reservation, prepared)) {
+                    when (val result = resumePreflight.finish(
+                        reservation, prepared, acquireBusy = ::beginTransfer
+                    )) {
                         is ResumePreflightResult.Ready -> {
-                            if (!startPreparedOutgoing(result.files)) publishBusyRace()
+                            if (!startPreparedOutgoing(result.files, alreadyHeld = true)) {
+                                publishBusyRace()
+                            }
                         }
-                        is ResumePreflightResult.Waiting -> publish { current ->
-                            current.copy(resumePrompt = result.prompt)
-                        }
+                        is ResumePreflightResult.Waiting -> publishResumePromptSafely(
+                            token = reservation,
+                            prompt = result.prompt,
+                            cancelPending = resumePreflight::cancelReservation,
+                            publishPrompt = ::publishResumePromptStrict,
+                            clearPublicPrompt = { failedToken ->
+                                mutableState.update { current ->
+                                    if (current.resumePrompt?.id == failedToken) {
+                                        current.copy(resumePrompt = null)
+                                    } else {
+                                        current
+                                    }
+                                }
+                            },
+                            publishError = { error ->
+                                publish { current ->
+                                    current.copy(
+                                        resumePrompt = null,
+                                        serviceMessage = "续传提示发布失败：${error.message ?: "未知错误"}"
+                                    )
+                                }
+                            }
+                        )
+                        ResumePreflightResult.Busy -> publishBusyRace()
                         ResumePreflightResult.Ignored -> Unit
                     }
                 } catch (exception: CancellationException) {
@@ -271,7 +295,9 @@ class TransferForegroundService : Service() {
     fun confirmResume(promptId: Long, choice: ResumeChoice): Boolean {
         var handled = false
         terminationGate.runIfOpen {
-            when (val confirmation = resumePreflight.confirm(promptId, choice)) {
+            when (val confirmation = resumePreflight.confirm(
+                promptId, choice, acquireBusy = ::beginTransfer
+            )) {
                 ResumeConfirmation.Ignored -> Unit
                 ResumeConfirmation.Cancelled -> {
                     handled = true
@@ -280,7 +306,13 @@ class TransferForegroundService : Service() {
                 is ResumeConfirmation.Ready -> {
                     handled = true
                     publish { it.copy(resumePrompt = null) }
-                    if (!startPreparedOutgoing(confirmation.files)) publishBusyRace()
+                    if (!startPreparedOutgoing(confirmation.files, alreadyHeld = true)) {
+                        publishBusyRace()
+                    }
+                }
+                ResumeConfirmation.Busy -> {
+                    handled = true
+                    publishBusyRace()
                 }
             }
         }
@@ -288,9 +320,14 @@ class TransferForegroundService : Service() {
     }
 
     private fun startPreparedOutgoing(
-        files: List<ResumeSelectedFile<PreparedOutgoingFile>>
+        files: List<ResumeSelectedFile<PreparedOutgoingFile>>,
+        alreadyHeld: Boolean = false
     ): Boolean {
-        if (files.isEmpty() || !beginTransfer()) return false
+        if (files.isEmpty()) {
+            if (alreadyHeld) endTransfer()
+            return false
+        }
+        if (!alreadyHeld && !beginTransfer()) return false
         val device = files.first().value.device
         val sources = files.map { it.value.prepared.source }
         val controller = TransferPauseController()
@@ -351,6 +388,7 @@ class TransferForegroundService : Service() {
                         }
                     }
                 }
+                var lastProgress: com.example.transfer.transfer.BatchTransferProgress? = null
                 val result = runner.runItems(
                     files.map { selected ->
                         BatchTransferItem(
@@ -362,20 +400,24 @@ class TransferForegroundService : Service() {
                             }
                         )
                     },
-                    onProgress = { progress -> publishOutgoingProgress(controller, progress) },
+                    onProgress = { progress ->
+                        lastProgress = progress
+                        publishOutgoingProgress(controller, progress)
+                    },
                     onPauseState = onPauseState
                 )
                 publish { current ->
                     if (activePauseController !== controller) current else {
+                        val terminal = lastProgress
                         current.copy(transfer = ServiceTransfer(
                             direction = "发送",
-                            fileName = sources.last().displayName,
-                            progress = 100,
+                            fileName = terminal?.fileName ?: sources.last().displayName,
+                            progress = terminal?.fileProgress ?: 0,
                             message = formatBatchCompletion(result),
                             active = false,
-                            fileIndex = sources.size,
+                            fileIndex = terminal?.fileIndex ?: sources.size,
                             fileCount = sources.size,
-                            batchProgress = 100,
+                            batchProgress = terminal?.batchProgress ?: 0,
                             pauseState = controller.state
                         ))
                     }
@@ -464,10 +506,23 @@ class TransferForegroundService : Service() {
 
     private fun publishNow(transform: (ServiceTransferState) -> ServiceTransferState) {
         mutableState.update(transform)
-        startForeground(
-            TransferNotificationFactory.NOTIFICATION_ID,
-            notificationFactory.build(TransferNotificationModel.from(mutableState.value))
-        )
+        runCatching {
+            startForeground(
+                TransferNotificationFactory.NOTIFICATION_ID,
+                notificationFactory.build(TransferNotificationModel.from(mutableState.value))
+            )
+        }
+    }
+
+    private fun publishResumePromptStrict(prompt: ResumePrompt) {
+        val published = terminationGate.runIfOpen {
+            mutableState.update { current -> current.copy(resumePrompt = prompt) }
+            startForeground(
+                TransferNotificationFactory.NOTIFICATION_ID,
+                notificationFactory.build(TransferNotificationModel.from(mutableState.value))
+            )
+        }
+        if (!published) throw IllegalStateException("Service is stopping")
     }
 
     private fun publishPauseState(controller: TransferPauseController) {

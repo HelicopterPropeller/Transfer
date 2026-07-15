@@ -151,7 +151,7 @@ class TransferBatchRunnerTest {
         assertEquals(listOf("a", "b", "c"), calls)
         assertEquals(2, result.successCount)
         assertEquals(listOf(BatchFailure("b", "broken")), result.failures)
-        assertEquals(100, snapshots.last().batchProgress)
+        assertEquals(99, snapshots.last().batchProgress)
     }
 
     @Test
@@ -328,7 +328,37 @@ class TransferBatchRunnerTest {
 
         assertEquals(listOf(BatchFailure("failed", "stopped")), result.failures)
         assertEquals(40, snapshots.first().batchProgress)
-        assertEquals(100, snapshots.last().batchProgress)
+        assertEquals(40, snapshots.last().batchProgress)
+    }
+
+    @Test
+    fun `fully acknowledged file that fails finalization does not report terminal one hundred`() = runBlocking {
+        val runner = TransferBatchRunner(TransferPauseController()) { file, progress ->
+            progress(FileTransferProgress(file.length, file.length))
+            Result.failure(IOException("finalize failed"))
+        }
+        val snapshots = mutableListOf<BatchTransferProgress>()
+
+        runner.run(listOf(source("failed", 10)), snapshots::add, {})
+
+        assertEquals(99, snapshots.last().fileProgress)
+        assertEquals(99, snapshots.last().batchProgress)
+    }
+
+    @Test
+    fun `cancellation after all bytes are confirmed publishes non-success terminal progress`() = runBlocking {
+        val controller = TransferPauseController()
+        val runner = TransferBatchRunner(controller) { file, progress ->
+            progress(FileTransferProgress(file.length, file.length))
+            controller.cancel()
+            Result.failure(IOException("cancelled"))
+        }
+        val snapshots = mutableListOf<BatchTransferProgress>()
+
+        runCatching { runner.run(listOf(source("cancelled", 10)), snapshots::add, {}) }
+
+        assertEquals(99, snapshots.last().fileProgress)
+        assertEquals(99, snapshots.last().batchProgress)
     }
 
     @Test
