@@ -190,10 +190,22 @@ class ResumeCoordinator(
     }
 
     suspend fun releaseIncoming(session: IncomingResumeSession) {
-        session.handle.close()
-        if (!store.releaseIncomingSession(session.checkpoint, session.sessionToken)) {
-            throw CheckpointConflictException("Incoming session no longer owns checkpoint")
+        var failure: Throwable? = null
+        try {
+            session.handle.close()
+        } catch (error: Throwable) {
+            failure = error
         }
+        try {
+            withContext(NonCancellable) {
+                if (!store.releaseIncomingSession(session.checkpoint, session.sessionToken)) {
+                    throw CheckpointConflictException("Incoming session no longer owns checkpoint")
+                }
+            }
+        } catch (error: Throwable) {
+            if (failure == null) failure = error else failure.addSuppressed(error)
+        }
+        failure?.let { throw it }
     }
 
     suspend fun clearStaleSessionClaims(staleClaimBefore: Long): Int =
@@ -267,8 +279,8 @@ class ResumeCoordinator(
                 throw CheckpointConflictException("Incoming checkpoint already exists")
             }
         } catch (error: Exception) {
-            cleanupStaged(handle, error)
-            store.deleteStagingJournal(journal)
+            val removed = cleanupStaged(handle, error)
+            deleteJournalAfterCleanup(journal, removed, error)
             throw error
         }
         deleteJournalAfterSwitch(journal)
@@ -295,7 +307,7 @@ class ResumeCoordinator(
             files.create(journal.stagingId, offer.fileName, offer.mimeType)
         } catch (error: Exception) {
             cleanupJournaledStaging(journal, error)
-            store.releaseIncomingSession(current, token)
+            releaseSessionAfterFailure(current, token, error)
             throw error
         }
         val prefix = emptyPrefix()
@@ -309,9 +321,9 @@ class ResumeCoordinator(
                 throw CheckpointConflictException("Incoming checkpoint changed during restart")
             }
         } catch (error: Exception) {
-            cleanupStaged(handle, error)
-            store.deleteStagingJournal(journal)
-            store.releaseIncomingSession(current, token)
+            val removed = cleanupStaged(handle, error)
+            deleteJournalAfterCleanup(journal, removed, error)
+            releaseSessionAfterFailure(current, token, error)
             throw error
         }
         deleteJournalAfterSwitch(journal)
@@ -516,9 +528,44 @@ class ResumeCoordinator(
         }
     }
 
-    private suspend fun cleanupStaged(handle: ResumableFileHandle, original: Exception) {
+    private suspend fun cleanupStaged(handle: ResumableFileHandle, original: Throwable): Boolean {
         runCatching { handle.close() }.exceptionOrNull()?.let(original::addSuppressed)
-        runCatching { files.delete(handle.location) }.exceptionOrNull()?.let(original::addSuppressed)
+        return try {
+            files.delete(handle.location)
+            true
+        } catch (error: Throwable) {
+            original.addSuppressed(error)
+            false
+        }
+    }
+
+    private suspend fun deleteJournalAfterCleanup(
+        journal: IncomingStagingJournal,
+        stagedAbsentOrDeleted: Boolean,
+        original: Throwable
+    ) {
+        if (!stagedAbsentOrDeleted) return
+        try {
+            store.deleteStagingJournal(journal)
+        } catch (error: Throwable) {
+            original.addSuppressed(error)
+        }
+    }
+
+    private suspend fun releaseSessionAfterFailure(
+        checkpoint: IncomingCheckpoint,
+        token: String,
+        original: Throwable
+    ) {
+        try {
+            withContext(NonCancellable) {
+                if (!store.releaseIncomingSession(checkpoint, token)) {
+                    throw CheckpointConflictException("Incoming session no longer owns checkpoint")
+                }
+            }
+        } catch (error: Throwable) {
+            original.addSuppressed(error)
+        }
     }
 
     private suspend fun deleteJournalAfterSwitch(journal: IncomingStagingJournal) {
@@ -535,13 +582,24 @@ class ResumeCoordinator(
         journal: IncomingStagingJournal,
         original: Exception
     ) {
-        val staged = runCatching { files.findStaging(journal.stagingId) }
-            .onFailure(original::addSuppressed)
-            .getOrNull()
-        if (staged != null) {
-            runCatching { files.delete(staged) }.exceptionOrNull()?.let(original::addSuppressed)
+        val staged = try {
+            files.findStaging(journal.stagingId)
+        } catch (error: Throwable) {
+            original.addSuppressed(error)
+            return
         }
-        runCatching { store.deleteStagingJournal(journal) }.exceptionOrNull()?.let(original::addSuppressed)
+        val removed = if (staged == null) {
+            true
+        } else {
+            try {
+                files.delete(staged)
+                true
+            } catch (error: Throwable) {
+                original.addSuppressed(error)
+                false
+            }
+        }
+        deleteJournalAfterCleanup(journal, removed, original)
     }
 
     private suspend fun recoverRetiredAfterProcessDeath(checkpoint: IncomingCheckpoint): Boolean {
