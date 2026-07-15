@@ -1,6 +1,7 @@
 package com.example.transfer.storage
 
 import android.Manifest
+import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
@@ -19,6 +20,7 @@ import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.IOException
 import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -72,7 +74,10 @@ class DownloadStorage(private val context: Context) :
         withContext(Dispatchers.IO) {
             try {
                 when (location.kind) {
-                    StoredFileLocation.MEDIA_STORE -> reopenMediaStoreFile(location, displayName)
+                    StoredFileLocation.MEDIA_STORE -> {
+                        val uri = ownedPendingMediaStoreUri(location) ?: return@withContext null
+                        openMediaStoreHandle(uri, FileNamePolicy.sanitize(displayName))
+                    }
                     StoredFileLocation.LEGACY_FILE -> reopenLegacyFile(location, displayName)
                     else -> null
                 }
@@ -84,8 +89,14 @@ class DownloadStorage(private val context: Context) :
     override suspend fun openInput(location: StoredFileLocation): InputStream? =
         withContext(Dispatchers.IO) {
             when (location.kind) {
-                StoredFileLocation.MEDIA_STORE ->
-                    context.contentResolver.openInputStream(mediaStoreUri(location))
+                StoredFileLocation.MEDIA_STORE -> {
+                    val uri = ownedPendingMediaStoreUri(location) ?: return@withContext null
+                    try {
+                        context.contentResolver.openInputStream(uri)
+                    } catch (_: FileNotFoundException) {
+                        null
+                    }
+                }
 
                 StoredFileLocation.LEGACY_FILE -> {
                     val file = checkedLegacyFile(location)
@@ -107,8 +118,10 @@ class DownloadStorage(private val context: Context) :
 
     override suspend fun delete(location: StoredFileLocation) = withContext(Dispatchers.IO) {
         when (location.kind) {
-            StoredFileLocation.MEDIA_STORE ->
-                context.contentResolver.delete(mediaStoreUri(location), null, null)
+            StoredFileLocation.MEDIA_STORE -> {
+                val uri = ownedPendingMediaStoreUri(location) ?: return@withContext
+                context.contentResolver.delete(uri, null, null)
+            }
 
             StoredFileLocation.LEGACY_FILE -> {
                 val file = checkedLegacyFile(location)
@@ -156,7 +169,7 @@ class DownloadStorage(private val context: Context) :
         mimeType: String
     ): ResumableFileHandle {
         val resolver = context.contentResolver
-        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/Transfer"
+        val relativePath = MEDIA_STORE_RELATIVE_PATH
         val displayName = uniqueMediaStoreName(FileNamePolicy.sanitize(requestedName), relativePath)
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
@@ -173,15 +186,6 @@ class DownloadStorage(private val context: Context) :
             resolver.delete(uri, null, null)
             throw failure
         }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun reopenMediaStoreFile(
-        location: StoredFileLocation,
-        displayName: String
-    ): ResumableFileHandle? {
-        val uri = mediaStoreUri(location)
-        return openMediaStoreHandle(uri, FileNamePolicy.sanitize(displayName))
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
@@ -203,7 +207,9 @@ class DownloadStorage(private val context: Context) :
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun publishMediaStoreFile(handle: ResumableFileHandle): String {
-        val uri = mediaStoreUri(handle.location)
+        val uri = checkNotNull(ownedPendingMediaStoreUri(handle.location)) {
+            "Pending MediaStore download no longer exists"
+        }
         handle.close()
         val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
         check(context.contentResolver.update(uri, values, null, null) > 0) {
@@ -234,8 +240,10 @@ class DownloadStorage(private val context: Context) :
     ): ResumableFileHandle {
         val directory = legacyDirectory()
         val safeTransferId = FileNamePolicy.sanitize(transferId)
-        val partialFile = File(directory, ".transfer-$safeTransferId.part").canonicalFile
-        check(partialFile.parentFile == directory) { "Invalid partial download path" }
+        val partialFile = LegacyDownloadFiles.requireContained(
+            directory,
+            File(directory, ".transfer-$safeTransferId.part").path
+        )
         val randomAccessFile = RandomAccessFile(partialFile, "rw")
         return try {
             randomAccessFile.setLength(0)
@@ -274,23 +282,32 @@ class DownloadStorage(private val context: Context) :
         val partialFile = checkedLegacyFile(handle.location)
         val finalName = FileNamePolicy.sanitize(handle.displayName)
         handle.close()
-        val finalFile = uniqueLegacyFile(finalName)
-        check(partialFile.renameTo(finalFile)) { "Unable to publish received file" }
-        return FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.files",
-            finalFile
-        ).toString()
+        val reservedFile = LegacyDownloadFiles.reserveFinalFile(
+            legacyDirectory(),
+            finalName,
+            ::timestamp
+        )
+        return try {
+            val publishedUri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.files",
+                reservedFile
+            ).toString()
+            check(partialFile.renameTo(reservedFile)) { "Unable to publish received file" }
+            publishedUri
+        } catch (failure: Throwable) {
+            if (partialFile.exists() && reservedFile.exists() && !reservedFile.delete()) {
+                failure.addSuppressed(IOException("Unable to remove reserved download destination"))
+            }
+            throw failure
+        }
     }
 
     private fun checkedLegacyFile(location: StoredFileLocation): File {
         check(location.kind == StoredFileLocation.LEGACY_FILE) {
             "Expected a legacy file location"
         }
-        val directory = legacyDirectory()
-        val file = File(location.value).canonicalFile
-        check(file.parentFile == directory) { "Invalid partial download path" }
-        return file
+        return LegacyDownloadFiles.requireContained(legacyDirectory(), location.value)
     }
 
     @Suppress("DEPRECATION")
@@ -307,17 +324,54 @@ class DownloadStorage(private val context: Context) :
         return directory
     }
 
-    private fun mediaStoreUri(location: StoredFileLocation): Uri {
-        check(location.kind == StoredFileLocation.MEDIA_STORE) {
-            "Expected a MediaStore location"
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun ownedPendingMediaStoreUri(location: StoredFileLocation): Uri? {
+        val uri = mediaStoreDownloadsUri(location)
+        val projection = arrayOf(
+            MediaStore.MediaColumns.RELATIVE_PATH,
+            MediaStore.MediaColumns.OWNER_PACKAGE_NAME,
+            MediaStore.MediaColumns.IS_PENDING
+        )
+        val cursor = context.contentResolver.query(uri, projection, null, null, null)
+            ?: return null
+        cursor.use {
+            if (!it.moveToFirst()) return null
+            val relativePath = it.getString(0)
+            val ownerPackageName = it.getString(1)
+            val isPending = it.getInt(2)
+            if (
+                relativePath != MEDIA_STORE_RELATIVE_PATH ||
+                ownerPackageName != context.packageName ||
+                isPending != 1
+            ) {
+                throw SecurityException("MediaStore item is not an owned pending Transfer download")
+            }
         }
-        return Uri.parse(location.value)
+        return uri
+    }
+
+    private fun mediaStoreDownloadsUri(location: StoredFileLocation): Uri {
+        if (location.kind != StoredFileLocation.MEDIA_STORE) {
+            throw SecurityException("Expected a MediaStore location")
+        }
+        val uri = Uri.parse(location.value)
+        val pathSegments = uri.pathSegments
+        if (
+            uri.scheme != ContentResolver.SCHEME_CONTENT ||
+            uri.authority != MediaStore.AUTHORITY ||
+            pathSegments.size != 3 ||
+            pathSegments[1] != "downloads" ||
+            pathSegments[2].toLongOrNull() == null
+        ) {
+            throw SecurityException("Expected a MediaStore Downloads item URI")
+        }
+        return uri
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun createMediaStoreFile(requestedName: String, mimeType: String): ReceivedFileHandle {
         val resolver = context.contentResolver
-        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/Transfer"
+        val relativePath = MEDIA_STORE_RELATIVE_PATH
         val displayName = uniqueMediaStoreName(FileNamePolicy.sanitize(requestedName), relativePath)
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
@@ -354,7 +408,7 @@ class DownloadStorage(private val context: Context) :
             MediaStore.Downloads.EXTERNAL_CONTENT_URI,
             projection,
             selection,
-            arrayOf(name, "$relativePath/"),
+            arrayOf(name, relativePath),
             null
         )?.use { return it.moveToFirst() }
         return false
@@ -362,25 +416,20 @@ class DownloadStorage(private val context: Context) :
 
     @Suppress("DEPRECATION")
     private fun createLegacyFile(requestedName: String): ReceivedFileHandle {
-        val file = uniqueLegacyFile(FileNamePolicy.sanitize(requestedName))
+        val file = LegacyDownloadFiles.reserveFinalFile(
+            legacyDirectory(),
+            requestedName,
+            ::timestamp
+        )
         return ReceivedFileHandle(FileOutputStream(file), file = file, displayName = file.name)
-    }
-
-    private fun uniqueLegacyFile(safeName: String): File {
-        val directory = legacyDirectory()
-        var file = File(directory, safeName)
-        if (file.exists()) {
-            val stamp = timestamp()
-            var attempt = 1
-            do {
-                file = File(directory, FileNamePolicy.withTimestamp(safeName, stamp, attempt++))
-            } while (file.exists())
-        }
-        return file
     }
 
     private fun timestamp(): String =
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
+    private companion object {
+        val MEDIA_STORE_RELATIVE_PATH = "${Environment.DIRECTORY_DOWNLOADS}/Transfer/"
+    }
 }
 
 private class ChannelResumableFileHandle(
