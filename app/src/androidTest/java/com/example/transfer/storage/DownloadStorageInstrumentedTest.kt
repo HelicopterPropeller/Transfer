@@ -33,12 +33,14 @@ class DownloadStorageInstrumentedTest {
     @Test
     fun createReopenWriteReadAndDeleteReturnsNullableMissingItem() = runBlocking {
         val storage = DownloadStorage(context)
+        val stagingId = "instrumented-reopen-${System.nanoTime()}"
         val created = storage.create(
-            transferId = "instrumented-reopen-${System.nanoTime()}",
+            transferId = stagingId,
             fileName = "resume.bin",
             mimeType = "application/octet-stream"
         )
         createdUris += Uri.parse(created.location.value)
+        assertEquals(created.location, storage.findStaging(stagingId))
         created.writeAt(0, byteArrayOf(1, 2, 3, 4), 4)
         created.force()
         created.close()
@@ -67,6 +69,7 @@ class DownloadStorageInstrumentedTest {
         createdUris += uri
 
         assertEquals(uri.toString(), storage.publish(created))
+        assertEquals(uri.toString(), storage.recoverPublished(created.location, "publish.bin"))
 
         resolver.query(
             uri,

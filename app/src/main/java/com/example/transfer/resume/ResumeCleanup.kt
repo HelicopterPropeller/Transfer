@@ -19,13 +19,13 @@ class ResumeCleanup(
         if (!force && now - lastRun() < DAY_MILLIS) return 0
 
         val token = UUID.randomUUID().toString()
-        val expired = store.claimExpiredIncoming(
-            now = now,
-            staleClaimBefore = now - DAY_MILLIS,
-            token = token
-        )
         var deletionError: Exception? = null
         try {
+            val expired = store.claimExpiredIncoming(
+                now = now,
+                staleClaimBefore = now - DAY_MILLIS,
+                token = token
+            )
             expired.forEach { checkpoint ->
                 val locations = listOfNotNull(checkpoint.location, checkpoint.retiredLocation)
                 locations.forEach { location ->

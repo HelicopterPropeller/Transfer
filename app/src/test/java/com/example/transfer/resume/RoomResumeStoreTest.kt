@@ -192,6 +192,45 @@ class RoomResumeStoreTest {
         assertTrue(store.claimExpiredIncoming(30L, 0L, "cleanup").isEmpty())
     }
 
+    @Test
+    fun `heartbeat advances active lease and completing is never stale-cleared`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        val original = incoming("t1")
+        store.saveIncoming(original)
+        val active = requireNotNull(store.acquireIncomingSession(original, "session", 20L, 200L))
+
+        assertTrue(store.heartbeatIncomingSession(active, "session", 30L, 300L))
+        val refreshed = requireNotNull(store.findIncoming("t1"))
+        assertEquals(30L, refreshed.sessionClaimedAt)
+        assertTrue(store.beginIncomingCompletion(refreshed, "session", 40L, 400L))
+
+        assertEquals(0, store.clearStaleIncomingSessions(Long.MAX_VALUE))
+        assertFalse(store.updateIncomingExpiry("t1", 50L, 500L))
+        assertFalse(
+            store.commitIncomingChunk(
+                "t1", refreshed.nextChunkIndex, 16L, 2,
+                byteArrayOf(3), byteArrayOf(4), 50L, 500L
+            )
+        )
+        assertEquals(IncomingOperationState.COMPLETING, store.findIncoming("t1")?.operationState)
+    }
+
+    @Test
+    fun `staging journal survives store reopen until exact record is removed`() = runBlocking {
+        val dao = FakeResumeDao()
+        val firstStore = RoomResumeStore(dao)
+        val journal = IncomingStagingJournal("t1", "t1-1", 10L)
+
+        assertTrue(firstStore.insertStagingJournal(journal))
+        assertFalse(firstStore.insertStagingJournal(journal.copy(stagingId = "other")))
+
+        val reopenedStore = RoomResumeStore(dao)
+        assertEquals(listOf(journal), reopenedStore.findStagingJournals())
+        assertFalse(reopenedStore.deleteStagingJournal(journal.copy(stagingId = "other")))
+        assertTrue(reopenedStore.deleteStagingJournal(journal))
+        assertTrue(reopenedStore.findStagingJournals().isEmpty())
+    }
+
     private fun incoming(transferId: String) = IncomingCheckpoint(
         transferId = transferId,
         senderDeviceId = "sender-1",
@@ -231,6 +270,7 @@ class RoomResumeStoreTest {
 private class FakeResumeDao : ResumeDao {
     private val incoming = linkedMapOf<String, IncomingCheckpointEntity>()
     private val outgoing = linkedMapOf<String, OutgoingResumeLinkEntity>()
+    private val staging = linkedMapOf<String, IncomingStagingJournalEntity>()
 
     override suspend fun findIncoming(transferId: String): IncomingCheckpointEntity? =
         incoming[transferId]
@@ -259,7 +299,9 @@ private class FakeResumeDao : ResumeDao {
             !current.lastChunkHash.contentEquals(lastChunkHash)
         ) return 0
         incoming[transferId] = current.copy(
-            sessionToken = token, sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+            sessionToken = token, sessionClaimedAt = now,
+            operationState = IncomingOperationState.ACTIVE,
+            updatedAt = now, expiresAt = expiresAt
         )
         return 1
     }
@@ -270,15 +312,24 @@ private class FakeResumeDao : ResumeDao {
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (!current.ownedBy(token, generation, storageKind, storageValue, nextChunkIndex)) return 0
-        incoming[transferId] = current.copy(sessionToken = null, sessionClaimedAt = null)
+        incoming[transferId] = current.copy(
+            sessionToken = null, sessionClaimedAt = null,
+            operationState = IncomingOperationState.IDLE
+        )
         return 1
     }
 
     override suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int {
         val rows = incoming.values.filter {
-            it.sessionToken != null && (it.sessionClaimedAt ?: Long.MAX_VALUE) < staleClaimBefore
+            it.operationState == IncomingOperationState.ACTIVE && it.sessionToken != null &&
+                (it.sessionClaimedAt ?: Long.MAX_VALUE) < staleClaimBefore
         }
-        rows.forEach { incoming[it.transferId] = it.copy(sessionToken = null, sessionClaimedAt = null) }
+        rows.forEach {
+            incoming[it.transferId] = it.copy(
+                sessionToken = null, sessionClaimedAt = null,
+                operationState = IncomingOperationState.IDLE
+            )
+        }
         return rows.size
     }
 
@@ -297,6 +348,81 @@ private class FakeResumeDao : ResumeDao {
             chainDigest = chainDigest, lastChunkHash = lastChunkHash,
             updatedAt = updatedAt, expiresAt = expiresAt
         )
+        return 1
+    }
+
+    override suspend fun heartbeatIncomingSession(
+        transferId: String, token: String, generation: Long, storageKind: String,
+        storageValue: String, nextChunkIndex: Int, now: Long, expiresAt: Long
+    ): Int {
+        val current = incoming[transferId] ?: return 0
+        if (!current.ownedBy(token, generation, storageKind, storageValue, nextChunkIndex) ||
+            current.operationState != IncomingOperationState.ACTIVE
+        ) return 0
+        incoming[transferId] = current.copy(
+            sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+        )
+        return 1
+    }
+
+    override suspend fun beginIncomingCompletion(
+        transferId: String, token: String, generation: Long, storageKind: String,
+        storageValue: String, nextChunkIndex: Int, now: Long, expiresAt: Long
+    ): Int {
+        val current = incoming[transferId] ?: return 0
+        if (!current.ownedBy(token, generation, storageKind, storageValue, nextChunkIndex) ||
+            current.operationState != IncomingOperationState.ACTIVE
+        ) return 0
+        incoming[transferId] = current.copy(
+            operationState = IncomingOperationState.COMPLETING,
+            sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+        )
+        return 1
+    }
+
+    override suspend fun findCompletingIncoming(): List<IncomingCheckpointEntity> =
+        incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
+
+    override suspend fun deleteCompletingIncoming(
+        transferId: String, generation: Long, storageKind: String, storageValue: String
+    ): Int {
+        val current = incoming[transferId] ?: return 0
+        if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.generation != generation || current.storageKind != storageKind ||
+            current.storageValue != storageValue
+        ) return 0
+        incoming.remove(transferId)
+        return 1
+    }
+
+    override suspend fun clearRetiredIncomingForRecovery(
+        transferId: String, generation: Long, storageKind: String, storageValue: String,
+        retiredKind: String, retiredValue: String
+    ): Int {
+        val current = incoming[transferId] ?: return 0
+        if (current.generation != generation || current.storageKind != storageKind ||
+            current.storageValue != storageValue || current.retiredStorageKind != retiredKind ||
+            current.retiredStorageValue != retiredValue
+        ) return 0
+        incoming[transferId] = current.copy(
+            retiredStorageKind = null, retiredStorageValue = null
+        )
+        return 1
+    }
+
+    override suspend fun insertStagingJournal(entity: IncomingStagingJournalEntity): Long {
+        if (staging.containsKey(entity.transferId)) return -1
+        staging[entity.transferId] = entity
+        return 1
+    }
+
+    override suspend fun findStagingJournals(): List<IncomingStagingJournalEntity> =
+        staging.values.toList()
+
+    override suspend fun deleteStagingJournal(transferId: String, stagingId: String): Int {
+        val current = staging[transferId] ?: return 0
+        if (current.stagingId != stagingId) return 0
+        staging.remove(transferId)
         return 1
     }
 
@@ -357,6 +483,8 @@ private class FakeResumeDao : ResumeDao {
         if (
             current == null ||
             current.cleanupToken != null ||
+            current.sessionToken != null ||
+            current.operationState != IncomingOperationState.IDLE ||
             current.nextChunkIndex != expectedNextChunkIndex
         ) return 0
         incoming[transferId] = current.copy(
@@ -375,7 +503,10 @@ private class FakeResumeDao : ResumeDao {
         updatedAt: Long,
         expiresAt: Long
     ): Int {
-        val current = incoming[transferId]?.takeIf { it.cleanupToken == null } ?: return 0
+        val current = incoming[transferId]?.takeIf {
+            it.cleanupToken == null && it.sessionToken == null &&
+                it.operationState == IncomingOperationState.IDLE
+        } ?: return 0
         incoming[transferId] = current.copy(updatedAt = updatedAt, expiresAt = expiresAt)
         return 1
     }

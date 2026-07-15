@@ -24,6 +24,28 @@ interface ResumeStore {
         error("clearRetiredIncoming is not implemented")
     suspend fun deleteOwnedIncoming(expected: IncomingCheckpoint, token: String): Boolean =
         error("deleteOwnedIncoming is not implemented")
+    suspend fun heartbeatIncomingSession(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        expiresAt: Long
+    ): Boolean = error("heartbeatIncomingSession is not implemented")
+    suspend fun beginIncomingCompletion(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        expiresAt: Long
+    ): Boolean = error("beginIncomingCompletion is not implemented")
+    suspend fun findCompletingIncoming(): List<IncomingCheckpoint> = emptyList()
+    suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
+        error("deleteCompletingIncoming is not implemented")
+    suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean =
+        error("clearRetiredIncomingForRecovery is not implemented")
+    suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean =
+        error("insertStagingJournal is not implemented")
+    suspend fun findStagingJournals(): List<IncomingStagingJournal> = emptyList()
+    suspend fun deleteStagingJournal(journal: IncomingStagingJournal): Boolean =
+        error("deleteStagingJournal is not implemented")
 
     suspend fun commitIncomingChunk(
         transferId: String,
@@ -149,6 +171,51 @@ class RoomResumeStore(
             expected.storageValue, expected.nextChunkIndex
         ) > 0
 
+    override suspend fun heartbeatIncomingSession(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        expiresAt: Long
+    ): Boolean = dao.heartbeatIncomingSession(
+        expected.transferId, token, expected.generation, expected.storageKind,
+        expected.storageValue, expected.nextChunkIndex, now, expiresAt
+    ) > 0
+
+    override suspend fun beginIncomingCompletion(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        expiresAt: Long
+    ): Boolean = dao.beginIncomingCompletion(
+        expected.transferId, token, expected.generation, expected.storageKind,
+        expected.storageValue, expected.nextChunkIndex, now, expiresAt
+    ) > 0
+
+    override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
+        dao.findCompletingIncoming().map { it.toDomain() }
+
+    override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
+        dao.deleteCompletingIncoming(
+            expected.transferId, expected.generation, expected.storageKind, expected.storageValue
+        ) > 0
+
+    override suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean {
+        val retired = expected.retiredLocation ?: return true
+        return dao.clearRetiredIncomingForRecovery(
+            expected.transferId, expected.generation, expected.storageKind, expected.storageValue,
+            retired.kind, retired.value
+        ) > 0
+    }
+
+    override suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean =
+        dao.insertStagingJournal(journal.toEntity()) != -1L
+
+    override suspend fun findStagingJournals(): List<IncomingStagingJournal> =
+        dao.findStagingJournals().map { it.toDomain() }
+
+    override suspend fun deleteStagingJournal(journal: IncomingStagingJournal): Boolean =
+        dao.deleteStagingJournal(journal.transferId, journal.stagingId) > 0
+
     override suspend fun commitIncomingChunk(
         transferId: String,
         expectedNextChunkIndex: Int,
@@ -256,7 +323,8 @@ class RoomResumeStore(
         sessionToken = sessionToken,
         sessionClaimedAt = sessionClaimedAt,
         retiredStorageKind = retiredStorageKind,
-        retiredStorageValue = retiredStorageValue
+        retiredStorageValue = retiredStorageValue,
+        operationState = operationState
     )
 
     private fun IncomingCheckpointEntity.toDomain() = IncomingCheckpoint(
@@ -280,7 +348,20 @@ class RoomResumeStore(
         sessionToken = sessionToken,
         sessionClaimedAt = sessionClaimedAt,
         retiredStorageKind = retiredStorageKind,
-        retiredStorageValue = retiredStorageValue
+        retiredStorageValue = retiredStorageValue,
+        operationState = operationState
+    )
+
+    private fun IncomingStagingJournal.toEntity() = IncomingStagingJournalEntity(
+        transferId = transferId,
+        stagingId = stagingId,
+        createdAt = createdAt
+    )
+
+    private fun IncomingStagingJournalEntity.toDomain() = IncomingStagingJournal(
+        transferId = transferId,
+        stagingId = stagingId,
+        createdAt = createdAt
     )
 
     private fun OutgoingResumeLink.toEntity() = OutgoingResumeLinkEntity(

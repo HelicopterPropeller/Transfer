@@ -7,6 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.transfer.resume.IncomingCheckpointEntity
+import com.example.transfer.resume.IncomingStagingJournalEntity
 import com.example.transfer.resume.OutgoingResumeLinkEntity
 import com.example.transfer.resume.ResumeDao
 
@@ -14,9 +15,10 @@ import com.example.transfer.resume.ResumeDao
     entities = [
         TransferHistoryEntity::class,
         IncomingCheckpointEntity::class,
+        IncomingStagingJournalEntity::class,
         OutgoingResumeLinkEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class TransferHistoryDatabase : RoomDatabase() {
@@ -46,12 +48,7 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
                         updatedAt INTEGER NOT NULL,
                         expiresAt INTEGER NOT NULL,
                         cleanupToken TEXT,
-                        cleanupClaimedAt INTEGER,
-                        generation INTEGER NOT NULL,
-                        sessionToken TEXT,
-                        sessionClaimedAt INTEGER,
-                        retiredStorageKind TEXT,
-                        retiredStorageValue TEXT
+                        cleanupClaimedAt INTEGER
                     )
                     """.trimIndent()
                 )
@@ -81,6 +78,26 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE incoming_checkpoints ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
+                database.execSQL("ALTER TABLE incoming_checkpoints ADD COLUMN sessionToken TEXT DEFAULT NULL")
+                database.execSQL("ALTER TABLE incoming_checkpoints ADD COLUMN sessionClaimedAt INTEGER DEFAULT NULL")
+                database.execSQL("ALTER TABLE incoming_checkpoints ADD COLUMN retiredStorageKind TEXT DEFAULT NULL")
+                database.execSQL("ALTER TABLE incoming_checkpoints ADD COLUMN retiredStorageValue TEXT DEFAULT NULL")
+                database.execSQL("ALTER TABLE incoming_checkpoints ADD COLUMN operationState TEXT NOT NULL DEFAULT 'IDLE'")
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS incoming_staging_journal (
+                        transferId TEXT NOT NULL PRIMARY KEY,
+                        stagingId TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         @Volatile
         private var instance: TransferHistoryDatabase? = null
 
@@ -90,7 +107,7 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
                     context.applicationContext,
                     TransferHistoryDatabase::class.java,
                     "transfer_history.db"
-                ).addMigrations(MIGRATION_1_2)
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     .also { instance = it }
             }

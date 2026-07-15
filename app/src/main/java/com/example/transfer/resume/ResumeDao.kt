@@ -21,13 +21,13 @@ interface ResumeDao {
         """
         UPDATE incoming_checkpoints
         SET sessionToken = :token, sessionClaimedAt = :now,
-            updatedAt = :now, expiresAt = :expiresAt
+            operationState = 'ACTIVE', updatedAt = :now, expiresAt = :expiresAt
         WHERE transferId = :transferId
           AND storageKind = :storageKind AND storageValue = :storageValue
           AND generation = :generation AND nextChunkIndex = :nextChunkIndex
           AND confirmedBytes = :confirmedBytes
           AND chainDigest = :chainDigest AND lastChunkHash = :lastChunkHash
-          AND sessionToken IS NULL AND cleanupToken IS NULL
+          AND sessionToken IS NULL AND operationState = 'IDLE' AND cleanupToken IS NULL
         """
     )
     suspend fun acquireIncomingSession(
@@ -47,10 +47,11 @@ interface ResumeDao {
     @Query(
         """
         UPDATE incoming_checkpoints
-        SET sessionToken = NULL, sessionClaimedAt = NULL
+        SET sessionToken = NULL, sessionClaimedAt = NULL, operationState = 'IDLE'
         WHERE transferId = :transferId AND sessionToken = :token
           AND generation = :generation AND storageKind = :storageKind
           AND storageValue = :storageValue AND nextChunkIndex = :nextChunkIndex
+          AND operationState = 'ACTIVE'
         """
     )
     suspend fun releaseIncomingSession(
@@ -60,8 +61,10 @@ interface ResumeDao {
 
     @Query(
         """
-        UPDATE incoming_checkpoints SET sessionToken = NULL, sessionClaimedAt = NULL
-        WHERE sessionToken IS NOT NULL AND sessionClaimedAt < :staleClaimBefore
+        UPDATE incoming_checkpoints
+        SET sessionToken = NULL, sessionClaimedAt = NULL, operationState = 'IDLE'
+        WHERE operationState = 'ACTIVE' AND sessionToken IS NOT NULL
+          AND sessionClaimedAt < :staleClaimBefore
         """
     )
     suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int
@@ -71,11 +74,11 @@ interface ResumeDao {
         UPDATE incoming_checkpoints
         SET confirmedBytes = :confirmedBytes, nextChunkIndex = :nextChunkIndex,
             chainDigest = :chainDigest, lastChunkHash = :lastChunkHash,
-            updatedAt = :updatedAt, expiresAt = :expiresAt
+            sessionClaimedAt = :updatedAt, updatedAt = :updatedAt, expiresAt = :expiresAt
         WHERE transferId = :transferId AND sessionToken = :token
           AND generation = :generation AND storageKind = :storageKind
           AND storageValue = :storageValue AND nextChunkIndex = :expectedNextChunkIndex
-          AND cleanupToken IS NULL
+          AND operationState = 'ACTIVE' AND cleanupToken IS NULL
         """
     )
     suspend fun commitOwnedIncomingChunk(
@@ -98,7 +101,7 @@ interface ResumeDao {
         WHERE transferId = :transferId AND sessionToken = :token
           AND generation = :expectedGeneration AND storageKind = :expectedStorageKind
           AND storageValue = :expectedStorageValue AND nextChunkIndex = :expectedNextChunkIndex
-          AND cleanupToken IS NULL
+          AND operationState = 'ACTIVE' AND cleanupToken IS NULL
         """
     )
     suspend fun replaceIncomingForRestart(
@@ -119,6 +122,7 @@ interface ResumeDao {
           AND generation = :generation AND storageKind = :storageKind
           AND storageValue = :storageValue AND nextChunkIndex = :nextChunkIndex
           AND retiredStorageKind = :retiredKind AND retiredStorageValue = :retiredValue
+          AND operationState = 'ACTIVE'
         """
     )
     suspend fun clearRetiredIncoming(
@@ -133,12 +137,84 @@ interface ResumeDao {
         WHERE transferId = :transferId AND sessionToken = :token
           AND generation = :generation AND storageKind = :storageKind
           AND storageValue = :storageValue AND nextChunkIndex = :nextChunkIndex
+          AND operationState = 'ACTIVE'
         """
     )
     suspend fun deleteOwnedIncoming(
         transferId: String, token: String, generation: Long,
         storageKind: String, storageValue: String, nextChunkIndex: Int
     ): Int
+
+    @Query(
+        """
+        UPDATE incoming_checkpoints
+        SET sessionClaimedAt = :now, updatedAt = :now, expiresAt = :expiresAt
+        WHERE transferId = :transferId AND sessionToken = :token
+          AND generation = :generation AND storageKind = :storageKind
+          AND storageValue = :storageValue AND nextChunkIndex = :nextChunkIndex
+          AND operationState = 'ACTIVE' AND cleanupToken IS NULL
+        """
+    )
+    suspend fun heartbeatIncomingSession(
+        transferId: String, token: String, generation: Long,
+        storageKind: String, storageValue: String, nextChunkIndex: Int,
+        now: Long, expiresAt: Long
+    ): Int
+
+    @Query(
+        """
+        UPDATE incoming_checkpoints
+        SET operationState = 'COMPLETING', sessionClaimedAt = :now,
+            updatedAt = :now, expiresAt = :expiresAt
+        WHERE transferId = :transferId AND sessionToken = :token
+          AND generation = :generation AND storageKind = :storageKind
+          AND storageValue = :storageValue AND nextChunkIndex = :nextChunkIndex
+          AND operationState = 'ACTIVE' AND cleanupToken IS NULL
+        """
+    )
+    suspend fun beginIncomingCompletion(
+        transferId: String, token: String, generation: Long,
+        storageKind: String, storageValue: String, nextChunkIndex: Int,
+        now: Long, expiresAt: Long
+    ): Int
+
+    @Query("SELECT * FROM incoming_checkpoints WHERE operationState = 'COMPLETING'")
+    suspend fun findCompletingIncoming(): List<IncomingCheckpointEntity>
+
+    @Query(
+        """
+        DELETE FROM incoming_checkpoints
+        WHERE transferId = :transferId AND generation = :generation
+          AND storageKind = :storageKind AND storageValue = :storageValue
+          AND operationState = 'COMPLETING'
+        """
+    )
+    suspend fun deleteCompletingIncoming(
+        transferId: String, generation: Long, storageKind: String, storageValue: String
+    ): Int
+
+    @Query(
+        """
+        UPDATE incoming_checkpoints
+        SET retiredStorageKind = NULL, retiredStorageValue = NULL
+        WHERE transferId = :transferId AND generation = :generation
+          AND storageKind = :storageKind AND storageValue = :storageValue
+          AND retiredStorageKind = :retiredKind AND retiredStorageValue = :retiredValue
+        """
+    )
+    suspend fun clearRetiredIncomingForRecovery(
+        transferId: String, generation: Long, storageKind: String, storageValue: String,
+        retiredKind: String, retiredValue: String
+    ): Int
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertStagingJournal(entity: IncomingStagingJournalEntity): Long
+
+    @Query("SELECT * FROM incoming_staging_journal ORDER BY createdAt, transferId")
+    suspend fun findStagingJournals(): List<IncomingStagingJournalEntity>
+
+    @Query("DELETE FROM incoming_staging_journal WHERE transferId = :transferId AND stagingId = :stagingId")
+    suspend fun deleteStagingJournal(transferId: String, stagingId: String): Int
 
     @Transaction
     @Query(
@@ -152,7 +228,7 @@ interface ResumeDao {
             expiresAt = :expiresAt
         WHERE transferId = :transferId
           AND nextChunkIndex = :expectedNextChunkIndex
-          AND cleanupToken IS NULL
+          AND sessionToken IS NULL AND operationState = 'IDLE' AND cleanupToken IS NULL
         """
     )
     suspend fun commitIncomingChunk(
@@ -170,7 +246,8 @@ interface ResumeDao {
         """
         UPDATE incoming_checkpoints
         SET updatedAt = :updatedAt, expiresAt = :expiresAt
-        WHERE transferId = :transferId AND cleanupToken IS NULL
+        WHERE transferId = :transferId AND sessionToken IS NULL
+          AND operationState = 'IDLE' AND cleanupToken IS NULL
         """
     )
     suspend fun updateIncomingExpiry(transferId: String, updatedAt: Long, expiresAt: Long): Int
@@ -233,7 +310,7 @@ interface ResumeDao {
         UPDATE incoming_checkpoints
         SET cleanupToken = :token, cleanupClaimedAt = :now
         WHERE expiresAt <= :now
-          AND sessionToken IS NULL
+          AND sessionToken IS NULL AND operationState = 'IDLE'
           AND (cleanupToken IS NULL OR cleanupClaimedAt < :staleClaimBefore)
         """
     )

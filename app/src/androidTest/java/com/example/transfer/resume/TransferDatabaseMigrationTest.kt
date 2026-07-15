@@ -45,9 +45,10 @@ class TransferDatabaseMigrationTest {
 
         val migrated = helper.runMigrationsAndValidate(
             TEST_DATABASE,
-            2,
+            3,
             true,
-            TransferHistoryDatabase.MIGRATION_1_2
+            TransferHistoryDatabase.MIGRATION_1_2,
+            TransferHistoryDatabase.MIGRATION_2_3
         )
 
         migrated.query("SELECT * FROM transfer_history").use { cursor ->
@@ -82,6 +83,43 @@ class TransferDatabaseMigrationTest {
                 setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue")
             )
         )
+        migrated.close()
+    }
+
+    @Test
+    fun migration2To3PreservesCheckpointAndAddsOwnershipColumns() {
+        helper.createDatabase(TEST_DATABASE, 2).apply {
+            createVersionOneHistoryTable()
+            TransferHistoryDatabase.MIGRATION_1_2.migrate(this)
+            execSQL(
+                """INSERT INTO incoming_checkpoints
+                (transferId,senderDeviceId,fileName,displayName,mimeType,fileSize,chunkSize,
+                 confirmedBytes,nextChunkIndex,chainDigest,lastChunkHash,storageKind,storageValue,
+                 createdAt,updatedAt,expiresAt,cleanupToken,cleanupClaimedAt)
+                VALUES ('kept','sender','a.bin','a.bin','application/octet-stream',1,1048576,
+                 0,0,X'00',X'00','LEGACY_FILE','old.part',1,1,2,NULL,NULL)""".trimIndent()
+            )
+            close()
+        }
+        val migrated = helper.runMigrationsAndValidate(
+            TEST_DATABASE, 3, true, TransferHistoryDatabase.MIGRATION_2_3
+        )
+        migrated.query(
+            "SELECT transferId,generation,sessionToken,retiredStorageValue,operationState " +
+                "FROM incoming_checkpoints"
+        ).use {
+            assertTrue(it.moveToFirst())
+            assertEquals("kept", it.getString(0))
+            assertEquals(0L, it.getLong(1))
+            assertTrue(it.isNull(2))
+            assertTrue(it.isNull(3))
+            assertEquals(IncomingOperationState.IDLE, it.getString(4))
+        }
+        migrated.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='incoming_staging_journal'"
+        ).use {
+            assertTrue(it.moveToFirst())
+        }
         migrated.close()
     }
 

@@ -2,6 +2,7 @@ package com.example.transfer.storage
 
 import android.Manifest
 import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
@@ -61,11 +62,24 @@ class DownloadStorage(private val context: Context) :
         mimeType: String
     ): ResumableFileHandle = withContext(Dispatchers.IO) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            createMediaStoreResumableFile(fileName, mimeType)
+            createMediaStoreResumableFile(transferId, fileName, mimeType)
         } else {
             createLegacyResumableFile(transferId, fileName)
         }
     }
+
+    override suspend fun findStaging(transferId: String): StoredFileLocation? =
+        withContext(Dispatchers.IO) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                findMediaStoreStagingUri(transferId)?.let {
+                    StoredFileLocation(StoredFileLocation.MEDIA_STORE, it.toString())
+                }
+            } else {
+                legacyStagingFile(transferId).takeIf(File::isFile)?.let {
+                    StoredFileLocation(StoredFileLocation.LEGACY_FILE, it.canonicalPath)
+                }
+            }
+        }
 
     override suspend fun reopen(
         location: StoredFileLocation,
@@ -116,6 +130,30 @@ class DownloadStorage(private val context: Context) :
             }
         }
 
+    override suspend fun recoverPublished(
+        location: StoredFileLocation,
+        displayName: String
+    ): String? = withContext(Dispatchers.IO) {
+        when (location.kind) {
+            StoredFileLocation.MEDIA_STORE -> {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return@withContext null
+                val uri = mediaStoreDownloadsUri(location)
+                val pending = ownedMediaStorePendingState(uri) ?: return@withContext null
+                if (!pending) uri.toString() else null
+            }
+            StoredFileLocation.LEGACY_FILE -> {
+                val partial = checkedLegacyFile(location)
+                val published = legacyPublishedFile(location, displayName)
+                if (!partial.exists() && published.isFile) {
+                    FileProvider.getUriForFile(
+                        context, "${context.packageName}.files", published
+                    ).toString()
+                } else null
+            }
+            else -> null
+        }
+    }
+
     override suspend fun delete(location: StoredFileLocation) = withContext(Dispatchers.IO) {
         when (location.kind) {
             StoredFileLocation.MEDIA_STORE -> {
@@ -165,14 +203,16 @@ class DownloadStorage(private val context: Context) :
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun createMediaStoreResumableFile(
+        transferId: String,
         requestedName: String,
         mimeType: String
     ): ResumableFileHandle {
         val resolver = context.contentResolver
         val relativePath = MEDIA_STORE_RELATIVE_PATH
-        val displayName = uniqueMediaStoreName(FileNamePolicy.sanitize(requestedName), relativePath)
+        val stagingName = mediaStoreStagingName(transferId)
+        check(findMediaStoreStagingUri(transferId) == null) { "Staging download already exists" }
         val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, stagingName)
             put(MediaStore.MediaColumns.MIME_TYPE, mimeType.ifBlank { "application/octet-stream" })
             put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
@@ -180,7 +220,7 @@ class DownloadStorage(private val context: Context) :
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: error("Unable to create a file in Download/Transfer")
         return try {
-            openMediaStoreHandle(uri, displayName)
+            openMediaStoreHandle(uri, FileNamePolicy.sanitize(requestedName))
                 ?: error("Unable to open the received file")
         } catch (failure: Throwable) {
             resolver.delete(uri, null, null)
@@ -207,13 +247,19 @@ class DownloadStorage(private val context: Context) :
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun publishMediaStoreFile(handle: ResumableFileHandle): String {
-        val uri = checkNotNull(ownedPendingMediaStoreUri(handle.location)) {
+        val uri = mediaStoreDownloadsUri(handle.location)
+        val pending = checkNotNull(ownedMediaStorePendingState(uri)) {
             "Pending MediaStore download no longer exists"
         }
         handle.close()
-        val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-        check(context.contentResolver.update(uri, values, null, null) > 0) {
-            "Unable to publish received file"
+        if (pending) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, FileNamePolicy.sanitize(handle.displayName))
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            check(context.contentResolver.update(uri, values, null, null) > 0) {
+                "Unable to publish received file"
+            }
         }
         return uri.toString()
     }
@@ -240,10 +286,8 @@ class DownloadStorage(private val context: Context) :
     ): ResumableFileHandle {
         val directory = legacyDirectory()
         val safeTransferId = FileNamePolicy.sanitize(transferId)
-        val partialFile = LegacyDownloadFiles.requireContained(
-            directory,
-            File(directory, ".transfer-$safeTransferId.part").path
-        )
+        val partialFile = legacyStagingFile(safeTransferId)
+        check(partialFile.createNewFile()) { "Staging download already exists" }
         val randomAccessFile = RandomAccessFile(partialFile, "rw")
         return try {
             randomAccessFile.setLength(0)
@@ -280,27 +324,15 @@ class DownloadStorage(private val context: Context) :
 
     private fun publishLegacyFile(handle: ResumableFileHandle): String {
         val partialFile = checkedLegacyFile(handle.location)
-        val finalName = FileNamePolicy.sanitize(handle.displayName)
+        val publishedFile = legacyPublishedFile(handle.location, handle.displayName)
         handle.close()
-        val reservedFile = LegacyDownloadFiles.reserveFinalFile(
-            legacyDirectory(),
-            finalName,
-            ::timestamp
-        )
-        return try {
-            val publishedUri = FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.files",
-                reservedFile
-            ).toString()
-            check(partialFile.renameTo(reservedFile)) { "Unable to publish received file" }
-            publishedUri
-        } catch (failure: Throwable) {
-            if (partialFile.exists() && reservedFile.exists() && !reservedFile.delete()) {
-                failure.addSuppressed(IOException("Unable to remove reserved download destination"))
-            }
-            throw failure
-        }
+        check(!publishedFile.exists()) { "Published download already exists" }
+        check(partialFile.renameTo(publishedFile)) { "Unable to publish received file" }
+        return FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.files",
+            publishedFile
+        ).toString()
     }
 
     private fun checkedLegacyFile(location: StoredFileLocation): File {
@@ -308,6 +340,22 @@ class DownloadStorage(private val context: Context) :
             "Expected a legacy file location"
         }
         return LegacyDownloadFiles.requireContained(legacyDirectory(), location.value)
+    }
+
+    private fun legacyStagingFile(transferId: String): File {
+        val directory = legacyDirectory()
+        val safeTransferId = FileNamePolicy.sanitize(transferId)
+        return LegacyDownloadFiles.requireContained(
+            directory,
+            File(directory, ".transfer-$safeTransferId.part").path
+        )
+    }
+
+    private fun legacyPublishedFile(location: StoredFileLocation, requestedName: String): File {
+        val publishedName = LegacyDownloadFiles.stablePublishedName(requestedName, location.value)
+        return LegacyDownloadFiles.requireContained(
+            legacyDirectory(), File(legacyDirectory(), publishedName).path
+        )
     }
 
     @Suppress("DEPRECATION")
@@ -327,6 +375,15 @@ class DownloadStorage(private val context: Context) :
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun ownedPendingMediaStoreUri(location: StoredFileLocation): Uri? {
         val uri = mediaStoreDownloadsUri(location)
+        val pending = ownedMediaStorePendingState(uri) ?: return null
+        if (!pending) {
+            throw SecurityException("MediaStore item is not a pending Transfer download")
+        }
+        return uri
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun ownedMediaStorePendingState(uri: Uri): Boolean? {
         val projection = arrayOf(
             MediaStore.MediaColumns.RELATIVE_PATH,
             MediaStore.MediaColumns.OWNER_PACKAGE_NAME,
@@ -341,14 +398,40 @@ class DownloadStorage(private val context: Context) :
             val isPending = it.getInt(2)
             if (
                 relativePath != MEDIA_STORE_RELATIVE_PATH ||
-                ownerPackageName != context.packageName ||
-                isPending != 1
+                ownerPackageName != context.packageName
             ) {
-                throw SecurityException("MediaStore item is not an owned pending Transfer download")
+                throw SecurityException("MediaStore item is not an owned Transfer download")
+            }
+            return isPending == 1
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun findMediaStoreStagingUri(transferId: String): Uri? {
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        val selection =
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND " +
+                "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND " +
+                "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? AND " +
+                "${MediaStore.MediaColumns.IS_PENDING}=1"
+        context.contentResolver.query(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            projection,
+            selection,
+            arrayOf(mediaStoreStagingName(transferId), MEDIA_STORE_RELATIVE_PATH, context.packageName),
+            null
+        )?.use {
+            if (it.moveToFirst()) {
+                return ContentUris.withAppendedId(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, it.getLong(0)
+                )
             }
         }
-        return uri
+        return null
     }
+
+    private fun mediaStoreStagingName(transferId: String): String =
+        FileNamePolicy.sanitize(".transfer-$transferId.part")
 
     private fun mediaStoreDownloadsUri(location: StoredFileLocation): Uri {
         if (location.kind != StoredFileLocation.MEDIA_STORE) {

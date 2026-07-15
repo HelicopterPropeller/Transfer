@@ -1,6 +1,7 @@
 package com.example.transfer.resume
 
 import com.example.transfer.protocol.ChunkCodec
+import com.example.transfer.protocol.DigestChain
 import com.example.transfer.protocol.PrefixDigestScanner
 import com.example.transfer.protocol.ResumeState
 import com.example.transfer.protocol.ResumeStatus
@@ -286,7 +287,9 @@ class ResumeCoordinatorTest {
             session = session,
             confirmedBytes = 1L,
             nextChunkIndex = 1,
-            chainDigest = ByteArray(ChunkCodec.DIGEST_SIZE) { 1 },
+            chainDigest = DigestChain.next(
+                session.checkpoint.chainDigest, 0, 1, ByteArray(ChunkCodec.DIGEST_SIZE) { 2 }
+            ),
             lastChunkHash = ByteArray(ChunkCodec.DIGEST_SIZE) { 2 }
         )
 
@@ -428,7 +431,12 @@ class ResumeCoordinatorTest {
         )
 
         assertThrows<CheckpointConflictException> {
-            coordinator.commitChunk(first, 1L, 1, ByteArray(32), ByteArray(32))
+            val lastHash = ByteArray(32)
+            coordinator.commitChunk(
+                first, 1L, 1,
+                DigestChain.next(first.checkpoint.chainDigest, 0, 1, lastHash),
+                lastHash
+            )
         }
         assertThrows<CheckpointConflictException> { coordinator.completeIncoming(first) }
         assertEquals(second.sessionToken, store.findIncoming(second.checkpoint.transferId)?.sessionToken)
@@ -469,12 +477,13 @@ class ResumeCoordinatorTest {
         val session = coordinator.openIncoming(offer(fileSize = 1L), TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
 
         assertThrows<CheckpointConflictException> {
+            val lastHash = ByteArray(ChunkCodec.DIGEST_SIZE)
             coordinator.commitChunk(
                 session,
                 1L,
                 1,
-                ByteArray(ChunkCodec.DIGEST_SIZE),
-                ByteArray(ChunkCodec.DIGEST_SIZE)
+                DigestChain.next(session.checkpoint.chainDigest, 0, 1, lastHash),
+                lastHash
             )
         }
         Unit
@@ -494,6 +503,106 @@ class ResumeCoordinatorTest {
 
         coordinator.completeOutgoing(prepared.offer.transferId)
         assertTrue(store.outgoing.isEmpty())
+    }
+
+    @Test
+    fun `process restart removes deterministic staging created before checkpoint CAS`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles().apply { crashAfterCreate = true }
+        val offer = offer()
+
+        assertThrows<SimulatedProcessDeath> {
+            coordinator(store, files).openIncoming(
+                offer,
+                TransferStartMode.NEW,
+                ResumeStatus(ResumeState.NONE)
+            )
+        }
+
+        assertEquals(1, store.stagingJournals.size)
+        assertEquals(1, files.stagingCount())
+
+        files.crashAfterCreate = false
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+
+        assertTrue(store.stagingJournals.isEmpty())
+        assertEquals(0, files.stagingCount())
+        assertNull(store.findIncoming(offer.transferId))
+    }
+
+    @Test
+    fun `process restart keeps switched staging and recovers its retired file`() = runBlocking {
+        val store = FakeResumeStore().apply { crashAfterRestartReplace = true }
+        val files = FakeFiles()
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        store.saveIncoming(checkpoint(offer, old))
+
+        assertThrows<SimulatedProcessDeath> {
+            coordinator(store, files).openIncoming(
+                offer,
+                TransferStartMode.RESTART,
+                coordinator(store, files).queryIncoming(offer)
+            )
+        }
+
+        val switched = store.findIncoming(offer.transferId)!!
+        assertEquals(old.value, switched.retiredStorageValue)
+        assertTrue(files.contains(old))
+
+        store.crashAfterRestartReplace = false
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+
+        val recovered = store.findIncoming(offer.transferId)!!
+        assertNull(recovered.retiredStorageValue)
+        assertEquals(IncomingOperationState.IDLE, recovered.operationState)
+        assertFalse(files.contains(old))
+        assertTrue(files.contains(StoredFileLocation(recovered.storageKind, recovered.storageValue)))
+        assertTrue(store.stagingJournals.isEmpty())
+    }
+
+    @Test
+    fun `heartbeat prevents stale recovery from clearing an active session`() = runBlocking {
+        var time = now
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = ResumeCoordinator(store, files, clock = { time })
+        val session = coordinator.openIncoming(
+            offer(), TransferStartMode.NEW, ResumeStatus(ResumeState.NONE)
+        )
+
+        time += 10_000
+        val refreshed = coordinator.heartbeatIncoming(session)
+        val cleared = store.clearStaleIncomingSessions(time - 1)
+
+        assertEquals(0, cleared)
+        assertEquals(time, store.findIncoming(session.checkpoint.transferId)?.sessionClaimedAt)
+        assertEquals(IncomingOperationState.ACTIVE, refreshed.checkpoint.operationState)
+    }
+
+    @Test
+    fun `completion enters durable state before stale clearing and process restart finishes publish`() = runBlocking {
+        val store = FakeResumeStore().apply { clearStaleDuringBeginCompletion = true }
+        val files = FakeFiles().apply { crashAfterPublish = true }
+        val offer = offer()
+        val session = coordinator(store, files).openIncoming(
+            offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE)
+        )
+
+        assertThrows<SimulatedProcessDeath> {
+            coordinator(store, files).completeIncoming(session)
+        }
+
+        val completing = store.findIncoming(offer.transferId)!!
+        assertEquals(IncomingOperationState.COMPLETING, completing.operationState)
+        assertEquals(0, store.clearedDuringCompletion)
+        assertTrue(files.wasPublished(completing.location.toStoredLocationForTest()))
+
+        files.crashAfterPublish = false
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+
+        assertNull(store.findIncoming(offer.transferId))
+        assertEquals(1, files.publishCount)
     }
 
     private fun coordinator(
@@ -549,6 +658,10 @@ class ResumeCoordinatorTest {
     )
 }
 
+private class SimulatedProcessDeath : Error("simulated process death")
+
+private fun ResumeStorageLocation.toStoredLocationForTest() = StoredFileLocation(kind, value)
+
 internal inline fun <reified T : Throwable> assertThrows(block: () -> Unit): T {
     try {
         block()
@@ -572,6 +685,10 @@ private class FakeResumeStore : ResumeStore {
     var removeAfterExpiryUpdate = false
     var advanceAfterExpiryUpdate = false
     var forceObserved: (() -> Boolean)? = null
+    val stagingJournals = linkedMapOf<String, IncomingStagingJournal>()
+    var crashAfterRestartReplace = false
+    var clearStaleDuringBeginCompletion = false
+    var clearedDuringCompletion = -1
 
     override suspend fun findIncoming(transferId: String) = incoming[transferId]
     override suspend fun saveIncoming(checkpoint: IncomingCheckpoint) { incoming[checkpoint.transferId] = checkpoint }
@@ -587,12 +704,15 @@ private class FakeResumeStore : ResumeStore {
         expiryUpdates += expected.transferId
         val current = incoming[expected.transferId]
         if (!allowExpiryUpdate || current == null || current.sessionToken != null ||
+            current.operationState != IncomingOperationState.IDLE ||
             current.generation != expected.generation || current.storageValue != expected.storageValue ||
             current.nextChunkIndex != expected.nextChunkIndex ||
             !current.chainDigest.contentEquals(expected.chainDigest)
         ) return null
         incoming[expected.transferId] = current.copy(
-            sessionToken = token, sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+            sessionToken = token, sessionClaimedAt = now,
+            operationState = IncomingOperationState.ACTIVE,
+            updatedAt = now, expiresAt = expiresAt
         )
         if (removeAfterExpiryUpdate) incoming.remove(expected.transferId)
         if (advanceAfterExpiryUpdate) {
@@ -609,12 +729,26 @@ private class FakeResumeStore : ResumeStore {
         if (current.sessionToken != token || current.generation != expected.generation ||
             current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex
         ) return false
-        incoming[expected.transferId] = current.copy(sessionToken = null, sessionClaimedAt = null)
+        if (current.operationState != IncomingOperationState.ACTIVE) return false
+        incoming[expected.transferId] = current.copy(
+            sessionToken = null,
+            sessionClaimedAt = null,
+            operationState = IncomingOperationState.IDLE
+        )
         return true
     }
     override suspend fun clearStaleIncomingSessions(staleClaimBefore: Long): Int {
-        val stale = incoming.values.filter { it.sessionToken != null && (it.sessionClaimedAt ?: Long.MAX_VALUE) < staleClaimBefore }
-        stale.forEach { incoming[it.transferId] = it.copy(sessionToken = null, sessionClaimedAt = null) }
+        val stale = incoming.values.filter {
+            it.operationState == IncomingOperationState.ACTIVE && it.sessionToken != null &&
+                (it.sessionClaimedAt ?: Long.MAX_VALUE) < staleClaimBefore
+        }
+        stale.forEach {
+            incoming[it.transferId] = it.copy(
+                sessionToken = null,
+                sessionClaimedAt = null,
+                operationState = IncomingOperationState.IDLE
+            )
+        }
         return stale.size
     }
     override suspend fun replaceIncomingForRestart(
@@ -626,6 +760,7 @@ private class FakeResumeStore : ResumeStore {
             current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex
         ) return false
         incoming[expected.transferId] = replacement
+        if (crashAfterRestartReplace) throw SimulatedProcessDeath()
         return true
     }
     override suspend fun clearRetiredIncoming(expected: IncomingCheckpoint, token: String): Boolean {
@@ -636,6 +771,65 @@ private class FakeResumeStore : ResumeStore {
         incoming[expected.transferId] = current.copy(retiredStorageKind = null, retiredStorageValue = null)
         return true
     }
+    override suspend fun heartbeatIncomingSession(
+        expected: IncomingCheckpoint, token: String, now: Long, expiresAt: Long
+    ): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.sessionToken != token || current.generation != expected.generation ||
+            current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex ||
+            current.operationState != IncomingOperationState.ACTIVE
+        ) return false
+        incoming[expected.transferId] = current.copy(
+            sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+        )
+        return true
+    }
+    override suspend fun beginIncomingCompletion(
+        expected: IncomingCheckpoint, token: String, now: Long, expiresAt: Long
+    ): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.sessionToken != token || current.generation != expected.generation ||
+            current.storageValue != expected.storageValue || current.nextChunkIndex != expected.nextChunkIndex ||
+            current.operationState != IncomingOperationState.ACTIVE
+        ) return false
+        incoming[expected.transferId] = current.copy(
+            operationState = IncomingOperationState.COMPLETING,
+            sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+        )
+        if (clearStaleDuringBeginCompletion) {
+            clearedDuringCompletion = clearStaleIncomingSessions(Long.MAX_VALUE)
+        }
+        return true
+    }
+    override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
+        incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
+    override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.generation != expected.generation || current.storageValue != expected.storageValue
+        ) return false
+        incoming.remove(expected.transferId)
+        return true
+    }
+    override suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean {
+        val current = incoming[expected.transferId] ?: return false
+        if (current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.retiredStorageValue != expected.retiredStorageValue
+        ) return false
+        incoming[expected.transferId] = current.copy(
+            retiredStorageKind = null, retiredStorageValue = null
+        )
+        return true
+    }
+    override suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean {
+        if (stagingJournals.containsKey(journal.transferId)) return false
+        stagingJournals[journal.transferId] = journal
+        return true
+    }
+    override suspend fun findStagingJournals(): List<IncomingStagingJournal> =
+        stagingJournals.values.toList()
+    override suspend fun deleteStagingJournal(journal: IncomingStagingJournal): Boolean =
+        stagingJournals.remove(journal.transferId, journal)
     override suspend fun deleteOwnedIncoming(expected: IncomingCheckpoint, token: String): Boolean {
         val current = incoming[expected.transferId] ?: return false
         if (current.sessionToken != token || current.generation != expected.generation ||
@@ -727,12 +921,19 @@ private class FakeResumeStore : ResumeStore {
 
 private class FakeFiles : ResumableIncomingFileStore {
     private val entries = linkedMapOf<StoredFileLocation, FakeEntry>()
+    private val staging = linkedMapOf<String, StoredFileLocation>()
+    private val published = mutableSetOf<StoredFileLocation>()
     val deleted = mutableListOf<StoredFileLocation>()
     var reopenCount = 0
     var failCreate = false
+    var crashAfterCreate = false
+    var crashAfterPublish = false
+    var publishCount = 0
     val failDeleteValues = mutableSetOf<String>()
 
     fun contains(location: StoredFileLocation) = entries.containsKey(location)
+    fun stagingCount() = staging.size
+    fun wasPublished(location: StoredFileLocation) = location in published
 
     fun put(id: String, bytes: ByteArray): StoredFileLocation {
         val location = StoredFileLocation("FAKE", id)
@@ -742,11 +943,15 @@ private class FakeFiles : ResumableIncomingFileStore {
 
     override suspend fun create(transferId: String, fileName: String, mimeType: String): ResumableFileHandle {
         if (failCreate) throw IllegalStateException("create failed")
-        val location = StoredFileLocation("FAKE", "$transferId-${entries.size}")
+        check(transferId !in staging) { "staging already exists" }
+        val location = StoredFileLocation("FAKE", transferId)
         val entry = FakeEntry(fileName, ByteArray(0))
         entries[location] = entry
+        staging[transferId] = location
+        if (crashAfterCreate) throw SimulatedProcessDeath()
         return FakeHandle(location, entry)
     }
+    override suspend fun findStaging(transferId: String): StoredFileLocation? = staging[transferId]
     override suspend fun reopen(location: StoredFileLocation, displayName: String): ResumableFileHandle? {
         reopenCount++
         return entries[location]?.let { FakeHandle(location, it) }
@@ -754,13 +959,21 @@ private class FakeFiles : ResumableIncomingFileStore {
     override suspend fun openInput(location: StoredFileLocation): InputStream? =
         entries[location]?.let { ByteArrayInputStream(it.bytes) }
     override suspend fun publish(handle: ResumableFileHandle): String {
+        publishCount++
         handle.close()
+        entries.remove(handle.location)
+        staging.entries.removeAll { it.value == handle.location }
+        published += handle.location
+        if (crashAfterPublish) throw SimulatedProcessDeath()
         return "fake://${handle.location.value}"
     }
+    override suspend fun recoverPublished(location: StoredFileLocation, displayName: String): String? =
+        if (location in published) "fake://${location.value}" else null
     override suspend fun delete(location: StoredFileLocation) {
         if (location.value in failDeleteValues) throw IllegalStateException("delete failed")
         deleted += location
         entries.remove(location)
+        staging.entries.removeAll { it.value == location }
     }
 }
 

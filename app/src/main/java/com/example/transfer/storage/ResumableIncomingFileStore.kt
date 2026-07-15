@@ -30,11 +30,16 @@ interface ResumableIncomingFileStore {
         mimeType: String
     ): ResumableFileHandle
 
+    /** Finds the deterministic pending file for a persisted staging id after process death. */
+    suspend fun findStaging(transferId: String): StoredFileLocation? = null
+
     suspend fun reopen(
         location: StoredFileLocation,
         displayName: String
     ): ResumableFileHandle?
     suspend fun openInput(location: StoredFileLocation): InputStream?
     suspend fun publish(handle: ResumableFileHandle): String?
+    /** Returns the result of an already-completed publish without publishing a second file. */
+    suspend fun recoverPublished(location: StoredFileLocation, displayName: String): String? = null
     suspend fun delete(location: StoredFileLocation)
 }

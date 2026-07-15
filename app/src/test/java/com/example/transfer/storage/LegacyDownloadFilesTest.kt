@@ -13,6 +13,17 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 
 class LegacyDownloadFilesTest {
+    @Test
+    fun `published name is deterministic per partial and keeps extension`() {
+        val first = LegacyDownloadFiles.stablePublishedName("report.pdf", "C:/Download/.transfer-a.part")
+        val reopened = LegacyDownloadFiles.stablePublishedName("report.pdf", "C:/Download/.transfer-a.part")
+        val second = LegacyDownloadFiles.stablePublishedName("report.pdf", "C:/Download/.transfer-b.part")
+
+        assertEquals(first, reopened)
+        assertNotEquals(first, second)
+        assertTrue(first.startsWith("report_"))
+        assertTrue(first.endsWith(".pdf"))
+    }
     @get:Rule
     val temporaryFolder = TemporaryFolder()
 
