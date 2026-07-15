@@ -43,7 +43,8 @@ data class IncomingCheckpoint(
     val sessionClaimedAt: Long? = null,
     val retiredStorageKind: String? = null,
     val retiredStorageValue: String? = null,
-    val operationState: String = IncomingOperationState.IDLE
+    val operationState: String = IncomingOperationState.IDLE,
+    val completingFinalDigest: ByteArray? = null
 ) {
     val location: ResumeStorageLocation
         get() = ResumeStorageLocation(storageKind, storageValue)
@@ -73,6 +74,20 @@ data class OutgoingResumeLink(
     val updatedAt: Long = createdAt
 )
 
+data class CompletedReceipt(
+    val transferId: String,
+    val senderDeviceId: String,
+    val fileName: String,
+    val mimeType: String,
+    val fileSize: Long,
+    val chunkSize: Int,
+    val finalDigest: ByteArray,
+    val publishedUri: String?,
+    val publishedName: String,
+    val completedAt: Long,
+    val expiresAt: Long
+)
+
 @Entity(tableName = "incoming_checkpoints")
 data class IncomingCheckpointEntity(
     @PrimaryKey val transferId: String,
@@ -98,7 +113,8 @@ data class IncomingCheckpointEntity(
     @ColumnInfo(defaultValue = "NULL") val sessionClaimedAt: Long? = null,
     @ColumnInfo(defaultValue = "NULL") val retiredStorageKind: String? = null,
     @ColumnInfo(defaultValue = "NULL") val retiredStorageValue: String? = null,
-    @ColumnInfo(defaultValue = "'IDLE'") val operationState: String = IncomingOperationState.IDLE
+    @ColumnInfo(defaultValue = "'IDLE'") val operationState: String = IncomingOperationState.IDLE,
+    @ColumnInfo(defaultValue = "NULL") val completingFinalDigest: ByteArray? = null
 )
 
 @Entity(tableName = "incoming_staging_journal")
@@ -123,4 +139,19 @@ data class OutgoingResumeLinkEntity(
     val chunkSize: Int,
     val createdAt: Long,
     val updatedAt: Long
+)
+
+@Entity(tableName = "completed_receipts")
+data class CompletedReceiptEntity(
+    @PrimaryKey val transferId: String,
+    val senderDeviceId: String,
+    val fileName: String,
+    val mimeType: String,
+    val fileSize: Long,
+    val chunkSize: Int,
+    val finalDigest: ByteArray,
+    val publishedUri: String?,
+    val publishedName: String,
+    val completedAt: Long,
+    val expiresAt: Long
 )

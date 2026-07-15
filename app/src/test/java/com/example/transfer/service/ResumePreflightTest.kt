@@ -32,6 +32,19 @@ class ResumePreflightTest {
     }
 
     @Test
+    fun `completed receipt starts immediately without prompting or restarting`() {
+        val preflight = ResumePreflight<String>()
+        val token = requireNotNull(preflight.reserve())
+
+        val result = preflight.finish(token, listOf(file("done", ResumeState.COMPLETED)))
+
+        val ready = result as ResumePreflightResult.Ready
+        assertEquals(TransferStartMode.RESUME, ready.files.single().mode)
+        assertEquals(ResumeState.COMPLETED, ready.files.single().status.state)
+        assertNull(preflight.prompt)
+    }
+
+    @Test
     fun `one or many available checkpoints publish one batch prompt`() {
         listOf(1, 3).forEach { availableCount ->
             val preflight = ResumePreflight<String>()

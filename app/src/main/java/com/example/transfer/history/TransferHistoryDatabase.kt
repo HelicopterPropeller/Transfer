@@ -9,6 +9,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.transfer.resume.IncomingCheckpointEntity
 import com.example.transfer.resume.IncomingStagingJournalEntity
 import com.example.transfer.resume.OutgoingResumeLinkEntity
+import com.example.transfer.resume.CompletedReceiptEntity
 import com.example.transfer.resume.ResumeDao
 
 @Database(
@@ -16,9 +17,10 @@ import com.example.transfer.resume.ResumeDao
         TransferHistoryEntity::class,
         IncomingCheckpointEntity::class,
         IncomingStagingJournalEntity::class,
-        OutgoingResumeLinkEntity::class
+        OutgoingResumeLinkEntity::class,
+        CompletedReceiptEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class TransferHistoryDatabase : RoomDatabase() {
@@ -98,6 +100,31 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "ALTER TABLE incoming_checkpoints ADD COLUMN completingFinalDigest BLOB DEFAULT NULL"
+                )
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS completed_receipts (
+                        transferId TEXT NOT NULL PRIMARY KEY,
+                        senderDeviceId TEXT NOT NULL,
+                        fileName TEXT NOT NULL,
+                        mimeType TEXT NOT NULL,
+                        fileSize INTEGER NOT NULL,
+                        chunkSize INTEGER NOT NULL,
+                        finalDigest BLOB NOT NULL,
+                        publishedUri TEXT,
+                        publishedName TEXT NOT NULL,
+                        completedAt INTEGER NOT NULL,
+                        expiresAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         @Volatile
         private var instance: TransferHistoryDatabase? = null
 
@@ -107,7 +134,7 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
                     context.applicationContext,
                     TransferHistoryDatabase::class.java,
                     "transfer_history.db"
-                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { instance = it }
             }

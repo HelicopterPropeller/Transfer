@@ -202,7 +202,7 @@ class RoomResumeStoreTest {
         assertTrue(store.heartbeatIncomingSession(active, "session", 30L, 300L))
         val refreshed = requireNotNull(store.findIncoming("t1"))
         assertEquals(30L, refreshed.sessionClaimedAt)
-        assertTrue(store.beginIncomingCompletion(refreshed, "session", 40L, 400L))
+        assertTrue(store.beginIncomingCompletion(refreshed, "session", ByteArray(32), 40L, 400L))
 
         assertEquals(0, store.clearStaleIncomingSessions(Long.MAX_VALUE))
         assertFalse(store.updateIncomingExpiry("t1", 50L, 500L))
@@ -213,6 +213,37 @@ class RoomResumeStoreTest {
             )
         )
         assertEquals(IncomingOperationState.COMPLETING, store.findIncoming("t1")?.operationState)
+    }
+
+    @Test
+    fun `completion transaction maps durable receipt and removes completing checkpoint`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        val digest = ByteArray(32) { 6 }
+        val completing = incoming("t1").copy(
+            operationState = IncomingOperationState.COMPLETING,
+            completingFinalDigest = digest
+        )
+        store.saveIncoming(completing)
+        val receipt = CompletedReceipt(
+            transferId = completing.transferId,
+            senderDeviceId = completing.senderDeviceId,
+            fileName = completing.fileName,
+            mimeType = completing.mimeType,
+            fileSize = completing.fileSize,
+            chunkSize = completing.chunkSize,
+            finalDigest = digest,
+            publishedUri = "content://received/a.bin",
+            publishedName = completing.displayName,
+            completedAt = 100L,
+            expiresAt = 200L
+        )
+
+        assertTrue(store.finishIncomingCompletion(completing, receipt))
+
+        assertNull(store.findIncoming("t1"))
+        val stored = requireNotNull(store.findCompletedReceipt("t1"))
+        assertArrayEquals(digest, stored.finalDigest)
+        assertEquals(receipt.publishedUri, stored.publishedUri)
     }
 
     @Test
@@ -365,9 +396,12 @@ private class FakeResumeDao : ResumeDao {
         return 1
     }
 
+    private val receipts = linkedMapOf<String, CompletedReceiptEntity>()
+
     override suspend fun beginIncomingCompletion(
         transferId: String, token: String, generation: Long, storageKind: String,
-        storageValue: String, nextChunkIndex: Int, now: Long, expiresAt: Long
+        storageValue: String, nextChunkIndex: Int, finalDigest: ByteArray,
+        now: Long, expiresAt: Long
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (!current.ownedBy(token, generation, storageKind, storageValue, nextChunkIndex) ||
@@ -375,7 +409,8 @@ private class FakeResumeDao : ResumeDao {
         ) return 0
         incoming[transferId] = current.copy(
             operationState = IncomingOperationState.COMPLETING,
-            sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt
+            sessionClaimedAt = now, updatedAt = now, expiresAt = expiresAt,
+            completingFinalDigest = finalDigest
         )
         return 1
     }
@@ -384,15 +419,32 @@ private class FakeResumeDao : ResumeDao {
         incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
 
     override suspend fun deleteCompletingIncoming(
-        transferId: String, generation: Long, storageKind: String, storageValue: String
+        transferId: String, generation: Long, storageKind: String, storageValue: String,
+        finalDigest: ByteArray
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (current.operationState != IncomingOperationState.COMPLETING ||
             current.generation != generation || current.storageKind != storageKind ||
-            current.storageValue != storageValue
+            current.storageValue != storageValue ||
+            current.completingFinalDigest?.contentEquals(finalDigest) != true
         ) return 0
         incoming.remove(transferId)
         return 1
+    }
+
+    override suspend fun findCompletedReceipt(transferId: String): CompletedReceiptEntity? =
+        receipts[transferId]
+
+    override suspend fun insertCompletedReceipt(receipt: CompletedReceiptEntity): Long {
+        if (receipts.containsKey(receipt.transferId)) return -1
+        receipts[receipt.transferId] = receipt
+        return 1
+    }
+
+    override suspend fun deleteExpiredCompletedReceipts(now: Long): Int {
+        val expired = receipts.values.filter { it.expiresAt <= now }.map { it.transferId }
+        expired.forEach(receipts::remove)
+        return expired.size
     }
 
     override suspend fun clearRetiredIncomingForRecovery(

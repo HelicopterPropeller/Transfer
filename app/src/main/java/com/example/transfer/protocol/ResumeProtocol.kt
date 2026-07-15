@@ -16,7 +16,8 @@ data class TransferOffer(
 enum class ResumeState(val code: Int) {
     NONE(0),
     AVAILABLE(1),
-    INVALID(2)
+    INVALID(2),
+    COMPLETED(3)
 }
 
 enum class TransferStartMode(val code: Int) {
@@ -30,7 +31,19 @@ data class ResumeStatus(
     val confirmedBytes: Long = 0,
     val nextChunkIndex: Int = 0,
     val chainDigest: ByteArray = ByteArray(ChunkCodec.DIGEST_SIZE),
-    val lastChunkHash: ByteArray = ByteArray(ChunkCodec.DIGEST_SIZE)
+    val lastChunkHash: ByteArray = ByteArray(ChunkCodec.DIGEST_SIZE),
+    val finalDigest: ByteArray? = null
+)
+
+enum class TransferStartResponse(val code: Int) {
+    READY(0),
+    COMPLETED(1),
+    FATAL(2)
+}
+
+data class TransferStartResult(
+    val response: TransferStartResponse,
+    val finalDigest: ByteArray? = null
 )
 
 object ResumeProtocol {
@@ -66,6 +79,7 @@ object ResumeProtocol {
         output.writeInt(status.nextChunkIndex)
         output.write(status.chainDigest)
         output.write(status.lastChunkHash)
+        status.finalDigest?.let(output::write)
     }
 
     fun readStatus(input: DataInputStream): ResumeStatus {
@@ -77,7 +91,10 @@ object ResumeProtocol {
             confirmedBytes = input.readLong(),
             nextChunkIndex = input.readInt(),
             chainDigest = ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully),
-            lastChunkHash = ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully)
+            lastChunkHash = ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully),
+            finalDigest = if (state == ResumeState.COMPLETED) {
+                ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully)
+            } else null
         ).also(::validateStatus)
     }
 
@@ -90,6 +107,32 @@ object ResumeProtocol {
         val code = input.readUnsignedByte()
         return TransferStartMode.entries.firstOrNull { it.code == code }
             ?: throw ProtocolException("Unknown transfer start mode")
+    }
+
+    fun writeStartResponse(
+        output: DataOutputStream,
+        response: TransferStartResponse,
+        finalDigest: ByteArray? = null
+    ) {
+        if (response == TransferStartResponse.COMPLETED) {
+            if (finalDigest?.size != ChunkCodec.DIGEST_SIZE) {
+                throw ProtocolException("Invalid completed transfer digest")
+            }
+        } else if (finalDigest != null) {
+            throw ProtocolException("Unexpected transfer digest")
+        }
+        output.writeByte(response.code)
+        finalDigest?.let(output::write)
+    }
+
+    fun readStartResponse(input: DataInputStream): TransferStartResult {
+        val code = input.readUnsignedByte()
+        val response = TransferStartResponse.entries.firstOrNull { it.code == code }
+            ?: throw ProtocolException("Unknown transfer start response")
+        val digest = if (response == TransferStartResponse.COMPLETED) {
+            ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully)
+        } else null
+        return TransferStartResult(response, digest)
     }
 
     private fun validateOffer(offer: TransferOffer) {
@@ -117,9 +160,17 @@ object ResumeProtocol {
         ) {
             throw ProtocolException("Invalid resume digest")
         }
+        if (status.state == ResumeState.COMPLETED) {
+            if (status.finalDigest?.size != ChunkCodec.DIGEST_SIZE) {
+                throw ProtocolException("Invalid completed transfer digest")
+            }
+        } else if (status.finalDigest != null) {
+            throw ProtocolException("Unexpected completed transfer digest")
+        }
     }
 
     private fun validateStatusForOffer(status: ResumeStatus, offer: TransferOffer) {
+        if (status.state == ResumeState.COMPLETED) return
         if (status.confirmedBytes > offer.fileSize) throw ProtocolException("Invalid resume offset")
         if (status.confirmedBytes != offer.fileSize &&
             status.confirmedBytes % TransferProtocol.CHUNK_SIZE != 0L

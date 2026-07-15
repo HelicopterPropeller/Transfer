@@ -89,9 +89,19 @@ class ResumeCoordinator(
     }
 
     suspend fun queryIncoming(offer: TransferOffer): ResumeStatus {
+        queryCompleted(offer)?.let { return it }
         val checkpoint = store.findIncoming(offer.transferId) ?: return ResumeStatus(ResumeState.NONE)
         return inspectIncoming(checkpoint, offer)
     }
+
+    suspend fun queryCompleted(offer: TransferOffer): ResumeStatus? =
+        store.findCompletedReceipt(offer.transferId)?.let { receipt ->
+            if (receipt.matches(offer)) {
+                ResumeStatus(ResumeState.COMPLETED, finalDigest = receipt.finalDigest.copyOf())
+            } else {
+                ResumeStatus(ResumeState.INVALID)
+            }
+        }
 
     private suspend fun inspectIncoming(
         checkpoint: IncomingCheckpoint,
@@ -178,24 +188,36 @@ class ResumeCoordinator(
         )
     }
 
-    suspend fun completeIncoming(session: IncomingResumeSession): String? {
+    suspend fun completeIncoming(
+        session: IncomingResumeSession,
+        finalDigest: ByteArray = session.prefix.wholeDigest.digest()
+    ): String? {
+        if (finalDigest.size != ChunkCodec.DIGEST_SIZE) {
+            throw ResumeValidationException("Invalid whole-file digest")
+        }
         var active = heartbeatIncoming(session)
         active = active.copy(
             checkpoint = recoverRetired(active.checkpoint, active.sessionToken, requireSuccess = true)
         )
         val now = clock()
         val expiresAt = now + RETENTION_MILLIS
-        if (!store.beginIncomingCompletion(active.checkpoint, active.sessionToken, now, expiresAt)) {
+        if (!store.beginIncomingCompletion(
+                active.checkpoint, active.sessionToken, finalDigest, now, expiresAt
+            )) {
             throw CheckpointConflictException("Incoming session lost ownership before completion")
         }
         val completing = active.checkpoint.copy(
             operationState = IncomingOperationState.COMPLETING,
             sessionClaimedAt = now,
             updatedAt = now,
-            expiresAt = expiresAt
+            expiresAt = expiresAt,
+            completingFinalDigest = finalDigest.copyOf()
         )
         val published = files.publish(active.handle)
-        if (!store.deleteCompletingIncoming(completing)) {
+        if (!store.finishIncomingCompletion(
+                completing,
+                completing.toReceipt(finalDigest, published, now)
+            )) {
             throw CheckpointConflictException("Completed checkpoint changed before final cleanup")
         }
         return published
@@ -258,16 +280,21 @@ class ResumeCoordinator(
         store.findCompletingIncoming().forEach { checkpoint ->
             if (!recoverRetiredAfterProcessDeath(checkpoint)) return@forEach
             try {
+                val finalDigest = checkpoint.completingFinalDigest ?: return@forEach
                 val alreadyPublished = files.recoverPublished(
                     checkpoint.location.toStoredLocation(), checkpoint.displayName
                 )
-                if (alreadyPublished == null) {
+                val published = if (alreadyPublished == null) {
                     val handle = files.reopen(
                         checkpoint.location.toStoredLocation(), checkpoint.displayName
                     ) ?: return@forEach
                     files.publish(handle)
-                }
-                if (store.deleteCompletingIncoming(checkpoint)) recovered++
+                } else alreadyPublished
+                val completedAt = clock()
+                if (store.finishIncomingCompletion(
+                        checkpoint,
+                        checkpoint.toReceipt(finalDigest, published, completedAt)
+                    )) recovered++
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -692,6 +719,30 @@ class ResumeCoordinator(
             fileSize == offer.fileSize &&
             chunkSize == offer.chunkSize
 
+    private fun CompletedReceipt.matches(offer: TransferOffer): Boolean =
+        transferId == offer.transferId && senderDeviceId == offer.senderDeviceId &&
+            fileName == offer.fileName && mimeType == offer.mimeType &&
+            fileSize == offer.fileSize && chunkSize == offer.chunkSize &&
+            finalDigest.size == ChunkCodec.DIGEST_SIZE
+
+    private fun IncomingCheckpoint.toReceipt(
+        finalDigest: ByteArray,
+        publishedUri: String?,
+        completedAt: Long
+    ) = CompletedReceipt(
+        transferId = transferId,
+        senderDeviceId = senderDeviceId,
+        fileName = fileName,
+        mimeType = mimeType,
+        fileSize = fileSize,
+        chunkSize = chunkSize,
+        finalDigest = finalDigest.copyOf(),
+        publishedUri = publishedUri,
+        publishedName = displayName,
+        completedAt = completedAt,
+        expiresAt = completedAt + RETENTION_MILLIS
+    )
+
     private fun IncomingCheckpoint.isResumableFor(offer: TransferOffer): Boolean {
         if (!matches(offer) || chainDigest.size != ChunkCodec.DIGEST_SIZE ||
             lastChunkHash.size != ChunkCodec.DIGEST_SIZE || confirmedBytes !in 0..fileSize
@@ -718,7 +769,10 @@ class ResumeCoordinator(
             confirmedBytes == other.confirmedBytes &&
             nextChunkIndex == other.nextChunkIndex &&
             chainDigest.contentEquals(other.chainDigest) &&
-            lastChunkHash.contentEquals(other.lastChunkHash)
+            lastChunkHash.contentEquals(other.lastChunkHash) &&
+            ((finalDigest == null && other.finalDigest == null) ||
+                (finalDigest != null && other.finalDigest != null &&
+                    finalDigest.contentEquals(other.finalDigest)))
 
     private fun ResumeStorageLocation.toStoredLocation() = StoredFileLocation(
         kind = kind,

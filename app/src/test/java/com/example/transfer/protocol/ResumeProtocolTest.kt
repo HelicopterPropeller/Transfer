@@ -67,7 +67,9 @@ class ResumeProtocolTest {
     @Test
     fun `status round trips every resume state`() {
         ResumeState.entries.forEach { state ->
-            val expected = validStatus(state)
+            val expected = validStatus(state).copy(
+                finalDigest = if (state == ResumeState.COMPLETED) ByteArray(ChunkCodec.DIGEST_SIZE) { 7 } else null
+            )
 
             val actual = ResumeProtocol.readStatus(DataInputStream(ByteArrayInputStream(encodeStatus(expected))))
 
@@ -76,6 +78,52 @@ class ResumeProtocolTest {
             assertEquals(expected.nextChunkIndex, actual.nextChunkIndex)
             assertArrayEquals(expected.chainDigest, actual.chainDigest)
             assertArrayEquals(expected.lastChunkHash, actual.lastChunkHash)
+            if (expected.finalDigest == null) assertEquals(null, actual.finalDigest)
+            else assertArrayEquals(expected.finalDigest, actual.finalDigest)
+        }
+    }
+
+    @Test
+    fun `completed status requires a sha256 final digest`() {
+        listOf(null, ByteArray(ChunkCodec.DIGEST_SIZE - 1)).forEach { digest ->
+            assertThrows(ProtocolException::class.java) {
+                ResumeProtocol.writeStatus(
+                    DataOutputStream(ByteArrayOutputStream()),
+                    validStatus(ResumeState.COMPLETED, confirmedBytes = 0).copy(finalDigest = digest)
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `transfer start response round trips ready completed and fatal`() {
+        TransferStartResponse.entries.forEach { response ->
+            val digest = if (response == TransferStartResponse.COMPLETED) {
+                ByteArray(ChunkCodec.DIGEST_SIZE) { 9 }
+            } else null
+            val bytes = ByteArrayOutputStream().also {
+                ResumeProtocol.writeStartResponse(DataOutputStream(it), response, digest)
+            }.toByteArray()
+
+            val actual = ResumeProtocol.readStartResponse(DataInputStream(ByteArrayInputStream(bytes)))
+
+            assertEquals(response, actual.response)
+            if (digest == null) assertEquals(null, actual.finalDigest)
+            else assertArrayEquals(digest, actual.finalDigest)
+        }
+    }
+
+    @Test
+    fun `completed start response requires sha256 digest and unknown code is rejected`() {
+        assertThrows(ProtocolException::class.java) {
+            ResumeProtocol.writeStartResponse(
+                DataOutputStream(ByteArrayOutputStream()),
+                TransferStartResponse.COMPLETED,
+                ByteArray(1)
+            )
+        }
+        assertThrows(ProtocolException::class.java) {
+            ResumeProtocol.readStartResponse(DataInputStream(ByteArrayInputStream(byteArrayOf(99))))
         }
     }
 

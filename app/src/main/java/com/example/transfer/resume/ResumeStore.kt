@@ -33,12 +33,18 @@ interface ResumeStore {
     suspend fun beginIncomingCompletion(
         expected: IncomingCheckpoint,
         token: String,
+        finalDigest: ByteArray,
         now: Long,
         expiresAt: Long
     ): Boolean = error("beginIncomingCompletion is not implemented")
     suspend fun findCompletingIncoming(): List<IncomingCheckpoint> = emptyList()
     suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
         error("deleteCompletingIncoming is not implemented")
+    suspend fun findCompletedReceipt(transferId: String): CompletedReceipt? = null
+    suspend fun finishIncomingCompletion(
+        expected: IncomingCheckpoint,
+        receipt: CompletedReceipt
+    ): Boolean = error("finishIncomingCompletion is not implemented")
     suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean =
         error("clearRetiredIncomingForRecovery is not implemented")
     suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean =
@@ -87,6 +93,7 @@ interface ResumeStore {
     suspend fun deleteClaimedIncoming(token: String): Int
     suspend fun releaseClaimedIncoming(token: String): Int
     suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int
+    suspend fun deleteExpiredCompletedReceipts(now: Long): Int = 0
 }
 
 class RoomResumeStore(
@@ -184,11 +191,12 @@ class RoomResumeStore(
     override suspend fun beginIncomingCompletion(
         expected: IncomingCheckpoint,
         token: String,
+        finalDigest: ByteArray,
         now: Long,
         expiresAt: Long
     ): Boolean = dao.beginIncomingCompletion(
         expected.transferId, token, expected.generation, expected.storageKind,
-        expected.storageValue, expected.nextChunkIndex, now, expiresAt
+        expected.storageValue, expected.nextChunkIndex, finalDigest, now, expiresAt
     ) > 0
 
     override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
@@ -196,8 +204,19 @@ class RoomResumeStore(
 
     override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
         dao.deleteCompletingIncoming(
-            expected.transferId, expected.generation, expected.storageKind, expected.storageValue
+            expected.transferId, expected.generation, expected.storageKind, expected.storageValue,
+            requireNotNull(expected.completingFinalDigest)
         ) > 0
+
+    override suspend fun findCompletedReceipt(transferId: String): CompletedReceipt? =
+        dao.findCompletedReceipt(transferId)?.toDomain()
+
+    override suspend fun finishIncomingCompletion(
+        expected: IncomingCheckpoint,
+        receipt: CompletedReceipt
+    ): Boolean = dao.recordCompletedReceiptAndDelete(
+        receipt.toEntity(), expected.generation, expected.storageKind, expected.storageValue
+    )
 
     override suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean {
         val retired = expected.retiredLocation ?: return true
@@ -300,6 +319,9 @@ class RoomResumeStore(
     override suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int =
         dao.deleteExpiredOutgoing(updatedAtCutoff)
 
+    override suspend fun deleteExpiredCompletedReceipts(now: Long): Int =
+        dao.deleteExpiredCompletedReceipts(now)
+
     private fun IncomingCheckpoint.toEntity() = IncomingCheckpointEntity(
         transferId = transferId,
         senderDeviceId = senderDeviceId,
@@ -324,7 +346,8 @@ class RoomResumeStore(
         sessionClaimedAt = sessionClaimedAt,
         retiredStorageKind = retiredStorageKind,
         retiredStorageValue = retiredStorageValue,
-        operationState = operationState
+        operationState = operationState,
+        completingFinalDigest = completingFinalDigest
     )
 
     private fun IncomingCheckpointEntity.toDomain() = IncomingCheckpoint(
@@ -349,7 +372,8 @@ class RoomResumeStore(
         sessionClaimedAt = sessionClaimedAt,
         retiredStorageKind = retiredStorageKind,
         retiredStorageValue = retiredStorageValue,
-        operationState = operationState
+        operationState = operationState,
+        completingFinalDigest = completingFinalDigest
     )
 
     private fun IncomingStagingJournal.toEntity() = IncomingStagingJournalEntity(
@@ -388,5 +412,15 @@ class RoomResumeStore(
         chunkSize = chunkSize,
         createdAt = createdAt,
         updatedAt = updatedAt
+    )
+
+    private fun CompletedReceipt.toEntity() = CompletedReceiptEntity(
+        transferId, senderDeviceId, fileName, mimeType, fileSize, chunkSize,
+        finalDigest, publishedUri, publishedName, completedAt, expiresAt
+    )
+
+    private fun CompletedReceiptEntity.toDomain() = CompletedReceipt(
+        transferId, senderDeviceId, fileName, mimeType, fileSize, chunkSize,
+        finalDigest, publishedUri, publishedName, completedAt, expiresAt
     )
 }

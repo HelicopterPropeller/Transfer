@@ -25,6 +25,7 @@ class ResumeCleanupTest {
         assertEquals(now, store.claimNow)
         assertEquals(now - ResumeCleanup.DAY_MILLIS, store.staleClaimBefore)
         assertEquals(now - ResumeCleanup.RETENTION_MILLIS, store.outgoingCutoff)
+        assertEquals(now, store.receiptExpiryNow)
         assertEquals(listOf(StoredFileLocation("FAKE", "expired")), files.deleted)
         assertTrue(store.deletedClaimToken != null)
         assertEquals(now, savedLastRun)
@@ -117,6 +118,7 @@ private class CleanupStore(private val expired: List<IncomingCheckpoint>) : Resu
     var releasedClaimToken: String? = null
     var releaseCount = 0
     var outgoingCutoff: Long? = null
+    var receiptExpiryNow: Long? = null
 
     override suspend fun claimExpiredIncoming(now: Long, staleClaimBefore: Long, token: String): List<IncomingCheckpoint> {
         claimNow = now
@@ -131,6 +133,7 @@ private class CleanupStore(private val expired: List<IncomingCheckpoint>) : Resu
         return expired.size
     }
     override suspend fun deleteExpiredOutgoing(updatedAtCutoff: Long): Int { outgoingCutoff = updatedAtCutoff; return 1 }
+    override suspend fun deleteExpiredCompletedReceipts(now: Long): Int { receiptExpiryNow = now; return 1 }
     override suspend fun findIncoming(transferId: String) = null
     override suspend fun saveIncoming(checkpoint: IncomingCheckpoint) = Unit
     override suspend fun commitIncomingChunk(transferId: String, expectedNextChunkIndex: Int, confirmedBytes: Long, nextChunkIndex: Int, chainDigest: ByteArray, lastChunkHash: ByteArray, updatedAt: Long, expiresAt: Long) = false

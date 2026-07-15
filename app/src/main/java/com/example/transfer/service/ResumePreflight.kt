@@ -129,6 +129,7 @@ internal class ResumePreflight<T> {
             } else {
                 TransferStartMode.RESTART
             }
+            ResumeState.COMPLETED -> TransferStartMode.RESUME
         }
         ResumeSelectedFile(file.value, file.status, mode)
     }

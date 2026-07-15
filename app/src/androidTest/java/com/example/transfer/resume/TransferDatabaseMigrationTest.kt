@@ -45,10 +45,11 @@ class TransferDatabaseMigrationTest {
 
         val migrated = helper.runMigrationsAndValidate(
             TEST_DATABASE,
-            3,
+            4,
             true,
             TransferHistoryDatabase.MIGRATION_1_2,
-            TransferHistoryDatabase.MIGRATION_2_3
+            TransferHistoryDatabase.MIGRATION_2_3,
+            TransferHistoryDatabase.MIGRATION_3_4
         )
 
         migrated.query("SELECT * FROM transfer_history").use { cursor ->
@@ -77,12 +78,46 @@ class TransferDatabaseMigrationTest {
         }
         assertTableEmpty(migrated, "incoming_checkpoints")
         assertTableEmpty(migrated, "outgoing_resume_links")
+        assertTableEmpty(migrated, "completed_receipts")
+        assertTrue("completingFinalDigest" in tableColumns(migrated, "incoming_checkpoints"))
         assertEquals(
             setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue"),
             tableColumns(migrated, "incoming_checkpoints").intersect(
                 setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue")
             )
         )
+        migrated.close()
+    }
+
+    @Test
+    fun migration3To4PreservesCheckpointAndAddsCompletionReceipts() {
+        helper.createDatabase(TEST_DATABASE, 3).apply {
+            createVersionOneHistoryTable()
+            TransferHistoryDatabase.MIGRATION_1_2.migrate(this)
+            TransferHistoryDatabase.MIGRATION_2_3.migrate(this)
+            execSQL(
+                """INSERT INTO incoming_checkpoints
+                (transferId,senderDeviceId,fileName,displayName,mimeType,fileSize,chunkSize,
+                 confirmedBytes,nextChunkIndex,chainDigest,lastChunkHash,storageKind,storageValue,
+                 createdAt,updatedAt,expiresAt,cleanupToken,cleanupClaimedAt,generation,sessionToken,
+                 sessionClaimedAt,retiredStorageKind,retiredStorageValue,operationState)
+                VALUES ('kept','sender','a.bin','a.bin','application/octet-stream',0,1048576,
+                 0,0,zeroblob(32),zeroblob(32),'LEGACY_FILE','old.part',1,1,2,NULL,NULL,1,
+                 'owner',1,NULL,NULL,'COMPLETING')""".trimIndent()
+            )
+            close()
+        }
+
+        val migrated = helper.runMigrationsAndValidate(
+            TEST_DATABASE, 4, true, TransferHistoryDatabase.MIGRATION_3_4
+        )
+
+        assertTrue("completingFinalDigest" in tableColumns(migrated, "incoming_checkpoints"))
+        migrated.query("SELECT completingFinalDigest FROM incoming_checkpoints WHERE transferId='kept'").use {
+            assertTrue(it.moveToFirst())
+            assertTrue(it.isNull(0))
+        }
+        assertTableEmpty(migrated, "completed_receipts")
         migrated.close()
     }
 
@@ -184,6 +219,42 @@ class TransferDatabaseMigrationTest {
                 row.transferId, "winner", row.generation, row.storageKind, row.storageValue,
                 row.nextChunkIndex, 16L, 2, byteArrayOf(3), byteArrayOf(4), 30L, 300L
             ))
+        }
+    }
+
+    @Test
+    fun realRoomCompletionTransactionPersistsReceiptAndDeletesCheckpoint() = runBlocking {
+        withResumeDatabase { database ->
+            val dao = database.resumeDao()
+            val digest = ByteArray(32) { 7 }
+            val checkpoint = incomingEntity("done").copy(
+                operationState = IncomingOperationState.COMPLETING,
+                completingFinalDigest = digest
+            )
+            dao.upsertIncoming(checkpoint)
+            val receipt = CompletedReceiptEntity(
+                transferId = checkpoint.transferId,
+                senderDeviceId = checkpoint.senderDeviceId,
+                fileName = checkpoint.fileName,
+                mimeType = checkpoint.mimeType,
+                fileSize = checkpoint.fileSize,
+                chunkSize = checkpoint.chunkSize,
+                finalDigest = digest,
+                publishedUri = "content://received/done",
+                publishedName = checkpoint.displayName,
+                completedAt = 100L,
+                expiresAt = 200L
+            )
+
+            assertTrue(
+                dao.recordCompletedReceiptAndDelete(
+                    receipt, checkpoint.generation, checkpoint.storageKind, checkpoint.storageValue
+                )
+            )
+            assertNull(dao.findIncoming(checkpoint.transferId))
+            val stored = requireNotNull(dao.findCompletedReceipt(checkpoint.transferId))
+            assertTrue(digest.contentEquals(stored.finalDigest))
+            assertEquals(receipt.publishedUri, stored.publishedUri)
         }
     }
 

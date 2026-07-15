@@ -50,6 +50,7 @@ class ResumeCleanup(
             deletionError?.let { throw it }
             store.deleteClaimedIncoming(token)
             store.deleteExpiredOutgoing(now - RETENTION_MILLIS)
+            store.deleteExpiredCompletedReceipts(now)
             saveLastRun(now)
             return expired.size
         } catch (error: CancellationException) {

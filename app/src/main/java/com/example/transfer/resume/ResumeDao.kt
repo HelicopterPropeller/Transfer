@@ -164,7 +164,8 @@ interface ResumeDao {
     @Query(
         """
         UPDATE incoming_checkpoints
-        SET operationState = 'COMPLETING', sessionClaimedAt = :now,
+        SET operationState = 'COMPLETING', completingFinalDigest = :finalDigest,
+            sessionClaimedAt = :now,
             updatedAt = :now, expiresAt = :expiresAt
         WHERE transferId = :transferId AND sessionToken = :token
           AND generation = :generation AND storageKind = :storageKind
@@ -175,7 +176,7 @@ interface ResumeDao {
     suspend fun beginIncomingCompletion(
         transferId: String, token: String, generation: Long,
         storageKind: String, storageValue: String, nextChunkIndex: Int,
-        now: Long, expiresAt: Long
+        finalDigest: ByteArray, now: Long, expiresAt: Long
     ): Int
 
     @Query("SELECT * FROM incoming_checkpoints WHERE operationState = 'COMPLETING'")
@@ -186,12 +187,46 @@ interface ResumeDao {
         DELETE FROM incoming_checkpoints
         WHERE transferId = :transferId AND generation = :generation
           AND storageKind = :storageKind AND storageValue = :storageValue
-          AND operationState = 'COMPLETING'
+          AND operationState = 'COMPLETING' AND completingFinalDigest = :finalDigest
         """
     )
     suspend fun deleteCompletingIncoming(
-        transferId: String, generation: Long, storageKind: String, storageValue: String
+        transferId: String, generation: Long, storageKind: String, storageValue: String,
+        finalDigest: ByteArray
     ): Int
+
+    @Query("SELECT * FROM completed_receipts WHERE transferId = :transferId LIMIT 1")
+    suspend fun findCompletedReceipt(transferId: String): CompletedReceiptEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertCompletedReceipt(receipt: CompletedReceiptEntity): Long
+
+    @Transaction
+    suspend fun recordCompletedReceiptAndDelete(
+        receipt: CompletedReceiptEntity,
+        generation: Long,
+        storageKind: String,
+        storageValue: String
+    ): Boolean {
+        insertCompletedReceipt(receipt)
+        val actual = findCompletedReceipt(receipt.transferId)
+        check(actual != null && actual.sameValue(receipt)) { "Completed receipt identity conflict" }
+        check(
+            deleteCompletingIncoming(
+                receipt.transferId, generation, storageKind, storageValue, receipt.finalDigest
+            ) > 0
+        ) { "Completing checkpoint changed" }
+        return true
+    }
+
+    private fun CompletedReceiptEntity.sameValue(other: CompletedReceiptEntity): Boolean =
+        senderDeviceId == other.senderDeviceId && fileName == other.fileName &&
+            mimeType == other.mimeType && fileSize == other.fileSize &&
+            chunkSize == other.chunkSize && finalDigest.contentEquals(other.finalDigest) &&
+            publishedUri == other.publishedUri && publishedName == other.publishedName
+
+    @Query("DELETE FROM completed_receipts WHERE expiresAt <= :now")
+    suspend fun deleteExpiredCompletedReceipts(now: Long): Int
 
     @Query(
         """

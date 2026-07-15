@@ -10,6 +10,7 @@ import com.example.transfer.protocol.TransferFrameCodec
 import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.protocol.TransferStartResponse
 import com.example.transfer.resume.PreparedTransfer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -66,6 +67,8 @@ class FileTransferCancellationTest {
                 ResumeProtocol.readOffer(input)
                 assertEquals(TransferStartMode.NEW, ResumeProtocol.readStartMode(input))
                 ResumeProtocol.readStatus(input)
+                ResumeProtocol.writeStartResponse(output, TransferStartResponse.READY)
+                output.flush()
                 assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                 ChunkCodec.read(input, expectedIndex = 0, expectedLength = TransferProtocol.CHUNK_SIZE)
                 output.writeByte(TransferProtocol.ACK)

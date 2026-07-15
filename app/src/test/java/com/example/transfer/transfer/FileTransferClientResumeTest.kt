@@ -12,6 +12,7 @@ import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferOffer
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.protocol.TransferStartResponse
 import com.example.transfer.resume.PreparedTransfer
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -33,6 +34,87 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class FileTransferClientResumeTest {
+    @Test
+    fun `client sends no chunk until receiver replies ready`() = runBlocking {
+        val bytes = byteArrayOf(4, 5, 6)
+        val offer = offer(bytes.size.toLong())
+        val server = ServerSocket(0)
+        val serverJob = async(Dispatchers.IO) {
+            server.accept().use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                assertStart(input, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                socket.soTimeout = 250
+                assertThrowsSocketTimeout { input.readUnsignedByte() }
+                ResumeProtocol.writeStartResponse(output, TransferStartResponse.READY)
+                output.flush()
+                socket.soTimeout = 3_000
+                assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
+                ChunkCodec.read(input, 0, bytes.size)
+                output.writeByte(TransferProtocol.ACK)
+                output.flush()
+                assertEquals(TransferProtocol.COMPLETE, input.readUnsignedByte())
+                ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully)
+                output.writeByte(TransferProtocol.SUCCESS)
+                output.flush()
+            }
+        }
+
+        val result = FileTransferClient().sendPrepared(
+            InetAddress.getLoopbackAddress(), server.localPort, prepared(offer, bytes),
+            TransferStartMode.NEW, ResumeStatus(ResumeState.NONE), TransferPauseController(), {}, {}
+        )
+
+        assertTrue(result.isSuccess)
+        serverJob.await()
+        server.close()
+    }
+
+    @Test
+    fun `completed status verifies local whole digest without opening transfer socket`() = runBlocking {
+        val bytes = byteArrayOf(7, 8, 9)
+        val offer = offer(bytes.size.toLong())
+        val server = ServerSocket(0).apply { soTimeout = 400 }
+        val digest = sha256(bytes)
+
+        val result = FileTransferClient().sendPrepared(
+            InetAddress.getLoopbackAddress(), server.localPort, prepared(offer, bytes),
+            TransferStartMode.RESUME,
+            ResumeStatus(ResumeState.COMPLETED, finalDigest = digest),
+            TransferPauseController(), {}, {}
+        )
+
+        assertTrue(result.isSuccess)
+        assertThrowsSocketTimeout { server.accept() }
+        server.close()
+    }
+
+    @Test
+    fun `completed start response verifies digest and sends no chunk`() = runBlocking {
+        val bytes = byteArrayOf(1, 3, 5)
+        val offer = offer(bytes.size.toLong())
+        val server = ServerSocket(0)
+        val serverJob = async(Dispatchers.IO) {
+            server.accept().use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                assertStart(input, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                ResumeProtocol.writeStartResponse(output, TransferStartResponse.COMPLETED, sha256(bytes))
+                output.flush()
+                socket.soTimeout = 1_000
+                assertEquals(-1, input.read())
+            }
+        }
+
+        val result = FileTransferClient().sendPrepared(
+            InetAddress.getLoopbackAddress(), server.localPort, prepared(offer, bytes),
+            TransferStartMode.NEW, ResumeStatus(ResumeState.NONE), TransferPauseController(), {}, {}
+        )
+
+        assertTrue(result.isSuccess)
+        serverJob.await()
+        server.close()
+    }
     @Test
     fun `query writes v4 resume request reads bounded status and closes socket`() = runBlocking {
         val offer = offer(fileSize = TransferProtocol.CHUNK_SIZE.toLong())
@@ -80,6 +162,7 @@ class FileTransferClientResumeTest {
                 val input = DataInputStream(socket.getInputStream())
                 val output = DataOutputStream(socket.getOutputStream())
                 assertStart(input, offer, TransferStartMode.RESUME, expectedStatus)
+                writeReady(output)
                 assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                 val frame = ChunkCodec.read(input, expectedIndex = 1, expectedLength = suffix.size)
                 assertArrayEquals(suffix, frame.data)
@@ -181,6 +264,7 @@ class FileTransferClientResumeTest {
                     val input = DataInputStream(socket.getInputStream())
                     val output = DataOutputStream(socket.getOutputStream())
                     assertStart(input, offer, mode, expectedStatus)
+                    writeReady(output)
                     assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                     val frame = ChunkCodec.read(input, expectedIndex = 0, expectedLength = bytes.size)
                     assertArrayEquals(bytes, frame.data)
@@ -223,6 +307,7 @@ class FileTransferClientResumeTest {
                 val input = DataInputStream(socket.getInputStream())
                 val output = DataOutputStream(socket.getOutputStream())
                 assertStart(input, offer, TransferStartMode.NEW, expectedStatus)
+                writeReady(output)
                 repeat(3) {
                     assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                     val frame = ChunkCodec.read(input, expectedIndex = 0, expectedLength = bytes.size)
@@ -263,6 +348,7 @@ class FileTransferClientResumeTest {
                 val input = DataInputStream(socket.getInputStream())
                 val output = DataOutputStream(socket.getOutputStream())
                 assertStart(input, offer, TransferStartMode.NEW, expectedStatus)
+                writeReady(output)
                 assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                 ChunkCodec.read(input, expectedIndex = 0, expectedLength = 1)
                 output.writeByte(TransferProtocol.ACK)
@@ -344,6 +430,11 @@ class FileTransferClientResumeTest {
         assertArrayEquals(expected.lastChunkHash, actual.lastChunkHash)
     }
 
+    private fun writeReady(output: DataOutputStream) {
+        ResumeProtocol.writeStartResponse(output, TransferStartResponse.READY)
+        output.flush()
+    }
+
     private fun encodeChunk(index: Int, data: ByteArray, digest: ByteArray): ByteArray =
         ByteArrayOutputStream().also { bytes ->
             DataOutputStream(bytes).use { output ->
@@ -356,4 +447,13 @@ class FileTransferClientResumeTest {
 
     private fun sha256(bytes: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(bytes)
+
+    private fun assertThrowsSocketTimeout(block: () -> Unit) {
+        try {
+            block()
+        } catch (_: SocketTimeoutException) {
+            return
+        }
+        throw AssertionError("Expected SocketTimeoutException")
+    }
 }

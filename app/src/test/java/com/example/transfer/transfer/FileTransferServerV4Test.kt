@@ -13,6 +13,7 @@ import com.example.transfer.protocol.TransferOffer
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.protocol.TransferStartMode
 import com.example.transfer.resume.IncomingCheckpoint
+import com.example.transfer.resume.CompletedReceipt
 import com.example.transfer.resume.IncomingOperationState
 import com.example.transfer.resume.IncomingStagingJournal
 import com.example.transfer.resume.OutgoingResumeLink
@@ -53,6 +54,65 @@ import org.junit.Test
 
 class FileTransferServerV4Test {
     @Test
+    fun `server defaults bound active sockets and concurrent queries`() {
+        assertEquals(16, FileTransferServer.MAX_ACTIVE_CONNECTIONS)
+        assertEquals(2, FileTransferServer.MAX_CONCURRENT_QUERIES)
+    }
+
+    @Test
+    fun `active socket admission closes connection beyond configured limit`() = runBlocking {
+        val harness = V4Harness(maxActiveConnections = 1)
+        val first = Socket(InetAddress.getLoopbackAddress(), harness.port())
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { second ->
+                second.soTimeout = 2_000
+                assertEquals(-1, second.getInputStream().read())
+            }
+        } finally {
+            first.close()
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `query admission rejects new work when configured permits are occupied`() = runBlocking {
+        val harness = V4Harness(maxConcurrentQueries = 1)
+        val chunk = ByteArray(TransferProtocol.CHUNK_SIZE) { 1 }
+        val offer = harness.offer(chunk.size.toLong() + 1)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(output, ChunkCodec.create(0, chunk))
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+            }
+            withTimeout(2_000) { while (!harness.store.isIdle(offer.transferId)) delay(10) }
+            harness.files.pauseFirstQueryRead(entered, release)
+            val first = async(Dispatchers.IO) { harness.query(offer) }
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                ConnectionProtocol.writePreamble(output, ConnectionKind.RESUME_QUERY)
+                ResumeProtocol.writeOffer(output, offer)
+                output.flush()
+                assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
+            }
+            release.countDown()
+            assertEquals(ResumeState.AVAILABLE, first.await().state)
+        } finally {
+            release.countDown()
+            harness.close()
+        }
+    }
+    @Test
     fun `pause lease timeout retains committed checkpoint`() = runBlocking {
         val harness = V4Harness(pausedSessionLeaseMillis = 100)
         val first = ByteArray(TransferProtocol.CHUNK_SIZE) { 2 }
@@ -63,6 +123,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                 ChunkCodec.write(output, ChunkCodec.create(0, first))
                 output.flush()
@@ -110,14 +171,21 @@ class FileTransferServerV4Test {
         val publishEntered = CountDownLatch(1)
         val releasePublish = CountDownLatch(1)
         harness.files.pausePublish(publishEntered, releasePublish)
-        val offer = harness.offer(0)
+        val bytes = byteArrayOf(42)
+        val offer = harness.offer(bytes.size.toLong())
         var socket: Socket? = null
         try {
             socket = Socket(InetAddress.getLoopbackAddress(), harness.port())
+            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+            assertReady(input)
+            TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+            ChunkCodec.write(output, ChunkCodec.create(0, bytes))
+            output.flush()
+            assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
             output.writeByte(TransferProtocol.COMPLETE)
-            output.write(MessageDigest.getInstance("SHA-256").digest())
+            output.write(MessageDigest.getInstance("SHA-256").digest(bytes))
             output.flush()
             assertTrue(publishEntered.await(2, TimeUnit.SECONDS))
             socket.setSoLinger(true, 0)
@@ -128,6 +196,26 @@ class FileTransferServerV4Test {
             withTimeout(2_000) { harness.history.succeeded.await() }
             assertTrue(harness.files.published)
             assertEquals(null, harness.store.findIncoming(offer.transferId))
+            val completed = harness.query(offer)
+            assertEquals(ResumeState.COMPLETED, completed.state)
+            val replay = FileTransferClient().sendPrepared(
+                InetAddress.getLoopbackAddress(), harness.port(),
+                PreparedTransfer(
+                    offer,
+                    SendFileSource(
+                        offer.fileName, offer.mimeType, offer.fileSize,
+                        sourceUri = "content://replay", openStream = { ByteArrayInputStream(bytes) }
+                    ),
+                    ResumeStatus(ResumeState.NONE)
+                ),
+                TransferStartMode.NEW,
+                ResumeStatus(ResumeState.NONE),
+                TransferPauseController(), {}, {}
+            )
+            assertTrue(replay.isSuccess)
+            assertEquals(1, harness.files.createCount)
+            assertEquals(1, harness.files.writeCount)
+            assertEquals(1, harness.files.publishCount)
         } finally {
             releasePublish.countDown()
             socket?.close()
@@ -188,6 +276,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
                 output.flush()
                 assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
@@ -272,6 +361,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 repeat(2) { index ->
                     TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                     ChunkCodec.write(output, ChunkCodec.create(index, chunk))
@@ -338,6 +428,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                 ChunkCodec.write(output, ChunkCodec.create(0, bytes))
                 output.flush()
@@ -363,6 +454,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                 ChunkCodec.write(output, ChunkCodec.create(0, bytes.copyOf(TransferProtocol.CHUNK_SIZE)))
                 output.flush()
@@ -402,6 +494,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                 ChunkCodec.write(output, ChunkCodec.create(0, bytes.copyOf(TransferProtocol.CHUNK_SIZE)))
                 output.flush()
@@ -429,6 +522,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 output.writeByte(TransferProtocol.COMPLETE)
                 output.write(MessageDigest.getInstance("SHA-256").digest())
                 output.flush()
@@ -436,7 +530,7 @@ class FileTransferServerV4Test {
             }
             withTimeout(2_000) { harness.completed.await() }
             assertTrue(harness.files.published)
-            assertEquals(ResumeState.NONE, harness.query(offer).state)
+            assertEquals(ResumeState.COMPLETED, harness.query(offer).state)
         } finally {
             harness.close()
         }
@@ -452,6 +546,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                 ChunkCodec.write(output, ChunkCodec.create(0, bytes))
                 output.flush()
@@ -478,6 +573,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 repeat(2) {
                     TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                     ChunkCodec.write(output, ChunkCodec.create(0, first))
@@ -493,6 +589,63 @@ class FileTransferServerV4Test {
     }
 
     @Test
+    fun `fourth consecutive bad chunk for same expected index is fatal`() = runBlocking {
+        val harness = V4Harness(verifier = ChunkVerifier { _, _ -> false })
+        val bytes = byteArrayOf(1)
+        val offer = harness.offer(1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
+                repeat(4) { attempt ->
+                    TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                    ChunkCodec.write(output, ChunkCodec.create(0, bytes))
+                    output.flush()
+                    assertEquals(
+                        if (attempt < 3) TransferProtocol.NACK else TransferProtocol.FATAL,
+                        input.readUnsignedByte()
+                    )
+                }
+            }
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `fourth consecutive duplicate committed chunk is fatal without rewriting`() = runBlocking {
+        val harness = V4Harness()
+        val first = ByteArray(TransferProtocol.CHUNK_SIZE) { 2 }
+        val offer = harness.offer(first.size.toLong() + 1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(output, ChunkCodec.create(0, first))
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+                repeat(4) { attempt ->
+                    TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                    ChunkCodec.write(output, ChunkCodec.create(0, first))
+                    output.flush()
+                    assertEquals(
+                        if (attempt < 3) TransferProtocol.ACK else TransferProtocol.FATAL,
+                        input.readUnsignedByte()
+                    )
+                }
+            }
+            assertEquals(1, harness.files.writeCount)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
     fun `lost final chunk ack retry is idempotent then completes`() = runBlocking {
         val harness = V4Harness()
         val bytes = byteArrayOf(7, 8, 9)
@@ -502,6 +655,7 @@ class FileTransferServerV4Test {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
                 repeat(2) {
                     TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
                     ChunkCodec.write(output, ChunkCodec.create(0, bytes))
@@ -529,6 +683,7 @@ class FileTransferServerV4Test {
             active = Socket(InetAddress.getLoopbackAddress(), harness.port())
             val output = DataOutputStream(BufferedOutputStream(active.getOutputStream()))
             start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+            assertReady(DataInputStream(BufferedInputStream(active.getInputStream())))
             withTimeout(2_000) {
                 while (harness.store.findIncoming(offer.transferId) == null) delay(10)
             }
@@ -599,6 +754,7 @@ class FileTransferServerV4Test {
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
             start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+            assertReady(input)
             TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
             ChunkCodec.write(output, ChunkCodec.create(0, first))
             output.flush()
@@ -626,13 +782,20 @@ class FileTransferServerV4Test {
         ResumeProtocol.writeStatus(output, status)
         output.flush()
     }
+
+    private fun assertReady(input: DataInputStream) {
+        val response = ResumeProtocol.readStartResponse(input)
+        assertEquals(com.example.transfer.protocol.TransferStartResponse.READY, response.response)
+    }
 }
 
 private class V4Harness(
     private val exclusiveBusyGate: Boolean = false,
     verifier: ChunkVerifier = ChunkVerifier.SHA256,
     private val configuredHistory: SocketHistory = SocketHistory(),
-    pausedSessionLeaseMillis: Int = 30 * 60 * 1000
+    pausedSessionLeaseMillis: Int = 30 * 60 * 1000,
+    maxActiveConnections: Int = FileTransferServer.MAX_ACTIVE_CONNECTIONS,
+    maxConcurrentQueries: Int = FileTransferServer.MAX_CONCURRENT_QUERIES
 ) {
     val store = SocketResumeStore()
     val files = SocketFiles()
@@ -656,6 +819,8 @@ private class V4Harness(
         },
         onTransferEnd = { busy = false },
         history = history,
+        maxActiveConnections = maxActiveConnections,
+        maxConcurrentQueries = maxConcurrentQueries,
         onServerStopping = { stopping.countDown() }
     )
 
@@ -717,7 +882,9 @@ private class SocketFiles : ResumableIncomingFileStore {
     private data class Entry(val name: String, var bytes: ByteArray = ByteArray(0))
     private val entries = linkedMapOf<StoredFileLocation, Entry>()
     var published = false
+    var createCount = 0
     var writeCount = 0
+    var publishCount = 0
     private var queryReadBarrier: Pair<CountDownLatch, CountDownLatch>? = null
     private var publishBarrier: Pair<CountDownLatch, CountDownLatch>? = null
 
@@ -744,6 +911,7 @@ private class SocketFiles : ResumableIncomingFileStore {
     }
 
     override suspend fun create(transferId: String, fileName: String, mimeType: String): ResumableFileHandle {
+        createCount++
         val location = StoredFileLocation("TEST", transferId)
         val entry = Entry(fileName)
         entries[location] = entry
@@ -773,6 +941,7 @@ private class SocketFiles : ResumableIncomingFileStore {
     }
 
     override suspend fun publish(handle: ResumableFileHandle): String {
+        publishCount++
         published = true
         publishBarrier?.also { barrier ->
             barrier.first.countDown()
@@ -803,6 +972,7 @@ private class SocketFiles : ResumableIncomingFileStore {
 private class SocketResumeStore : ResumeStore {
     private val incoming = linkedMapOf<String, IncomingCheckpoint>()
     private val journals = linkedMapOf<String, IncomingStagingJournal>()
+    private val receipts = linkedMapOf<String, CompletedReceipt>()
 
     fun isIdle(transferId: String) = synchronized(this) {
         incoming[transferId]?.operationState == IncomingOperationState.IDLE
@@ -842,15 +1012,29 @@ private class SocketResumeStore : ResumeStore {
                 chainDigest = chainDigest, lastChunkHash = lastChunkHash, updatedAt = updatedAt, expiresAt = expiresAt); true
         }
     }
-    override suspend fun beginIncomingCompletion(expected: IncomingCheckpoint, token: String, now: Long, expiresAt: Long) = synchronized(this) {
+    override suspend fun beginIncomingCompletion(expected: IncomingCheckpoint, token: String, finalDigest: ByteArray, now: Long, expiresAt: Long) = synchronized(this) {
         val current = incoming[expected.transferId]
         if (current?.sessionToken != token || current.generation != expected.generation || current.nextChunkIndex != expected.nextChunkIndex) false else {
-            incoming[current.transferId] = current.copy(operationState = IncomingOperationState.COMPLETING); true
+            incoming[current.transferId] = current.copy(
+                operationState = IncomingOperationState.COMPLETING,
+                completingFinalDigest = finalDigest
+            ); true
         }
     }
     override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint) = synchronized(this) {
         val current = incoming[expected.transferId]
         if (current?.operationState != IncomingOperationState.COMPLETING) false else { incoming.remove(expected.transferId); true }
+    }
+    override suspend fun findCompletedReceipt(transferId: String) = synchronized(this) { receipts[transferId] }
+    override suspend fun finishIncomingCompletion(expected: IncomingCheckpoint, receipt: CompletedReceipt) = synchronized(this) {
+        val current = incoming[expected.transferId]
+        if (current?.operationState != IncomingOperationState.COMPLETING ||
+            current.completingFinalDigest?.contentEquals(receipt.finalDigest) != true
+        ) false else {
+            receipts[receipt.transferId] = receipt
+            incoming.remove(expected.transferId)
+            true
+        }
     }
     override suspend fun insertStagingJournal(journal: IncomingStagingJournal) = synchronized(this) {
         if (journals.containsKey(journal.transferId)) false else { journals[journal.transferId] = journal; true }

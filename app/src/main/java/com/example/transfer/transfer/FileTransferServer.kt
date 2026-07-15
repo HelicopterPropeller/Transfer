@@ -10,6 +10,8 @@ import com.example.transfer.protocol.ResumeProtocol
 import com.example.transfer.protocol.TransferFrameCodec
 import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferProtocol
+import com.example.transfer.protocol.ResumeState
+import com.example.transfer.protocol.TransferStartResponse
 import com.example.transfer.resume.IncomingResumeSession
 import com.example.transfer.resume.ResumeCoordinator
 import kotlinx.coroutines.CoroutineScope
@@ -30,6 +32,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.Semaphore
 
 fun interface ChunkVerifier {
     fun matches(data: ByteArray, expectedDigest: ByteArray): Boolean
@@ -50,10 +53,13 @@ class FileTransferServer(
     private val history: IncomingTransferHistory = IncomingTransferHistory.None,
     private val beforeClientRegister: () -> Unit = {},
     private val onClientStarted: () -> Unit = {},
-    private val onServerStopping: () -> Unit = {}
+    private val onServerStopping: () -> Unit = {},
+    maxActiveConnections: Int = MAX_ACTIVE_CONNECTIONS,
+    maxConcurrentQueries: Int = MAX_CONCURRENT_QUERIES
 ) {
     init {
         require(pausedSessionLeaseMillis > 0) { "Paused session lease must be positive" }
+        require(maxActiveConnections > 0 && maxConcurrentQueries > 0)
     }
 
     @Volatile private var serverSocket: ServerSocket? = null
@@ -62,6 +68,8 @@ class FileTransferServer(
     private var stopping = true
     private val clients = linkedSetOf<ReceiveSession>()
     private val clientJobs = linkedSetOf<Job>()
+    private val activeConnections = Semaphore(maxActiveConnections)
+    private val concurrentQueries = Semaphore(maxConcurrentQueries)
 
     fun start(
         scope: CoroutineScope,
@@ -83,15 +91,26 @@ class FileTransferServer(
                     onStarted(server.localPort)
                     while (isActive) {
                         val socket = server.accept()
-                        beforeClientRegister()
+                        if (!activeConnections.tryAcquire()) {
+                            runCatching { socket.close() }
+                            continue
+                        }
+                        try {
+                            beforeClientRegister()
+                        } catch (error: Exception) {
+                            activeConnections.release()
+                            runCatching { socket.close() }
+                            throw error
+                        }
                         val receiveSession = ReceiveSession(socket)
                         val child = launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                            onClientStarted()
                             try {
+                                onClientStarted()
                                 if (!isActive) receiveSession.requestLocalStop()
                                 runCatching { receive(receiveSession, onProgress, onComplete) }
                                     .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
                             } finally {
+                                activeConnections.release()
                                 synchronized(lifecycleLock) {
                                     clients -= receiveSession
                                     coroutineContext[Job]?.let { clientJobs.remove(it) }
@@ -108,6 +127,7 @@ class FileTransferServer(
                         if (clientRegistered) {
                             child.start()
                         } else {
+                            activeConnections.release()
                             receiveSession.requestLocalStop()
                             runCatching { socket.close() }
                             child.cancel()
@@ -182,9 +202,16 @@ class FileTransferServer(
             try {
                 when (ConnectionProtocol.readPreamble(input)) {
                     ConnectionKind.RESUME_QUERY -> {
-                        val offer = ResumeProtocol.readOffer(input)
-                        ResumeProtocol.writeStatus(output, coordinator.queryIncoming(offer))
-                        output.flush()
+                        if (!concurrentQueries.tryAcquire()) {
+                            throw ProtocolException("Too many concurrent resume queries")
+                        }
+                        try {
+                            val offer = ResumeProtocol.readOffer(input)
+                            ResumeProtocol.writeStatus(output, coordinator.queryIncoming(offer))
+                            output.flush()
+                        } finally {
+                            concurrentQueries.release()
+                        }
                     }
                     ConnectionKind.TRANSFER_START -> receiveV4Transfer(
                         receiveSession, coordinator, input, output, onProgress, onComplete
@@ -212,6 +239,18 @@ class FileTransferServer(
         val offer = ResumeProtocol.readOffer(input)
         val mode = ResumeProtocol.readStartMode(input)
         val expectedStatus = ResumeProtocol.readStatus(input, offer)
+        coordinator.queryCompleted(offer)?.let { completed ->
+            if (completed.state == ResumeState.COMPLETED) {
+                ResumeProtocol.writeStartResponse(
+                    output, TransferStartResponse.COMPLETED, completed.finalDigest
+                )
+                output.flush()
+                return
+            }
+            ResumeProtocol.writeStartResponse(output, TransferStartResponse.FATAL)
+            output.flush()
+            return
+        }
         if (!onTransferStart()) throw ProtocolException("Another transfer is active")
 
         var session: IncomingResumeSession? = null
@@ -227,7 +266,22 @@ class FileTransferServer(
                         ?: receiveSession.socket.inetAddress.toString()
                 )
             }
-            session = coordinator.openIncoming(offer, mode, expectedStatus)
+            session = try {
+                coordinator.openIncoming(offer, mode, expectedStatus)
+            } catch (error: Exception) {
+                val completionStatus = coordinator.queryCompleted(offer)
+                if (completionStatus?.state == ResumeState.COMPLETED) {
+                    ResumeProtocol.writeStartResponse(
+                        output, TransferStartResponse.COMPLETED, completionStatus.finalDigest
+                    )
+                    output.flush()
+                    completed = true
+                    return
+                }
+                throw error
+            }
+            ResumeProtocol.writeStartResponse(output, TransferStartResponse.READY)
+            output.flush()
             val received = receiveV4Frames(
                 receiveSession.socket, coordinator, session, offer.fileSize,
                 input, output, onProgress, onCheckpoint = { session = it }
@@ -238,7 +292,7 @@ class FileTransferServer(
             if (!senderDigest.contentEquals(receiverDigest)) {
                 throw ProtocolException("Whole-file digest mismatch")
             }
-            val receivedUri = coordinator.completeIncoming(session)
+            val receivedUri = coordinator.completeIncoming(session, senderDigest)
             completed = true
             historyBestEffort { history.succeed(historyId, receivedUri) }
             output.writeByte(TransferProtocol.SUCCESS)
@@ -277,6 +331,7 @@ class FileTransferServer(
         var session = initialSession
         var hasVerifiedChunkAck = session.checkpoint.nextChunkIndex > 0
         var pauseEntitled = false
+        var consecutiveRejected = 0
         var remainingPauseLeaseMillis = pausedSessionLeaseMillis.toLong()
         while (true) {
             val typeCode = input.readUnsignedByte()
@@ -318,6 +373,10 @@ class FileTransferServer(
                     !frame.digest.contentEquals(session.checkpoint.lastChunkHash) ||
                     !chunkVerifier.matches(frame.data, frame.digest)
                 ) throw ProtocolException("Committed chunk does not match checkpoint")
+                consecutiveRejected++
+                if (consecutiveRejected > MAX_REJECTED_CHUNK_ATTEMPTS) {
+                    throw ProtocolException("Too many duplicate chunk attempts")
+                }
                 output.writeByte(TransferProtocol.ACK)
                 output.flush()
                 continue
@@ -326,6 +385,10 @@ class FileTransferServer(
                 throw ProtocolException("Unexpected chunk")
             }
             if (!chunkVerifier.matches(frame.data, frame.digest)) {
+                consecutiveRejected++
+                if (consecutiveRejected > MAX_REJECTED_CHUNK_ATTEMPTS) {
+                    throw ProtocolException("Too many invalid chunk attempts")
+                }
                 output.writeByte(TransferProtocol.NACK)
                 output.flush()
                 continue
@@ -344,6 +407,7 @@ class FileTransferServer(
                 chainDigest = chain,
                 lastChunkHash = frame.digest
             )
+            consecutiveRejected = 0
             onCheckpoint(session)
             output.writeByte(TransferProtocol.ACK)
             output.flush()
@@ -438,5 +502,8 @@ class FileTransferServer(
         private const val DEFAULT_PAUSED_SESSION_LEASE_MILLIS = 30 * 60 * 1000
         private const val SOCKET_TIMEOUT_MILLIS = 15_000
         private const val LOCAL_STOP_MESSAGE = "Receive service stopped"
+        internal const val MAX_ACTIVE_CONNECTIONS = 16
+        internal const val MAX_CONCURRENT_QUERIES = 2
+        internal const val MAX_REJECTED_CHUNK_ATTEMPTS = 3
     }
 }

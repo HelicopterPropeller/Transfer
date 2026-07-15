@@ -12,6 +12,7 @@ import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferOffer
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.protocol.TransferStartResponse
 import com.example.transfer.resume.PreparedTransfer
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
@@ -42,6 +43,18 @@ class FileTransferClientOperationTest {
         assertTrue(
             FileTransferClient.queryReadTimeoutMillis(TransferProtocol.MAX_FILE_SIZE) >
                 FileTransferClient.queryReadTimeoutMillis(TransferProtocol.CHUNK_SIZE.toLong())
+        )
+    }
+
+    @Test
+    fun `ready timeout scales from confirmed prefix instead of fixed fifteen seconds`() {
+        assertEquals(15_000, FileTransferClient.readyReadTimeoutMillis(0))
+        assertEquals(
+            35_000,
+            FileTransferClient.readyReadTimeoutMillis(20L * 256 * 1024)
+        )
+        assertTrue(
+            FileTransferClient.readyReadTimeoutMillis(TransferProtocol.MAX_FILE_SIZE) > 15_000
         )
     }
 
@@ -236,6 +249,8 @@ class FileTransferClientOperationTest {
                 ResumeProtocol.readOffer(input)
                 ResumeProtocol.readStartMode(input)
                 ResumeProtocol.readStatus(input, offer)
+                ResumeProtocol.writeStartResponse(output, TransferStartResponse.READY)
+                output.flush()
                 assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                 ChunkCodec.read(input, 0, TransferProtocol.CHUNK_SIZE)
                 output.writeByte(TransferProtocol.ACK)
@@ -284,6 +299,8 @@ class FileTransferClientOperationTest {
         assertEquals(offer, ResumeProtocol.readOffer(input))
         assertEquals(TransferStartMode.NEW, ResumeProtocol.readStartMode(input))
         ResumeProtocol.readStatus(input, offer)
+        ResumeProtocol.writeStartResponse(output, TransferStartResponse.READY)
+        output.flush()
         assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
         ChunkCodec.read(input, 0, bytes.size)
         output.writeByte(TransferProtocol.ACK)

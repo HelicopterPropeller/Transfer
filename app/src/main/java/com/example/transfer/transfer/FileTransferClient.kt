@@ -13,6 +13,7 @@ import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferOffer
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.protocol.TransferStartResponse
 import com.example.transfer.resume.PreparedTransfer
 import com.example.transfer.resume.ResumeValidationException
 import kotlinx.coroutines.Dispatchers
@@ -82,6 +83,11 @@ class FileTransferClient {
                     val start = prepareStream(
                         fileInput, prepared.offer, mode, expectedStatus, operation.id
                     )
+                    if (expectedStatus.state == ResumeState.COMPLETED) {
+                        verifyCompletedDigest(start.wholeDigest, expectedStatus.finalDigest)
+                        onProgress(FileTransferProgress(prepared.offer.fileSize, prepared.offer.fileSize))
+                        return@use
+                    }
                     checkActive(operation.id)
                     if (mode == TransferStartMode.RESUME) {
                         onProgress(FileTransferProgress(start.confirmedBytes, prepared.offer.fileSize))
@@ -94,7 +100,7 @@ class FileTransferClient {
                         checkActive(operation.id)
                         socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS)
                         checkActive(operation.id)
-                        socket.soTimeout = SOCKET_TIMEOUT_MILLIS
+                        socket.soTimeout = readyReadTimeoutMillis(expectedStatus.confirmedBytes)
                         val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                         val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                         checkActive(operation.id)
@@ -103,6 +109,28 @@ class FileTransferClient {
                         ResumeProtocol.writeStartMode(output, mode)
                         ResumeProtocol.writeStatus(output, expectedStatus)
                         output.flush()
+
+                        val response = ResumeProtocol.readStartResponse(input)
+                        when (response.response) {
+                            TransferStartResponse.READY -> socket.soTimeout = SOCKET_TIMEOUT_MILLIS
+                            TransferStartResponse.COMPLETED -> {
+                                scanRemaining(
+                                    fileInput,
+                                    prepared.offer.fileSize - start.confirmedBytes,
+                                    start.wholeDigest,
+                                    operation.id
+                                )
+                                verifyCompletedDigest(start.wholeDigest, response.finalDigest)
+                                onProgress(
+                                    FileTransferProgress(
+                                        prepared.offer.fileSize,
+                                        prepared.offer.fileSize
+                                    )
+                                )
+                                return@use
+                            }
+                            TransferStartResponse.FATAL -> error("Receiver rejected transfer start")
+                        }
 
                         sendPreparedChunks(
                             fileInput = fileInput,
@@ -156,6 +184,13 @@ class FileTransferClient {
         operationId: Long
     ): PreparedStream {
         checkActive(operationId)
+        if (expectedStatus.state == ResumeState.COMPLETED) {
+            if (expectedStatus.finalDigest?.size != ChunkCodec.DIGEST_SIZE) {
+                throw ResumeValidationException("Completed receipt has no final digest")
+            }
+            val completed = scanPrefix(fileInput, offer.fileSize, offer.chunkSize, operationId)
+            return PreparedStream(completed.scannedBytes, completed.nextChunkIndex, completed.wholeDigest)
+        }
         if (mode != TransferStartMode.RESUME) {
             return PreparedStream(0, 0, MessageDigest.getInstance("SHA-256"))
         }
@@ -273,6 +308,27 @@ class FileTransferClient {
         return PrefixDigest(bytes, index, chain, last, whole)
     }
 
+    private fun scanRemaining(
+        input: InputStream,
+        bytes: Long,
+        wholeDigest: MessageDigest,
+        operationId: Long
+    ) {
+        var remaining = bytes
+        while (remaining > 0) {
+            checkActive(operationId)
+            val length = minOf(TransferProtocol.CHUNK_SIZE.toLong(), remaining).toInt()
+            wholeDigest.update(readExactly(input, length, operationId))
+            remaining -= length
+        }
+    }
+
+    private fun verifyCompletedDigest(digest: MessageDigest, expected: ByteArray?) {
+        if (expected?.size != ChunkCodec.DIGEST_SIZE || !digest.digest().contentEquals(expected)) {
+            throw ResumeValidationException("Source digest does not match completed receipt")
+        }
+    }
+
     private fun registerOperation(
         pauseController: TransferPauseController? = null
     ): ActiveOperation {
@@ -379,6 +435,9 @@ class FileTransferClient {
                 (scanMillis + SOCKET_TIMEOUT_MILLIS).toInt()
             }
         }
+
+        internal fun readyReadTimeoutMillis(confirmedBytes: Long): Int =
+            queryReadTimeoutMillis(confirmedBytes)
     }
 
     private data class PreparedStream(
