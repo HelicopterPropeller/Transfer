@@ -12,9 +12,8 @@ import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferProtocol
 import com.example.transfer.resume.IncomingResumeSession
 import com.example.transfer.resume.ResumeCoordinator
-import com.example.transfer.storage.IncomingFileStore
-import com.example.transfer.storage.ReceivedFileHandle
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -30,8 +29,6 @@ import java.io.DataOutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
-import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 fun interface ChunkVerifier {
@@ -44,14 +41,16 @@ fun interface ChunkVerifier {
 
 class FileTransferServer(
     private val port: Int = DEFAULT_PORT,
-    private val store: IncomingFileStore? = null,
+    private val resumeCoordinator: ResumeCoordinator,
     private val chunkVerifier: ChunkVerifier = ChunkVerifier.SHA256,
     private val onTransferStart: () -> Boolean = { true },
     private val onTransferEnd: () -> Unit = {},
     private val pausedSessionLeaseMillis: Int = DEFAULT_PAUSED_SESSION_LEASE_MILLIS,
     private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
     private val history: IncomingTransferHistory = IncomingTransferHistory.None,
-    private val resumeCoordinator: ResumeCoordinator? = null
+    private val beforeClientRegister: () -> Unit = {},
+    private val onClientStarted: () -> Unit = {},
+    private val onServerStopping: () -> Unit = {}
 ) {
     init {
         require(pausedSessionLeaseMillis > 0) { "Paused session lease must be positive" }
@@ -59,8 +58,10 @@ class FileTransferServer(
 
     @Volatile private var serverSocket: ServerSocket? = null
     private var job: Job? = null
-    private val clients = Collections.newSetFromMap(ConcurrentHashMap<ReceiveSession, Boolean>())
-    private val clientJobs = Collections.newSetFromMap(ConcurrentHashMap<Job, Boolean>())
+    private val lifecycleLock = Any()
+    private var stopping = true
+    private val clients = linkedSetOf<ReceiveSession>()
+    private val clientJobs = linkedSetOf<Job>()
 
     fun start(
         scope: CoroutineScope,
@@ -69,120 +70,102 @@ class FileTransferServer(
         onComplete: (String) -> Unit,
         onError: (String) -> Unit
     ) {
-        if (job?.isActive == true) return
-        job = scope.launch(Dispatchers.IO) {
+        val serverJob = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             try {
                 ServerSocket(port).use { server ->
-                    serverSocket = server
+                    val registered = synchronized(lifecycleLock) {
+                        if (stopping) false else {
+                            serverSocket = server
+                            true
+                        }
+                    }
+                    if (!registered) return@use
                     onStarted(server.localPort)
                     while (isActive) {
                         val socket = server.accept()
+                        beforeClientRegister()
                         val receiveSession = ReceiveSession(socket)
-                        clients += receiveSession
-                        val child = launch(Dispatchers.IO) {
+                        val child = launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                            onClientStarted()
                             try {
                                 if (!isActive) receiveSession.requestLocalStop()
                                 runCatching { receive(receiveSession, onProgress, onComplete) }
                                     .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
                             } finally {
-                                clients -= receiveSession
+                                synchronized(lifecycleLock) {
+                                    clients -= receiveSession
+                                    coroutineContext[Job]?.let { clientJobs.remove(it) }
+                                }
                             }
                         }
-                        clientJobs += child
-                        child.invokeOnCompletion { clientJobs -= child }
+                        val clientRegistered = synchronized(lifecycleLock) {
+                            if (stopping) false else {
+                                clients += receiveSession
+                                clientJobs += child
+                                true
+                            }
+                        }
+                        if (clientRegistered) {
+                            child.start()
+                        } else {
+                            receiveSession.requestLocalStop()
+                            runCatching { socket.close() }
+                            child.cancel()
+                        }
                     }
                 }
             } catch (error: Exception) {
                 if (isActive) onError(error.message ?: "Receive service failed")
             } finally {
-                serverSocket = null
+                synchronized(lifecycleLock) {
+                    serverSocket = null
+                }
             }
         }
+        val shouldStart = synchronized(lifecycleLock) {
+            if (job != null) false else {
+                stopping = false
+                job = serverJob
+                true
+            }
+        }
+        if (shouldStart) serverJob.start() else serverJob.cancel()
     }
 
     fun stop() {
-        val serverJob = job
-        val children = clientJobs.toList()
-        clients.forEach { it.requestLocalStop() }
+        val snapshot = synchronized(lifecycleLock) {
+            stopping = true
+            runCatching { serverSocket?.close() }
+            StopSnapshot(job, clients.toList(), clientJobs.toList()).also {
+                job = null
+                serverSocket = null
+            }
+        }
+        onServerStopping()
+        val serverJob = snapshot.serverJob
+        val children = snapshot.children
+        snapshot.sessions.forEach { it.requestLocalStop() }
         serverJob?.cancel()
-        clients.forEach { runCatching { it.socket.close() } }
+        snapshot.sessions.forEach { runCatching { it.socket.close() } }
         children.forEach { it.cancel() }
-        runCatching { serverSocket?.close() }
-        serverSocket = null
-        job = null
         runBlocking {
             children.forEach { runCatching { it.cancelAndJoin() } }
             serverJob?.let { runCatching { it.cancelAndJoin() } }
         }
     }
 
+    private data class StopSnapshot(
+        val serverJob: Job?,
+        val sessions: List<ReceiveSession>,
+        val children: List<Job>
+    )
+
     private suspend fun receive(
         receiveSession: ReceiveSession,
         onProgress: (String, Int) -> Unit,
         onComplete: (String) -> Unit
     ) {
-        if (resumeCoordinator != null) {
-            receiveV4(receiveSession, resumeCoordinator, onProgress, onComplete)
-        } else {
-            receiveLegacy(receiveSession, onProgress, onComplete)
-        }
-    }
-
-    private suspend fun receiveLegacy(
-        receiveSession: ReceiveSession,
-        onProgress: (String, Int) -> Unit,
-        onComplete: (String) -> Unit
-    ) {
-        val socket = receiveSession.socket
-        val legacyStore = requireNotNull(store)
-        socket.use {
-            socket.soTimeout = SOCKET_TIMEOUT_MILLIS
-            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
-            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-            var handle: ReceivedFileHandle? = null
-            var transferStarted = false
-            var historyId: Long? = null
-            var committed = false
-            try {
-                val header = TransferProtocol.readHeader(input)
-                if (!onTransferStart()) error("Another transfer is active")
-                transferStarted = true
-                historyId = historyBestEffort {
-                    history.start(
-                        fileName = header.fileName,
-                        fileSize = header.fileSize,
-                        mimeType = header.mimeType,
-                        peerAddress = socket.inetAddress.hostAddress ?: socket.inetAddress.toString()
-                    )
-                }
-                handle = legacyStore.create(header.fileName, header.mimeType)
-                receiveChunks(socket, input, output, header.fileSize, handle, onProgress)
-                val receivedUri = legacyStore.complete(handle)
-                committed = true
-                historyBestEffort { history.succeed(historyId, receivedUri) }
-                output.writeByte(TransferProtocol.COMPLETE)
-                output.flush()
-                onComplete(handle.displayName)
-            } catch (error: Exception) {
-                if (!committed) {
-                    val termination = receiveSession.classifyFailure(error)
-                    withContext(NonCancellable) {
-                        handle?.let { runCatching { legacyStore.abort(it) } }
-                        runCatching {
-                            if (termination == ReceiveTermination.LOCAL_STOP) {
-                                history.cancel(historyId, LOCAL_STOP_MESSAGE)
-                            } else {
-                                history.fail(historyId, error.message)
-                            }
-                        }
-                    }
-                }
-                runCatching { output.writeByte(TransferProtocol.FATAL); output.flush() }
-                throw error
-            } finally {
-                if (transferStarted) onTransferEnd()
-            }
-        }
+        receiveV4(receiveSession, resumeCoordinator, onProgress, onComplete)
     }
 
     private suspend fun receiveV4(
@@ -245,14 +228,12 @@ class FileTransferServer(
                 )
             }
             session = coordinator.openIncoming(offer, mode, expectedStatus)
-            session = receiveV4Chunks(
+            val received = receiveV4Frames(
                 receiveSession.socket, coordinator, session, offer.fileSize,
                 input, output, onProgress, onCheckpoint = { session = it }
             )
-            if (input.readUnsignedByte() != TransferProtocol.COMPLETE) {
-                throw ProtocolException("Expected completion marker")
-            }
-            val senderDigest = ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully)
+            session = received.session
+            val senderDigest = received.wholeDigest
             val receiverDigest = session.prefix.wholeDigest.digest()
             if (!senderDigest.contentEquals(receiverDigest)) {
                 throw ProtocolException("Whole-file digest mismatch")
@@ -283,7 +264,7 @@ class FileTransferServer(
         }
     }
 
-    private suspend fun receiveV4Chunks(
+    private suspend fun receiveV4Frames(
         socket: Socket,
         coordinator: ResumeCoordinator,
         initialSession: IncomingResumeSession,
@@ -292,13 +273,24 @@ class FileTransferServer(
         output: DataOutputStream,
         onProgress: (String, Int) -> Unit,
         onCheckpoint: (IncomingResumeSession) -> Unit
-    ): IncomingResumeSession {
+    ): CompletedFrames {
         var session = initialSession
         var hasVerifiedChunkAck = session.checkpoint.nextChunkIndex > 0
         var pauseEntitled = false
         var remainingPauseLeaseMillis = pausedSessionLeaseMillis.toLong()
-        while (session.checkpoint.confirmedBytes < total) {
-            val type = TransferFrameCodec.readType(input)
+        while (true) {
+            val typeCode = input.readUnsignedByte()
+            if (typeCode == TransferProtocol.COMPLETE) {
+                if (session.checkpoint.confirmedBytes != total) {
+                    throw ProtocolException("Transfer completed before all bytes were committed")
+                }
+                return CompletedFrames(
+                    session,
+                    ByteArray(ChunkCodec.DIGEST_SIZE).also(input::readFully)
+                )
+            }
+            val type = TransferFrameType.entries.firstOrNull { it.code == typeCode }
+                ?: throw ProtocolException("Unknown transfer frame")
             if (type == TransferFrameType.PAUSE) {
                 if (!hasVerifiedChunkAck || !pauseEntitled) {
                     throw ProtocolException("Pause requires a new verified chunk ACK")
@@ -359,8 +351,12 @@ class FileTransferServer(
             pauseEntitled = true
             onProgress(session.handle.displayName, TransferProgress.percent(confirmed, total))
         }
-        return session
     }
+
+    private data class CompletedFrames(
+        val session: IncomingResumeSession,
+        val wholeDigest: ByteArray
+    )
 
     private fun readV4Chunk(input: DataInputStream): com.example.transfer.protocol.ChunkFrame {
         val index = input.readInt()
@@ -405,64 +401,6 @@ class FileTransferServer(
         FAILURE
     }
 
-    private fun receiveChunks(
-        socket: Socket,
-        input: DataInputStream,
-        output: DataOutputStream,
-        total: Long,
-        handle: ReceivedFileHandle,
-        onProgress: (String, Int) -> Unit
-    ) {
-        var received = 0L
-        var index = 0
-        var hasVerifiedChunkAck = false
-        var pauseEntitled = false
-        var remainingPauseLeaseMillis = pausedSessionLeaseMillis.toLong()
-        while (received < total) {
-            val expectedLength = minOf(TransferProtocol.CHUNK_SIZE.toLong(), total - received).toInt()
-            var failures = 0
-            while (true) {
-                val type = TransferFrameCodec.readType(input)
-                if (type == TransferFrameType.PAUSE) {
-                    if (!hasVerifiedChunkAck) {
-                        throw ProtocolException("Pause before first verified chunk ACK")
-                    }
-                    if (!pauseEntitled) {
-                        throw ProtocolException("Pause requires a new verified chunk ACK")
-                    }
-                    if (failures > 0) throw ProtocolException("Control frame during chunk retry")
-                    pauseEntitled = false
-                    remainingPauseLeaseMillis = acknowledgePause(
-                        socket,
-                        input,
-                        output,
-                        remainingPauseLeaseMillis
-                    )
-                    continue
-                }
-                if (type == TransferFrameType.RESUME) {
-                    throw ProtocolException("Unexpected resume frame")
-                }
-                val frame = ChunkCodec.read(input, index, expectedLength)
-                if (chunkVerifier.matches(frame.data, frame.digest)) {
-                    handle.output.write(frame.data)
-                    received += frame.data.size
-                    output.writeByte(TransferProtocol.ACK)
-                    output.flush()
-                    hasVerifiedChunkAck = true
-                    pauseEntitled = true
-                    onProgress(handle.displayName, TransferProgress.percent(received, total))
-                    break
-                }
-                failures++
-                output.writeByte(TransferProtocol.NACK)
-                output.flush()
-                if (failures >= MAX_ATTEMPTS) error("Chunk $index failed verification")
-            }
-            index++
-        }
-    }
-
     private fun acknowledgePause(
         socket: Socket,
         input: DataInputStream,
@@ -499,7 +437,6 @@ class FileTransferServer(
         const val DEFAULT_PORT = 42043
         private const val DEFAULT_PAUSED_SESSION_LEASE_MILLIS = 30 * 60 * 1000
         private const val SOCKET_TIMEOUT_MILLIS = 15_000
-        private const val MAX_ATTEMPTS = 3
         private const val LOCAL_STOP_MESSAGE = "Receive service stopped"
     }
 }

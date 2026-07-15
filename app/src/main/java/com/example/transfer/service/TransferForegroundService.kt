@@ -15,6 +15,10 @@ import com.example.transfer.history.IncomingHistoryRecorder
 import com.example.transfer.history.OutgoingHistoryRecorder
 import com.example.transfer.history.TransferHistoryDatabase
 import com.example.transfer.history.TransferHistoryRepository
+import com.example.transfer.protocol.ResumeState
+import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.resume.ResumeCoordinator
+import com.example.transfer.resume.RoomResumeStore
 import com.example.transfer.storage.DownloadStorage
 import com.example.transfer.transfer.FileTransferClient
 import com.example.transfer.transfer.FileTransferServer
@@ -63,6 +67,8 @@ class TransferForegroundService : Service() {
     private lateinit var historyRepository: TransferHistoryRepository
     private lateinit var outgoingHistoryRecorder: OutgoingHistoryRecorder
     private lateinit var historyStartupGate: HistoryStartupGate
+    private lateinit var resumeCoordinator: ResumeCoordinator
+    private lateinit var localDeviceId: String
     private val client = FileTransferClient()
     @Volatile private var activePauseController: TransferPauseController? = null
     @Volatile private var activeBatchJob: Job? = null
@@ -70,9 +76,8 @@ class TransferForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        historyRepository = TransferHistoryRepository(
-            TransferHistoryDatabase.getInstance(this).transferHistoryDao()
-        )
+        val database = TransferHistoryDatabase.getInstance(this)
+        historyRepository = TransferHistoryRepository(database.transferHistoryDao())
         outgoingHistoryRecorder = OutgoingHistoryRecorder(historyRepository)
         historyStartupGate = HistoryStartupGate(serviceScope) {
             historyRepository.interruptActive()
@@ -83,16 +88,18 @@ class TransferForegroundService : Service() {
             notificationFactory.build(TransferNotificationModel.from(mutableState.value))
         )
         resourceGuard = createResourceGuard()
-        val deviceId = getSharedPreferences("transfer", 0).let { preferences ->
+        localDeviceId = getSharedPreferences("transfer", 0).let { preferences ->
             preferences.getString("device_id", null) ?: UUID.randomUUID().toString().also {
                 preferences.edit { putString("device_id", it) }
             }
         }
         val deviceName = listOf(Build.MANUFACTURER, Build.MODEL).filter(String::isNotBlank)
             .joinToString(" ").ifBlank { "Android 设备" }
-        discovery = DiscoveryManager(this, deviceId, deviceName)
+        discovery = DiscoveryManager(this, localDeviceId, deviceName)
+        val downloadStorage = DownloadStorage(this)
+        resumeCoordinator = ResumeCoordinator(RoomResumeStore(database.resumeDao()), downloadStorage)
         server = FileTransferServer(
-            store = DownloadStorage(this),
+            resumeCoordinator = resumeCoordinator,
             onTransferStart = ::beginTransfer,
             onTransferEnd = ::endTransfer,
             history = IncomingHistoryRecorder(historyRepository) { address ->
@@ -202,14 +209,31 @@ class TransferForegroundService : Service() {
                             ),
                             controller = controller
                         ) {
-                            client.send(
+                            val prepared = resumeCoordinator.prepareOutgoing(
+                                source, device.id, localDeviceId
+                            )
+                            val status = client.queryResume(
+                                device.address, device.port, prepared.offer
+                            )
+                            val mode = when (status.state) {
+                                ResumeState.NONE -> TransferStartMode.NEW
+                                ResumeState.AVAILABLE -> TransferStartMode.RESUME
+                                ResumeState.INVALID -> TransferStartMode.RESTART
+                            }
+                            client.sendPrepared(
                                 device.address,
                                 device.port,
-                                source,
+                                prepared.copy(resumeStatus = status),
+                                mode,
+                                status,
                                 controller,
                                 onPauseState,
                                 onProgress
-                            )
+                            ).also { result ->
+                                if (result.isSuccess) {
+                                    resumeCoordinator.completeOutgoing(prepared.offer.transferId)
+                                }
+                            }
                         }
                     }
                     val result = runner.run(

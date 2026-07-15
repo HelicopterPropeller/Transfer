@@ -87,7 +87,19 @@ class ResumeCoordinator(
     suspend fun queryIncoming(offer: TransferOffer): ResumeStatus {
         val checkpoint = store.findIncoming(offer.transferId) ?: return ResumeStatus(ResumeState.NONE)
         if (!checkpoint.isResumableFor(offer)) return ResumeStatus(ResumeState.INVALID)
-        return checkpoint.toStatus(ResumeState.AVAILABLE)
+        val expected = checkpoint.toStatus(ResumeState.AVAILABLE)
+        return try {
+            val input = files.openInput(checkpoint.location.toStoredLocation())
+                ?: return ResumeStatus(ResumeState.INVALID)
+            val prefix = input.use {
+                PrefixDigestScanner.scan(it, checkpoint.confirmedBytes, checkpoint.chunkSize)
+            }
+            if (validatePrefix(expected, prefix)) expected else ResumeStatus(ResumeState.INVALID)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            ResumeStatus(ResumeState.INVALID)
+        }
     }
 
     fun validatePrefix(status: ResumeStatus, scanned: PrefixDigest): Boolean =

@@ -1,9 +1,16 @@
 package com.example.transfer.transfer
 
 import com.example.transfer.protocol.ChunkCodec
+import com.example.transfer.protocol.ConnectionKind
+import com.example.transfer.protocol.ConnectionProtocol
+import com.example.transfer.protocol.ResumeProtocol
+import com.example.transfer.protocol.ResumeState
+import com.example.transfer.protocol.ResumeStatus
 import com.example.transfer.protocol.TransferFrameCodec
 import com.example.transfer.protocol.TransferFrameType
 import com.example.transfer.protocol.TransferProtocol
+import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.resume.PreparedTransfer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -17,6 +24,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.util.UUID
 
 class FileTransferCancellationTest {
     @Test
@@ -32,10 +40,11 @@ class FileTransferCancellationTest {
         }
         val client = FileTransferClient()
         val send = async(Dispatchers.IO) {
-            client.send(
+            client.sendPrepared(
                 InetAddress.getLoopbackAddress(), server.localPort,
-                SendFileSource("a.bin", "application/octet-stream", 1) { ByteArrayInputStream(byteArrayOf(1)) }
-            ) {}
+                prepared(byteArrayOf(1)), TransferStartMode.NEW, ResumeStatus(ResumeState.NONE),
+                TransferPauseController(), {}, {}
+            )
         }
         withTimeout(2_000) { accepted.await() }
         client.cancelActive()
@@ -53,7 +62,10 @@ class FileTransferCancellationTest {
             server.accept().use { socket ->
                 val input = DataInputStream(socket.getInputStream())
                 val output = DataOutputStream(socket.getOutputStream())
-                TransferProtocol.readHeader(input)
+                assertEquals(ConnectionKind.TRANSFER_START, ConnectionProtocol.readPreamble(input))
+                ResumeProtocol.readOffer(input)
+                assertEquals(TransferStartMode.NEW, ResumeProtocol.readStartMode(input))
+                ResumeProtocol.readStatus(input)
                 assertEquals(TransferFrameType.CHUNK, TransferFrameCodec.readType(input))
                 ChunkCodec.read(input, expectedIndex = 0, expectedLength = TransferProtocol.CHUNK_SIZE)
                 output.writeByte(TransferProtocol.ACK)
@@ -69,12 +81,12 @@ class FileTransferCancellationTest {
         val controller = TransferPauseController()
         val paused = CompletableDeferred<Unit>()
         val send = async(Dispatchers.IO) {
-            client.send(
+            client.sendPrepared(
                 InetAddress.getLoopbackAddress(),
                 server.localPort,
-                SendFileSource("a.bin", "application/octet-stream", bytes.size.toLong()) {
-                    ByteArrayInputStream(bytes)
-                },
+                prepared(bytes),
+                TransferStartMode.NEW,
+                ResumeStatus(ResumeState.NONE),
                 controller,
                 { state -> if (state == TransferPauseState.PAUSED) paused.complete(Unit) }
             ) { progress ->
@@ -94,5 +106,20 @@ class FileTransferCancellationTest {
         assertEquals(TransferPauseState.CANCELLED, controller.state)
         server.close()
         serverJob.cancel()
+    }
+
+    private fun prepared(bytes: ByteArray): PreparedTransfer {
+        val source = SendFileSource(
+            "a.bin", "application/octet-stream", bytes.size.toLong(),
+            sourceUri = "content://a", openStream = { ByteArrayInputStream(bytes) }
+        )
+        return PreparedTransfer(
+            com.example.transfer.protocol.TransferOffer(
+                UUID.randomUUID().toString(), "sender", source.displayName,
+                source.mimeType, source.length
+            ),
+            source,
+            ResumeStatus(ResumeState.NONE)
+        )
     }
 }

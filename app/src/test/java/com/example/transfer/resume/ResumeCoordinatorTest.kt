@@ -203,6 +203,8 @@ class ResumeCoordinatorTest {
         val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(original), original.size.toLong())
         store.saveIncoming(checkpoint(offer, location, prefix))
 
+        assertEquals(ResumeState.INVALID, coordinator.queryIncoming(offer).state)
+
         assertThrows<ResumeValidationException> {
             coordinator.openIncoming(offer, TransferStartMode.RESUME, coordinator.queryIncoming(offer))
         }
