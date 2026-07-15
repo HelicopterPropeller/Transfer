@@ -14,9 +14,13 @@ import com.example.transfer.storage.ResumableIncomingFileStore
 import com.example.transfer.storage.StoredFileLocation
 import com.example.transfer.transfer.SendFileSource
 import java.io.IOException
+import java.io.EOFException
+import java.io.FileNotFoundException
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 data class PreparedTransfer(
@@ -86,18 +90,30 @@ class ResumeCoordinator(
 
     suspend fun queryIncoming(offer: TransferOffer): ResumeStatus {
         val checkpoint = store.findIncoming(offer.transferId) ?: return ResumeStatus(ResumeState.NONE)
+        return inspectIncoming(checkpoint, offer)
+    }
+
+    private suspend fun inspectIncoming(
+        checkpoint: IncomingCheckpoint,
+        offer: TransferOffer
+    ): ResumeStatus {
         if (!checkpoint.isResumableFor(offer)) return ResumeStatus(ResumeState.INVALID)
         val expected = checkpoint.toStatus(ResumeState.AVAILABLE)
+        val coroutineContext = currentCoroutineContext()
         return try {
             val input = files.openInput(checkpoint.location.toStoredLocation())
                 ?: return ResumeStatus(ResumeState.INVALID)
             val prefix = input.use {
-                PrefixDigestScanner.scan(it, checkpoint.confirmedBytes, checkpoint.chunkSize)
+                PrefixDigestScanner.scan(it, checkpoint.confirmedBytes, checkpoint.chunkSize) {
+                    coroutineContext.ensureActive()
+                }
             }
             if (validatePrefix(expected, prefix)) expected else ResumeStatus(ResumeState.INVALID)
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
+        } catch (_: FileNotFoundException) {
+            ResumeStatus(ResumeState.INVALID)
+        } catch (_: EOFException) {
             ResumeStatus(ResumeState.INVALID)
         }
     }
@@ -303,7 +319,7 @@ class ResumeCoordinator(
         offer: TransferOffer,
         expectedStatus: ResumeStatus
     ): IncomingResumeSession {
-        val acquired = acquireCurrent(offer, expectedStatus)
+        val acquired = acquireCurrentForRestart(offer, expectedStatus)
         val current = recoverRetired(acquired.first, acquired.second, requireSuccess = true)
         val token = acquired.second
         val journal = IncomingStagingJournal(
@@ -357,6 +373,34 @@ class ResumeCoordinator(
         return IncomingResumeSession(handle, active, prefix, token)
     }
 
+    private suspend fun acquireCurrentForRestart(
+        offer: TransferOffer,
+        expectedStatus: ResumeStatus
+    ): Pair<IncomingCheckpoint, String> {
+        val expected = store.findIncoming(offer.transferId)
+            ?: throw CheckpointConflictException("Incoming checkpoint no longer exists")
+        if (!inspectIncoming(expected, offer).sameValue(expectedStatus)) {
+            throw CheckpointConflictException("Incoming checkpoint changed during negotiation")
+        }
+        val token = newSessionToken()
+        val now = clock()
+        val acquired = store.acquireIncomingSession(
+            expected, token, now, now + RETENTION_MILLIS
+        ) ?: throw CheckpointConflictException("Incoming checkpoint is already owned or being cleaned up")
+        try {
+            if (!inspectIncoming(acquired, offer).sameValue(expectedStatus)) {
+                throw CheckpointConflictException("Incoming checkpoint changed during restart validation")
+            }
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { store.releaseIncomingSession(acquired, token) }
+            throw cancelled
+        } catch (error: Exception) {
+            withContext(NonCancellable) { store.releaseIncomingSession(acquired, token) }
+            throw error
+        }
+        return acquired to token
+    }
+
     private suspend fun openResume(
         offer: TransferOffer,
         expectedStatus: ResumeStatus
@@ -388,9 +432,12 @@ class ResumeCoordinator(
             }
             val input = files.openInput(location)
                 ?: throw ResumeValidationException("Partial file cannot be read")
+            val coroutineContext = currentCoroutineContext()
             val prefix = input.use {
                 try {
-                    PrefixDigestScanner.scan(it, current.confirmedBytes, current.chunkSize)
+                    PrefixDigestScanner.scan(it, current.confirmedBytes, current.chunkSize) {
+                        coroutineContext.ensureActive()
+                    }
                 } catch (error: IOException) {
                     throw ResumeValidationException("Partial file prefix cannot be read", error)
                 }

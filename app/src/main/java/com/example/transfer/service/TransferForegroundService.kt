@@ -18,6 +18,7 @@ import com.example.transfer.history.TransferHistoryRepository
 import com.example.transfer.protocol.ResumeState
 import com.example.transfer.protocol.TransferStartMode
 import com.example.transfer.resume.ResumeCoordinator
+import com.example.transfer.resume.ResumeCleanup
 import com.example.transfer.resume.RoomResumeStore
 import com.example.transfer.storage.DownloadStorage
 import com.example.transfer.transfer.FileTransferClient
@@ -68,6 +69,7 @@ class TransferForegroundService : Service() {
     private lateinit var outgoingHistoryRecorder: OutgoingHistoryRecorder
     private lateinit var historyStartupGate: HistoryStartupGate
     private lateinit var resumeCoordinator: ResumeCoordinator
+    private lateinit var resumeStartupGate: ResumeStartupGate
     private lateinit var localDeviceId: String
     private val client = FileTransferClient()
     @Volatile private var activePauseController: TransferPauseController? = null
@@ -97,7 +99,26 @@ class TransferForegroundService : Service() {
             .joinToString(" ").ifBlank { "Android 设备" }
         discovery = DiscoveryManager(this, localDeviceId, deviceName)
         val downloadStorage = DownloadStorage(this)
-        resumeCoordinator = ResumeCoordinator(RoomResumeStore(database.resumeDao()), downloadStorage)
+        val resumeStore = RoomResumeStore(database.resumeDao())
+        resumeCoordinator = ResumeCoordinator(resumeStore, downloadStorage)
+        val resumePreferences = getSharedPreferences("resume", 0)
+        resumeStartupGate = ResumeStartupGate(
+            scope = serviceScope,
+            recover = {
+                resumeCoordinator.recoverInterruptedState(System.currentTimeMillis() + 1)
+            },
+            cleanup = {
+                ResumeCleanup(
+                    store = resumeStore,
+                    files = downloadStorage,
+                    clock = System::currentTimeMillis,
+                    lastRun = { resumePreferences.getLong("cleanup_last_run", 0L) },
+                    saveLastRun = { value ->
+                        resumePreferences.edit { putLong("cleanup_last_run", value) }
+                    }
+                ).runIfDue()
+            }
+        )
         server = FileTransferServer(
             resumeCoordinator = resumeCoordinator,
             onTransferStart = ::beginTransfer,
@@ -113,7 +134,8 @@ class TransferForegroundService : Service() {
                 )
             }
         )
-        incomingStartupJob = historyStartupGate.launchWhenReady {
+        incomingStartupJob = resumeStartupGate.launchWhenReady {
+            historyStartupGate.awaitReady()
             server.start(
                 serviceScope,
                 { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
@@ -196,6 +218,7 @@ class TransferForegroundService : Service() {
             job = serviceScope.launch(start = CoroutineStart.LAZY) {
                 try {
                     historyStartupGate.awaitReady()
+                    resumeStartupGate.awaitReady()
                     val onPauseState: (TransferPauseState) -> Unit = {
                         publishPauseState(controller)
                     }

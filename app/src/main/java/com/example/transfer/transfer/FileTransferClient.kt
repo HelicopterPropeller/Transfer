@@ -48,7 +48,7 @@ class FileTransferClient {
                 checkActive(operation.id)
                 socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS)
                 checkActive(operation.id)
-                socket.soTimeout = SOCKET_TIMEOUT_MILLIS
+                socket.soTimeout = queryReadTimeoutMillis(offer.fileSize)
                 val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 checkActive(operation.id)
@@ -358,7 +358,18 @@ class FileTransferClient {
     companion object {
         private const val CONNECT_TIMEOUT_MILLIS = 5_000
         private const val SOCKET_TIMEOUT_MILLIS = 15_000
+        private const val QUERY_MIN_BYTES_PER_SECOND = 256L * 1024
         private const val MAX_ATTEMPTS = 3
+
+        internal fun queryReadTimeoutMillis(fileSize: Long): Int {
+            require(fileSize >= 0)
+            val scanSeconds = if (fileSize == 0L) 0L else {
+                (fileSize + QUERY_MIN_BYTES_PER_SECOND - 1) / QUERY_MIN_BYTES_PER_SECOND
+            }
+            return (SOCKET_TIMEOUT_MILLIS.toLong() + scanSeconds * 1_000L)
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt()
+        }
     }
 
     private data class PreparedStream(

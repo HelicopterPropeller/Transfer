@@ -37,6 +37,15 @@ import org.junit.Test
 
 class FileTransferClientOperationTest {
     @Test
+    fun `resume query timeout scales conservatively with offered file size`() {
+        assertEquals(15_000, FileTransferClient.queryReadTimeoutMillis(0))
+        assertTrue(
+            FileTransferClient.queryReadTimeoutMillis(TransferProtocol.MAX_FILE_SIZE) >
+                FileTransferClient.queryReadTimeoutMillis(TransferProtocol.CHUNK_SIZE.toLong())
+        )
+    }
+
+    @Test
     fun `cancel active closes a source blocked during resumed prefix scan`() = runBlocking {
         val prefix = ByteArray(TransferProtocol.CHUNK_SIZE) { (it % 251).toByte() }
         val bytes = prefix + byteArrayOf(9)

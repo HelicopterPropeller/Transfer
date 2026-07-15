@@ -10,6 +10,7 @@ import java.io.EOFException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
+import java.util.concurrent.CancellationException
 
 class DigestChainTest {
     @Test
@@ -94,5 +95,19 @@ class DigestChainTest {
         }
 
         assertEquals("File ended before committed prefix", error.message)
+    }
+
+    @Test
+    fun `prefix scanner cooperatively checks cancellation between chunks`() {
+        var checks = 0
+
+        assertThrows(CancellationException::class.java) {
+            PrefixDigestScanner.scan(ByteArrayInputStream(ByteArray(6)), 6, 2) {
+                checks++
+                if (checks == 3) throw CancellationException("stopped")
+            }
+        }
+
+        assertEquals(3, checks)
     }
 }

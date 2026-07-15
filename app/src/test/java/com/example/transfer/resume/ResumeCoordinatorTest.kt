@@ -24,6 +24,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.InputStream
+import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -208,6 +209,89 @@ class ResumeCoordinatorTest {
         assertThrows<ResumeValidationException> {
             coordinator.openIncoming(offer, TransferStartMode.RESUME, coordinator.queryIncoming(offer))
         }
+        Unit
+    }
+
+    @Test
+    fun `corrupt query invalid can restart after repeated invalid validation`() = runBlocking {
+        val original = ByteArray(TransferProtocol.CHUNK_SIZE) { 3 }
+        val corrupt = original.copyOf().also { it[0] = 4 }
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer(fileSize = original.size.toLong() + 1)
+        val location = files.put(offer.transferId, corrupt)
+        val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(original), original.size.toLong())
+        store.saveIncoming(checkpoint(offer, location, prefix))
+        val invalid = coordinator.queryIncoming(offer)
+
+        val restarted = coordinator.openIncoming(offer, TransferStartMode.RESTART, invalid)
+
+        assertEquals(ResumeState.INVALID, invalid.state)
+        assertEquals(0L, restarted.checkpoint.confirmedBytes)
+        assertTrue(location in files.deleted)
+    }
+
+    @Test
+    fun `missing partial query invalid can restart`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer(fileSize = 3)
+        val missing = StoredFileLocation("FAKE", "missing")
+        store.saveIncoming(checkpoint(offer, missing))
+        val invalid = coordinator.queryIncoming(offer)
+
+        val restarted = coordinator.openIncoming(offer, TransferStartMode.RESTART, invalid)
+
+        assertEquals(ResumeState.INVALID, invalid.state)
+        assertEquals(0L, restarted.checkpoint.confirmedBytes)
+    }
+
+    @Test
+    fun `restart refuses invalid status when receiver prefix becomes valid after query`() = runBlocking {
+        val original = ByteArray(TransferProtocol.CHUNK_SIZE) { 3 }
+        val corrupt = original.copyOf().also { it[0] = 4 }
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val coordinator = coordinator(store, files)
+        val offer = offer(fileSize = original.size.toLong() + 1)
+        val location = files.put(offer.transferId, corrupt)
+        val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(original), original.size.toLong())
+        store.saveIncoming(checkpoint(offer, location, prefix))
+        val invalid = coordinator.queryIncoming(offer)
+        files.replace(location, original)
+
+        assertThrows<CheckpointConflictException> {
+            coordinator.openIncoming(offer, TransferStartMode.RESTART, invalid)
+        }
+        assertTrue(files.deleted.isEmpty())
+    }
+
+    @Test
+    fun `query propagates transient storage io instead of returning invalid`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles().apply { openInputFailure = IOException("storage busy") }
+        val coordinator = coordinator(store, files)
+        val offer = offer()
+        val location = files.put(offer.transferId, ByteArray(0))
+        store.saveIncoming(checkpoint(offer, location))
+
+        val failure = assertThrows<IOException> { coordinator.queryIncoming(offer) }
+
+        assertEquals("storage busy", failure.message)
+    }
+
+    @Test
+    fun `query propagates storage security failure`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles().apply { openInputFailure = SecurityException("permission revoked") }
+        val coordinator = coordinator(store, files)
+        val offer = offer()
+        val location = files.put(offer.transferId, ByteArray(0))
+        store.saveIncoming(checkpoint(offer, location))
+
+        assertThrows<SecurityException> { coordinator.queryIncoming(offer) }
         Unit
     }
 
@@ -1122,6 +1206,7 @@ private class FakeFiles : ResumableIncomingFileStore {
     var failAfterCreate = false
     var crashAfterPublish = false
     var publishCount = 0
+    var openInputFailure: Exception? = null
     val failDeleteValues = mutableSetOf<String>()
 
     fun contains(location: StoredFileLocation) = entries.containsKey(location)
@@ -1132,6 +1217,10 @@ private class FakeFiles : ResumableIncomingFileStore {
         val location = StoredFileLocation("FAKE", id)
         entries[location] = FakeEntry("a.bin", bytes)
         return location
+    }
+
+    fun replace(location: StoredFileLocation, bytes: ByteArray) {
+        entries.getValue(location).bytes = bytes
     }
 
     override suspend fun create(transferId: String, fileName: String, mimeType: String): ResumableFileHandle {
@@ -1151,7 +1240,7 @@ private class FakeFiles : ResumableIncomingFileStore {
         return entries[location]?.let { FakeHandle(location, it) }
     }
     override suspend fun openInput(location: StoredFileLocation): InputStream? =
-        entries[location]?.let { ByteArrayInputStream(it.bytes) }
+        openInputFailure?.let { throw it } ?: entries[location]?.let { ByteArrayInputStream(it.bytes) }
     override suspend fun publish(handle: ResumableFileHandle): String {
         publishCount++
         handle.close()

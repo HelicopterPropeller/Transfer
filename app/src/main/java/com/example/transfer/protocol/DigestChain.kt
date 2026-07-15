@@ -40,7 +40,8 @@ object PrefixDigestScanner {
     fun scan(
         input: InputStream,
         bytes: Long,
-        chunkSize: Int = TransferProtocol.CHUNK_SIZE
+        chunkSize: Int = TransferProtocol.CHUNK_SIZE,
+        checkCancellation: () -> Unit = {}
     ): PrefixDigest {
         require(bytes >= 0 && chunkSize > 0)
 
@@ -52,6 +53,7 @@ object PrefixDigestScanner {
         val buffer = ByteArray(chunkSize)
 
         while (remaining > 0) {
+            checkCancellation()
             val length = minOf(chunkSize.toLong(), remaining).toInt()
             readFully(input, buffer, length)
             whole.update(buffer, 0, length)
@@ -60,6 +62,7 @@ object PrefixDigestScanner {
             remaining -= length
             index++
         }
+        checkCancellation()
 
         return PrefixDigest(bytes, index, chain, last, whole)
     }

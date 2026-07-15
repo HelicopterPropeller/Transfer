@@ -27,6 +27,7 @@ import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
 import java.security.MessageDigest
@@ -40,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -50,6 +52,89 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class FileTransferServerV4Test {
+    @Test
+    fun `pause lease timeout retains committed checkpoint`() = runBlocking {
+        val harness = V4Harness(pausedSessionLeaseMillis = 100)
+        val first = ByteArray(TransferProtocol.CHUNK_SIZE) { 2 }
+        val offer = harness.offer(first.size.toLong() + 1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                ChunkCodec.write(output, ChunkCodec.create(0, first))
+                output.flush()
+                assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+                assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
+            }
+            withTimeout(2_000) { harness.history.failed.await() }
+            assertEquals(first.size.toLong(), harness.store.findIncoming(offer.transferId)?.confirmedBytes)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `history failure callback never replaces original transfer error`() = runBlocking {
+        val history = SocketHistory(failFailure = IOException("history unavailable"))
+        val harness = V4Harness(
+            verifier = ChunkVerifier { _, _ -> error("original transfer failure") },
+            configuredHistory = history
+        )
+        val prepared = harness.prepared(byteArrayOf(1))
+        try {
+            val result = FileTransferClient().sendPrepared(
+                InetAddress.getLoopbackAddress(), harness.port(), prepared,
+                TransferStartMode.NEW, ResumeStatus(ResumeState.NONE),
+                TransferPauseController(), {}, {}
+            )
+            assertTrue(result.isFailure)
+            withTimeout(2_000) { history.failed.await() }
+            withTimeout(2_000) {
+                while (harness.errors.isEmpty()) delay(10)
+            }
+            assertTrue(harness.errors.single().contains("original transfer failure"))
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `success response write failure after publish does not undo success`() = runBlocking {
+        val harness = V4Harness()
+        val publishEntered = CountDownLatch(1)
+        val releasePublish = CountDownLatch(1)
+        harness.files.pausePublish(publishEntered, releasePublish)
+        val offer = harness.offer(0)
+        var socket: Socket? = null
+        try {
+            socket = Socket(InetAddress.getLoopbackAddress(), harness.port())
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+            output.writeByte(TransferProtocol.COMPLETE)
+            output.write(MessageDigest.getInstance("SHA-256").digest())
+            output.flush()
+            assertTrue(publishEntered.await(2, TimeUnit.SECONDS))
+            socket.setSoLinger(true, 0)
+            socket.close()
+            socket = null
+            releasePublish.countDown()
+
+            withTimeout(2_000) { harness.history.succeeded.await() }
+            assertTrue(harness.files.published)
+            assertEquals(null, harness.store.findIncoming(offer.transferId))
+        } finally {
+            releasePublish.countDown()
+            socket?.close()
+            harness.close()
+        }
+    }
+
     @Test
     fun `nack retries identical v4 chunk and then succeeds`() = runBlocking {
         val checks = AtomicInteger()
@@ -174,6 +259,44 @@ class FileTransferServerV4Test {
             socket.close()
             server.stop()
             job.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun `stop cancels resume query during cooperative large prefix scan`() = runBlocking {
+        val harness = V4Harness()
+        val chunk = ByteArray(TransferProtocol.CHUNK_SIZE) { 5 }
+        val offer = harness.offer(chunk.size.toLong() * 2 + 1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                repeat(2) { index ->
+                    TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+                    ChunkCodec.write(output, ChunkCodec.create(index, chunk))
+                    output.flush()
+                    assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+                }
+            }
+            withTimeout(2_000) {
+                while (!harness.store.isIdle(offer.transferId)) delay(10)
+            }
+            val enteredRead = CountDownLatch(1)
+            val releaseRead = CountDownLatch(1)
+            harness.files.pauseFirstQueryRead(enteredRead, releaseRead)
+            val queryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val query = queryScope.async { harness.query(offer) }
+            assertTrue(enteredRead.await(2, TimeUnit.SECONDS))
+            val stopped = async(Dispatchers.IO) { harness.stop() }
+            assertTrue(harness.awaitStopping())
+            releaseRead.countDown()
+
+            withTimeout(2_000) { stopped.await() }
+            assertTrue(runCatching { withTimeout(2_000) { query.await() } }.isFailure)
+            queryScope.cancel()
+        } finally {
+            harness.close()
         }
     }
 
@@ -507,31 +630,40 @@ class FileTransferServerV4Test {
 
 private class V4Harness(
     private val exclusiveBusyGate: Boolean = false,
-    verifier: ChunkVerifier = ChunkVerifier.SHA256
+    verifier: ChunkVerifier = ChunkVerifier.SHA256,
+    private val configuredHistory: SocketHistory = SocketHistory(),
+    pausedSessionLeaseMillis: Int = 30 * 60 * 1000
 ) {
     val store = SocketResumeStore()
     val files = SocketFiles()
     val completed = CompletableDeferred<Unit>()
-    val history = SocketHistory()
+    val history = configuredHistory
+    val errors = java.util.Collections.synchronizedList(mutableListOf<String>())
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.IO)
     private val ready = CompletableDeferred<Int>()
+    private val stopping = CountDownLatch(1)
     var startCalls = 0
     private var busy = false
     private val server = FileTransferServer(
         port = 0,
         resumeCoordinator = ResumeCoordinator(store, files),
         chunkVerifier = verifier,
+        pausedSessionLeaseMillis = pausedSessionLeaseMillis,
         onTransferStart = {
             startCalls++
             if (exclusiveBusyGate && busy) false else { busy = true; true }
         },
         onTransferEnd = { busy = false },
-        history = history
+        history = history,
+        onServerStopping = { stopping.countDown() }
     )
 
     init {
-        server.start(scope, { ready.complete(it) }, { _, _ -> }, { completed.complete(Unit) }, {})
+        server.start(
+            scope, { ready.complete(it) }, { _, _ -> }, { completed.complete(Unit) },
+            { errors += it }
+        )
     }
 
     suspend fun port() = withTimeout(2_000) { ready.await() }
@@ -560,19 +692,24 @@ private class V4Harness(
 
     fun stop() = server.stop()
 
+    fun awaitStopping() = stopping.await(2, TimeUnit.SECONDS)
+
     suspend fun close() {
         server.stop()
         withTimeout(2_000) { job.cancelAndJoin() }
     }
 }
 
-private class SocketHistory : IncomingTransferHistory {
+private class SocketHistory(private val failFailure: Exception? = null) : IncomingTransferHistory {
     val cancelled = CompletableDeferred<Unit>()
     val succeeded = CompletableDeferred<Unit>()
     val failed = CompletableDeferred<Unit>()
     override suspend fun start(fileName: String, fileSize: Long, mimeType: String, peerAddress: String) = 1L
     override suspend fun succeed(historyId: Long?, receivedUri: String?) { succeeded.complete(Unit) }
-    override suspend fun fail(historyId: Long?, errorMessage: String?) { failed.complete(Unit) }
+    override suspend fun fail(historyId: Long?, errorMessage: String?) {
+        failed.complete(Unit)
+        failFailure?.let { throw it }
+    }
     override suspend fun cancel(historyId: Long?, errorMessage: String?) { cancelled.complete(Unit) }
 }
 
@@ -581,6 +718,8 @@ private class SocketFiles : ResumableIncomingFileStore {
     private val entries = linkedMapOf<StoredFileLocation, Entry>()
     var published = false
     var writeCount = 0
+    private var queryReadBarrier: Pair<CountDownLatch, CountDownLatch>? = null
+    private var publishBarrier: Pair<CountDownLatch, CountDownLatch>? = null
 
     fun bytes(stagingIdPrefix: String): ByteArray = entries.entries.first {
         it.key.value.startsWith(stagingIdPrefix)
@@ -596,6 +735,14 @@ private class SocketFiles : ResumableIncomingFileStore {
         entry.bytes[0] = (entry.bytes[0].toInt() xor 0xff).toByte()
     }
 
+    fun pauseFirstQueryRead(entered: CountDownLatch, release: CountDownLatch) {
+        queryReadBarrier = entered to release
+    }
+
+    fun pausePublish(entered: CountDownLatch, release: CountDownLatch) {
+        publishBarrier = entered to release
+    }
+
     override suspend fun create(transferId: String, fileName: String, mimeType: String): ResumableFileHandle {
         val location = StoredFileLocation("TEST", transferId)
         val entry = Entry(fileName)
@@ -606,11 +753,32 @@ private class SocketFiles : ResumableIncomingFileStore {
     override suspend fun reopen(location: StoredFileLocation, displayName: String): ResumableFileHandle? =
         entries[location]?.let { handle(location, it) }
 
-    override suspend fun openInput(location: StoredFileLocation) =
-        entries[location]?.bytes?.let(::ByteArrayInputStream)
+    override suspend fun openInput(location: StoredFileLocation) = entries[location]?.bytes?.let { bytes ->
+        val barrier = queryReadBarrier.also { queryReadBarrier = null }
+        if (barrier == null) {
+            ByteArrayInputStream(bytes)
+        } else {
+            object : ByteArrayInputStream(bytes) {
+                private var first = true
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    if (first) {
+                        first = false
+                        barrier.first.countDown()
+                        check(barrier.second.await(2, TimeUnit.SECONDS))
+                    }
+                    return super.read(buffer, offset, length)
+                }
+            }
+        }
+    }
 
     override suspend fun publish(handle: ResumableFileHandle): String {
         published = true
+        publishBarrier?.also { barrier ->
+            barrier.first.countDown()
+            check(barrier.second.await(2, TimeUnit.SECONDS))
+            publishBarrier = null
+        }
         return "content://received/${handle.displayName}"
     }
 
