@@ -286,9 +286,17 @@ class ResumeCoordinator(
         }
 
         store.findCompletingIncoming().forEach { original ->
-            if (!recoverRetiredAfterProcessDeath(original)) return@forEach
             try {
-                val checkpoint = recoverCompletingDigest(original) ?: return@forEach
+                val acquiredAt = clock()
+                val acquired = store.acquireCompletingRecovery(
+                    original,
+                    newSessionToken(),
+                    acquiredAt,
+                    staleClaimBefore,
+                    acquiredAt + RETENTION_MILLIS
+                ) ?: return@forEach
+                if (!recoverRetiredAfterProcessDeath(acquired)) return@forEach
+                val checkpoint = recoverCompletingDigest(acquired) ?: return@forEach
                 val finalDigest = checkpoint.completingFinalDigest ?: return@forEach
                 val alreadyPublished = files.recoverPublished(
                     checkpoint.location.toStoredLocation(), checkpoint.displayName, finalDigest

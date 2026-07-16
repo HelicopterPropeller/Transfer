@@ -199,11 +199,37 @@ interface ResumeDao {
     @Query(
         """
         UPDATE incoming_checkpoints
+        SET sessionToken = :token, sessionClaimedAt = :now,
+            updatedAt = :now, expiresAt = :expiresAt
+        WHERE transferId = :transferId AND generation = :generation
+          AND storageKind = :storageKind AND storageValue = :storageValue
+          AND operationState = 'COMPLETING' AND cleanupToken IS NULL
+          AND (
+            sessionToken IS NULL OR sessionClaimedAt IS NULL
+            OR sessionClaimedAt < :staleClaimBefore
+          )
+        """
+    )
+    suspend fun acquireCompletingRecovery(
+        transferId: String,
+        generation: Long,
+        storageKind: String,
+        storageValue: String,
+        token: String,
+        now: Long,
+        staleClaimBefore: Long,
+        expiresAt: Long
+    ): Int
+
+    @Query(
+        """
+        UPDATE incoming_checkpoints
         SET completingFinalDigest = :finalDigest, updatedAt = :now, expiresAt = :expiresAt
         WHERE transferId = :transferId AND generation = :generation
           AND storageKind = :storageKind AND storageValue = :storageValue
           AND confirmedBytes = fileSize AND operationState = 'COMPLETING'
           AND completingFinalDigest IS NULL AND cleanupToken IS NULL
+          AND sessionToken = :token
         """
     )
     suspend fun persistRecoveredCompletingDigest(
@@ -211,6 +237,7 @@ interface ResumeDao {
         generation: Long,
         storageKind: String,
         storageValue: String,
+        token: String,
         finalDigest: ByteArray,
         now: Long,
         expiresAt: Long
@@ -222,11 +249,11 @@ interface ResumeDao {
         WHERE transferId = :transferId AND generation = :generation
           AND storageKind = :storageKind AND storageValue = :storageValue
           AND operationState = 'COMPLETING' AND completingFinalDigest = :finalDigest
-          AND cleanupToken IS NULL
+          AND cleanupToken IS NULL AND sessionToken = :token
         """
     )
     suspend fun deleteCompletingIncoming(
-        transferId: String, generation: Long, storageKind: String, storageValue: String,
+        transferId: String, generation: Long, storageKind: String, storageValue: String, token: String,
         finalDigest: ByteArray
     ): Int
 
@@ -252,11 +279,12 @@ interface ResumeDao {
         receipt: CompletedReceiptEntity,
         generation: Long,
         storageKind: String,
-        storageValue: String
+        storageValue: String,
+        token: String
     ): Boolean {
         check(
             deleteCompletingIncoming(
-                receipt.transferId, generation, storageKind, storageValue, receipt.finalDigest
+                receipt.transferId, generation, storageKind, storageValue, token, receipt.finalDigest
             ) > 0
         ) { "Completing checkpoint changed" }
         insertCompletedReceipt(receipt)

@@ -231,7 +231,7 @@ class FileTransferClient {
             ResumeProtocol.readStatus(input, offer)
         } catch (_: EOFException) {
             if (firstResponse == TransferProtocol.FATAL) {
-                throw ProtocolException("对端协议版本不兼容，请将两台设备都升级到最新版")
+                throw ProtocolException("对端未返回完整的 v4 响应，可能协议版本不兼容或连接已中断")
             }
             throw ProtocolException("Receiver closed the resume response early")
         }

@@ -50,7 +50,7 @@ internal object LegacyDownloadFiles {
         partial: File,
         requestedName: String,
         expectedDigest: ByteArray,
-        copyExclusive: (source: File, target: File) -> Boolean
+        moveIntoPlace: (source: File, target: File) -> Boolean
     ): File {
         require(expectedDigest.size == SHA_256_SIZE) { "Invalid whole-file digest" }
         check(partial.isFile) { "Partial download no longer exists" }
@@ -58,18 +58,17 @@ internal object LegacyDownloadFiles {
 
         recoverPublished(partial, requestedName, expectedDigest)?.let { return it }
         for (attempt in 0 until MAX_PUBLISH_ATTEMPTS) {
-            val candidate = publishedCandidate(partial, requestedName, expectedDigest, attempt)
-            if (!copyExclusive(partial, candidate)) {
+            val candidate = uniquePublishedCandidate(partial, requestedName, expectedDigest, attempt)
+            if (!moveIntoPlace(partial, candidate)) {
                 if (candidate.isFile && matchesDigest(candidate, expectedDigest)) {
-                    check(partial.delete()) { "Unable to remove published partial file" }
+                    if (partial.exists()) {
+                        check(partial.delete()) { "Unable to remove published partial file" }
+                    }
                     return candidate
                 }
                 continue
             }
-            if (!matchesDigest(candidate, expectedDigest)) {
-                throw IOException("Published copy digest mismatch")
-            }
-            check(partial.delete()) { "Unable to remove published partial file" }
+            check(!partial.exists() && candidate.isFile) { "Atomic publish move did not complete" }
             return candidate
         }
         throw IOException("Unable to reserve a published download name")
@@ -82,8 +81,12 @@ internal object LegacyDownloadFiles {
         expectedDigest: ByteArray
     ): File? {
         require(expectedDigest.size == SHA_256_SIZE) { "Invalid whole-file digest" }
-        for (attempt in 0 until MAX_PUBLISH_ATTEMPTS) {
-            val candidate = publishedCandidate(partial, requestedName, expectedDigest, attempt)
+        val candidates = sequenceOf(
+            legacyPublishedCandidate(partial, requestedName)
+        ) + (0 until MAX_PUBLISH_ATTEMPTS).asSequence().map { attempt ->
+            uniquePublishedCandidate(partial, requestedName, expectedDigest, attempt)
+        }
+        for (candidate in candidates) {
             if (!candidate.isFile || !matchesDigest(candidate, expectedDigest)) continue
             if (partial.exists()) {
                 if (!partial.isFile || !matchesDigest(partial, expectedDigest)) return null
@@ -94,7 +97,17 @@ internal object LegacyDownloadFiles {
         return null
     }
 
-    private fun publishedCandidate(
+    private fun legacyPublishedCandidate(partial: File, requestedName: String): File {
+        val directory = checkNotNull(partial.canonicalFile.parentFile) {
+            "Partial download has no parent directory"
+        }
+        return requireContained(
+            directory,
+            File(directory, stablePublishedName(requestedName, partial.canonicalPath)).path
+        )
+    }
+
+    private fun uniquePublishedCandidate(
         partial: File,
         requestedName: String,
         expectedDigest: ByteArray,
@@ -103,17 +116,13 @@ internal object LegacyDownloadFiles {
         val directory = checkNotNull(partial.canonicalFile.parentFile) {
             "Partial download has no parent directory"
         }
-        val name = if (attempt == 0) {
-            stablePublishedName(requestedName, partial.canonicalPath)
-        } else {
-            val identity = stableSuffix(partial.canonicalPath)
-            val digest = expectedDigest.take(DIGEST_NAME_BYTES).toHex()
-            FileNamePolicy.withTimestamp(
-                requestedName,
-                "${identity}_$digest",
-                attempt
-            )
-        }
+        val identity = stableSuffix(partial.canonicalPath)
+        val digest = expectedDigest.take(DIGEST_NAME_BYTES).toHex()
+        val name = FileNamePolicy.withTimestamp(
+            requestedName,
+            "${identity}_$digest",
+            attempt + 1
+        )
         return requireContained(directory, File(directory, name).path)
     }
 

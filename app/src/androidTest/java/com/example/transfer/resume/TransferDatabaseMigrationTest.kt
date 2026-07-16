@@ -297,6 +297,7 @@ class TransferDatabaseMigrationTest {
             val digest = ByteArray(32) { 7 }
             val checkpoint = incomingEntity("done").copy(
                 operationState = IncomingOperationState.COMPLETING,
+                sessionToken = "recovery",
                 completingFinalDigest = digest
             )
             dao.upsertIncoming(checkpoint)
@@ -316,7 +317,8 @@ class TransferDatabaseMigrationTest {
 
             assertTrue(
                 dao.recordCompletedReceiptAndDelete(
-                    receipt, checkpoint.generation, checkpoint.storageKind, checkpoint.storageValue
+                    receipt, checkpoint.generation, checkpoint.storageKind, checkpoint.storageValue,
+                    "recovery"
                 )
             )
             assertNull(dao.findIncoming(checkpoint.transferId))

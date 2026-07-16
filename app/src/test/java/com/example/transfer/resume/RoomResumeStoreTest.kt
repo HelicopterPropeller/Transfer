@@ -287,6 +287,47 @@ class RoomResumeStoreTest {
     }
 
     @Test
+    fun `cleanup claim wins before completion recovery lease without file ownership`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(staleCompleting("t1", ByteArray(32)))
+        val discovered = requireNotNull(store.findIncoming("t1"))
+        assertEquals(1, store.claimExpiredIncoming(100L, 50L, "cleanup").size)
+
+        assertNull(
+            store.acquireCompletingRecovery(
+                discovered, "recovery", now = 101L,
+                staleClaimBefore = 50L, expiresAt = 200L
+            )
+        )
+    }
+
+    @Test
+    fun `completion recovery lease blocks cleanup and owns receipt completion`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        val digest = ByteArray(32) { 4 }
+        store.saveIncoming(staleCompleting("t1", digest))
+        val discovered = requireNotNull(store.findIncoming("t1"))
+
+        val acquired = requireNotNull(
+            store.acquireCompletingRecovery(
+                discovered, "recovery", now = 100L,
+                staleClaimBefore = 50L, expiresAt = 200L
+            )
+        )
+
+        assertEquals("recovery", acquired.sessionToken)
+        assertEquals(100L, acquired.sessionClaimedAt)
+        assertTrue(store.claimExpiredIncoming(110L, 50L, "cleanup").isEmpty())
+        val receipt = CompletedReceipt(
+            acquired.transferId, acquired.senderDeviceId, acquired.fileName, acquired.mimeType,
+            acquired.fileSize, acquired.chunkSize, digest, "fake://received/a.bin",
+            acquired.displayName, 110L, 200L
+        )
+        assertTrue(store.finishIncomingCompletion(acquired, receipt))
+        assertNull(store.findIncoming("t1"))
+    }
+
+    @Test
     fun `cleanup claimed completing checkpoint rejects recovered digest persistence`() = runBlocking {
         val store = RoomResumeStore(FakeResumeDao())
         store.saveIncoming(staleCompleting("t1", finalDigest = null))
@@ -359,6 +400,11 @@ class RoomResumeStoreTest {
             completingFinalDigest = digest
         )
         store.saveIncoming(completing)
+        val owned = requireNotNull(
+            store.acquireCompletingRecovery(
+                completing, "recovery", 90L, Long.MAX_VALUE, 200L
+            )
+        )
         val receipt = CompletedReceipt(
             transferId = completing.transferId,
             senderDeviceId = completing.senderDeviceId,
@@ -373,7 +419,7 @@ class RoomResumeStoreTest {
             expiresAt = 200L
         )
 
-        assertTrue(store.finishIncomingCompletion(completing, receipt))
+        assertTrue(store.finishIncomingCompletion(owned, receipt))
 
         assertNull(store.findIncoming("t1"))
         val stored = requireNotNull(store.findCompletedReceipt("t1", now = 150L))
@@ -392,17 +438,22 @@ class RoomResumeStoreTest {
             completingFinalDigest = null
         )
         store.saveIncoming(completing)
+        val owned = requireNotNull(
+            store.acquireCompletingRecovery(
+                completing, "recovery", 40L, Long.MAX_VALUE, 500L
+            )
+        )
         val digest = ByteArray(32) { 3 }
 
         val recovered = store.persistRecoveredCompletingDigest(
-            completing, digest, now = 50L, expiresAt = 500L
+            owned, digest, now = 50L, expiresAt = 500L
         )
 
         assertArrayEquals(digest, recovered?.completingFinalDigest)
         assertEquals(50L, recovered?.updatedAt)
         assertNull(
             store.persistRecoveredCompletingDigest(
-                completing, ByteArray(32) { 9 }, now = 60L, expiresAt = 600L
+                owned, ByteArray(32) { 9 }, now = 60L, expiresAt = 600L
             )
         )
     }
@@ -594,11 +645,38 @@ private class FakeResumeDao : ResumeDao {
             it.operationState == IncomingOperationState.COMPLETING && it.cleanupToken == null
         }
 
+    override suspend fun acquireCompletingRecovery(
+        transferId: String,
+        generation: Long,
+        storageKind: String,
+        storageValue: String,
+        token: String,
+        now: Long,
+        staleClaimBefore: Long,
+        expiresAt: Long
+    ): Int {
+        val current = incoming[transferId] ?: return 0
+        if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.cleanupToken != null || current.generation != generation ||
+            current.storageKind != storageKind || current.storageValue != storageValue ||
+            (current.sessionToken != null && current.sessionClaimedAt != null &&
+                current.sessionClaimedAt >= staleClaimBefore)
+        ) return 0
+        incoming[transferId] = current.copy(
+            sessionToken = token,
+            sessionClaimedAt = now,
+            updatedAt = now,
+            expiresAt = expiresAt
+        )
+        return 1
+    }
+
     override suspend fun persistRecoveredCompletingDigest(
         transferId: String,
         generation: Long,
         storageKind: String,
         storageValue: String,
+        token: String,
         finalDigest: ByteArray,
         now: Long,
         expiresAt: Long
@@ -608,7 +686,7 @@ private class FakeResumeDao : ResumeDao {
             current.cleanupToken != null ||
             current.completingFinalDigest != null || current.confirmedBytes != current.fileSize ||
             current.generation != generation || current.storageKind != storageKind ||
-            current.storageValue != storageValue
+            current.storageValue != storageValue || current.sessionToken != token
         ) return 0
         incoming[transferId] = current.copy(
             completingFinalDigest = finalDigest, updatedAt = now, expiresAt = expiresAt
@@ -617,14 +695,14 @@ private class FakeResumeDao : ResumeDao {
     }
 
     override suspend fun deleteCompletingIncoming(
-        transferId: String, generation: Long, storageKind: String, storageValue: String,
+        transferId: String, generation: Long, storageKind: String, storageValue: String, token: String,
         finalDigest: ByteArray
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (current.operationState != IncomingOperationState.COMPLETING ||
             current.cleanupToken != null ||
             current.generation != generation || current.storageKind != storageKind ||
-            current.storageValue != storageValue ||
+            current.storageValue != storageValue || current.sessionToken != token ||
             current.completingFinalDigest?.contentEquals(finalDigest) != true
         ) return 0
         incoming.remove(transferId)

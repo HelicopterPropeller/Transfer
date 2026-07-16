@@ -1104,6 +1104,28 @@ class ResumeCoordinatorTest {
     }
 
     @Test
+    fun `completion recovery that loses its lease performs no file side effect`() = runBlocking {
+        val bytes = byteArrayOf(1, 2, 3)
+        val offer = offer(bytes.size.toLong())
+        val store = FakeResumeStore().apply { completionRecoveryLeaseAvailable = false }
+        val files = FakeFiles()
+        val location = files.put(offer.transferId, bytes)
+        val prefix = PrefixDigestScanner.scan(ByteArrayInputStream(bytes), bytes.size.toLong())
+        store.saveIncoming(
+            checkpoint(offer, location, prefix).copy(
+                operationState = IncomingOperationState.COMPLETING,
+                completingFinalDigest = ChunkCodec.sha256(bytes)
+            )
+        )
+
+        assertEquals(0, coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE))
+
+        assertEquals(0, files.completionProbeCount)
+        assertEquals(0, files.publishCount)
+        assertEquals(IncomingOperationState.COMPLETING, store.findIncoming(offer.transferId)?.operationState)
+    }
+
+    @Test
     fun `v3 completing pending file derives persists digest then publishes once`() = runBlocking {
         val bytes = byteArrayOf(3, 4, 5)
         val offer = offer(bytes.size.toLong())
@@ -1284,6 +1306,7 @@ private class FakeResumeStore : ResumeStore {
     var clearStaleDuringBeginCompletion = false
     var clearedDuringCompletion = -1
     var failReceiptCompletionOnce = false
+    var completionRecoveryLeaseAvailable = true
 
     override suspend fun findIncoming(transferId: String) = incoming[transferId]
     override suspend fun saveIncoming(checkpoint: IncomingCheckpoint) { incoming[checkpoint.transferId] = checkpoint }
@@ -1402,6 +1425,27 @@ private class FakeResumeStore : ResumeStore {
     }
     override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
         incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
+    override suspend fun acquireCompletingRecovery(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        staleClaimBefore: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? {
+        if (!completionRecoveryLeaseAvailable) return null
+        val current = incoming[expected.transferId] ?: return null
+        if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            (current.sessionToken != null && current.sessionClaimedAt != null &&
+                current.sessionClaimedAt >= staleClaimBefore)
+        ) return null
+        return current.copy(
+            sessionToken = token,
+            sessionClaimedAt = now,
+            updatedAt = now,
+            expiresAt = expiresAt
+        ).also { incoming[expected.transferId] = it }
+    }
     override suspend fun persistRecoveredCompletingDigest(
         expected: IncomingCheckpoint,
         finalDigest: ByteArray,
@@ -1411,7 +1455,8 @@ private class FakeResumeStore : ResumeStore {
         val current = incoming[expected.transferId] ?: return null
         if (current.operationState != IncomingOperationState.COMPLETING ||
             current.completingFinalDigest != null || current.confirmedBytes != current.fileSize ||
-            current.generation != expected.generation || current.storageValue != expected.storageValue
+            current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.sessionToken != expected.sessionToken
         ) return null
         val updated = current.copy(
             completingFinalDigest = finalDigest.copyOf(), updatedAt = now, expiresAt = expiresAt
@@ -1423,7 +1468,8 @@ private class FakeResumeStore : ResumeStore {
     override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean {
         val current = incoming[expected.transferId] ?: return false
         if (current.operationState != IncomingOperationState.COMPLETING ||
-            current.generation != expected.generation || current.storageValue != expected.storageValue
+            current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.sessionToken != expected.sessionToken
         ) return false
         incoming.remove(expected.transferId)
         return true
@@ -1447,6 +1493,7 @@ private class FakeResumeStore : ResumeStore {
         val current = incoming[expected.transferId] ?: return false
         if (current.operationState != IncomingOperationState.COMPLETING ||
             current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.sessionToken != expected.sessionToken ||
             current.completingFinalDigest?.contentEquals(receipt.finalDigest) != true
         ) return false
         receipts[receipt.transferId] = receipt
@@ -1586,6 +1633,7 @@ private class FakeFiles : ResumableIncomingFileStore {
     var crashAfterPublish = false
     var failBeforePublishOnce = false
     var publishCount = 0
+    var completionProbeCount = 0
     var openInputFailure: Exception? = null
     var failCreatedHandleClose = false
     val failDeleteValues = mutableSetOf<String>()
@@ -1654,8 +1702,10 @@ private class FakeFiles : ResumableIncomingFileStore {
         location: StoredFileLocation,
         displayName: String,
         expectedDigest: ByteArray?
-    ): String? =
-        if (location in published) "fake://${location.value}" else null
+    ): String? {
+        completionProbeCount++
+        return if (location in published) "fake://${location.value}" else null
+    }
     override suspend fun delete(location: StoredFileLocation) {
         if (location.value in cancelDeleteValues) throw CancellationException("delete cancelled")
         if (location.value in failDeleteValues) throw IllegalStateException("delete failed")

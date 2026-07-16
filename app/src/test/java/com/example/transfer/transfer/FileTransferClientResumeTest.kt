@@ -36,7 +36,7 @@ import org.junit.Test
 
 class FileTransferClientResumeTest {
     @Test
-    fun `query reports an explicit incompatibility when a v3 receiver rejects the v4 preamble`() = runBlocking {
+    fun `query reports a possible incompatibility without misclassifying a fatal disconnect`() = runBlocking {
         val offer = offer(fileSize = 1)
         val server = ServerSocket(0)
         val serverJob = async(Dispatchers.IO) {
@@ -56,7 +56,10 @@ class FileTransferClientResumeTest {
         }.exceptionOrNull()
 
         assertTrue(error is ProtocolException)
-        assertEquals("对端协议版本不兼容，请将两台设备都升级到最新版", error?.message)
+        assertEquals(
+            "对端未返回完整的 v4 响应，可能协议版本不兼容或连接已中断",
+            error?.message
+        )
         serverJob.await()
         server.close()
     }

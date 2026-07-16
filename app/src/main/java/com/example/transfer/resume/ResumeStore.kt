@@ -38,6 +38,13 @@ interface ResumeStore {
         expiresAt: Long
     ): Boolean = error("beginIncomingCompletion is not implemented")
     suspend fun findCompletingIncoming(): List<IncomingCheckpoint> = emptyList()
+    suspend fun acquireCompletingRecovery(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        staleClaimBefore: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? = error("acquireCompletingRecovery is not implemented")
     suspend fun persistRecoveredCompletingDigest(
         expected: IncomingCheckpoint,
         finalDigest: ByteArray,
@@ -211,6 +218,20 @@ class RoomResumeStore(
     override suspend fun findCompletingIncoming(): List<IncomingCheckpoint> =
         dao.findCompletingIncoming().map { it.toDomain() }
 
+    override suspend fun acquireCompletingRecovery(
+        expected: IncomingCheckpoint,
+        token: String,
+        now: Long,
+        staleClaimBefore: Long,
+        expiresAt: Long
+    ): IncomingCheckpoint? {
+        val acquired = dao.acquireCompletingRecovery(
+            expected.transferId, expected.generation, expected.storageKind,
+            expected.storageValue, token, now, staleClaimBefore, expiresAt
+        ) > 0
+        return if (acquired) dao.findIncoming(expected.transferId)?.toDomain() else null
+    }
+
     override suspend fun persistRecoveredCompletingDigest(
         expected: IncomingCheckpoint,
         finalDigest: ByteArray,
@@ -219,7 +240,7 @@ class RoomResumeStore(
     ): IncomingCheckpoint? {
         val updated = dao.persistRecoveredCompletingDigest(
             expected.transferId, expected.generation, expected.storageKind,
-            expected.storageValue, finalDigest, now, expiresAt
+            expected.storageValue, requireNotNull(expected.sessionToken), finalDigest, now, expiresAt
         ) > 0
         return if (updated) dao.findIncoming(expected.transferId)?.toDomain() else null
     }
@@ -227,7 +248,7 @@ class RoomResumeStore(
     override suspend fun deleteCompletingIncoming(expected: IncomingCheckpoint): Boolean =
         dao.deleteCompletingIncoming(
             expected.transferId, expected.generation, expected.storageKind, expected.storageValue,
-            requireNotNull(expected.completingFinalDigest)
+            requireNotNull(expected.sessionToken), requireNotNull(expected.completingFinalDigest)
         ) > 0
 
     override suspend fun findCompletedReceipt(transferId: String, now: Long): CompletedReceipt? =
@@ -237,7 +258,8 @@ class RoomResumeStore(
         expected: IncomingCheckpoint,
         receipt: CompletedReceipt
     ): Boolean = dao.recordCompletedReceiptAndDelete(
-        receipt.toEntity(), expected.generation, expected.storageKind, expected.storageValue
+        receipt.toEntity(), expected.generation, expected.storageKind, expected.storageValue,
+        requireNotNull(expected.sessionToken)
     )
 
     override suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean {
