@@ -520,7 +520,10 @@ private class MigrationRecoveryFiles(private val bytes: ByteArray) : ResumableIn
         displayName: String
     ): InputStream? = if (location == this.location) ByteArrayInputStream(bytes) else null
 
-    override suspend fun publish(handle: ResumableFileHandle): String {
+    override suspend fun publish(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray?
+    ): String {
         publishCount++
         return "content://received/${handle.displayName}"
     }

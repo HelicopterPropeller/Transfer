@@ -12,6 +12,9 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -164,7 +167,10 @@ class DownloadStorage(private val context: Context) :
         }
     }
 
-    override suspend fun publish(handle: ResumableFileHandle): String? =
+    override suspend fun publish(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray?
+    ): String? =
         withContext(Dispatchers.IO) {
             when (handle.location.kind) {
                 StoredFileLocation.MEDIA_STORE -> {
@@ -181,14 +187,15 @@ class DownloadStorage(private val context: Context) :
                     }
                     publishMediaStoreFile(handle)
                 }
-                StoredFileLocation.LEGACY_FILE -> publishLegacyFile(handle)
+                StoredFileLocation.LEGACY_FILE -> publishLegacyFile(handle, expectedDigest)
                 else -> error("Unsupported stored file location: ${handle.location.kind}")
             }
         }
 
     override suspend fun recoverPublished(
         location: StoredFileLocation,
-        displayName: String
+        displayName: String,
+        expectedDigest: ByteArray?
     ): String? = withContext(Dispatchers.IO) {
         when (location.kind) {
             StoredFileLocation.MEDIA_STORE -> {
@@ -207,8 +214,14 @@ class DownloadStorage(private val context: Context) :
             }
             StoredFileLocation.LEGACY_FILE -> {
                 val partial = checkedLegacyFile(location)
-                val published = legacyPublishedFile(location, displayName)
-                if (!partial.exists() && published.isFile) {
+                val published = if (expectedDigest == null) {
+                    legacyPublishedFile(location, displayName).takeIf {
+                        !partial.exists() && it.isFile
+                    }
+                } else {
+                    LegacyDownloadFiles.recoverPublished(partial, displayName, expectedDigest)
+                }
+                if (published != null) {
                     FileProvider.getUriForFile(
                         context, "${context.packageName}.files", published
                     ).toString()
@@ -409,17 +422,75 @@ class DownloadStorage(private val context: Context) :
         closeResources = randomAccessFile::close
     )
 
-    private fun publishLegacyFile(handle: ResumableFileHandle): String {
+    private fun publishLegacyFile(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray?
+    ): String {
         val partialFile = checkedLegacyFile(handle.location)
-        val publishedFile = legacyPublishedFile(handle.location, handle.displayName)
         handle.close()
-        check(!publishedFile.exists()) { "Published download already exists" }
-        check(partialFile.renameTo(publishedFile)) { "Unable to publish received file" }
+        val digest = expectedDigest ?: LegacyDownloadFiles.sha256(partialFile)
+        val publishedFile = LegacyDownloadFiles.publishWithoutOverwrite(
+            partialFile,
+            handle.displayName,
+            digest,
+            ::copyLegacyFileExclusively
+        )
         return FileProvider.getUriForFile(
             context,
             "${context.packageName}.files",
             publishedFile
         ).toString()
+    }
+
+    private fun copyLegacyFileExclusively(source: File, target: File): Boolean {
+        val descriptor = try {
+            Os.open(
+                target.path,
+                OsConstants.O_WRONLY or OsConstants.O_CREAT or OsConstants.O_EXCL,
+                LEGACY_FILE_MODE
+            )
+        } catch (error: ErrnoException) {
+            if (error.errno == OsConstants.EEXIST) return false
+            throw IOException("Unable to reserve published download", error)
+        }
+        val owned = try {
+            Os.fstat(descriptor)
+        } catch (error: ErrnoException) {
+            runCatching { Os.close(descriptor) }
+            throw IOException("Unable to inspect published download", error)
+        }
+        var output: FileOutputStream? = null
+        try {
+            val stream = FileOutputStream(descriptor)
+            output = stream
+            FileInputStream(source).use { input -> input.copyTo(stream) }
+            stream.fd.sync()
+            val current = Os.stat(target.path)
+            if (owned.st_dev != current.st_dev || owned.st_ino != current.st_ino) {
+                throw IOException("Published download path changed during copy")
+            }
+            stream.close()
+            output = null
+            return true
+        } catch (failure: Throwable) {
+            try {
+                val current = Os.stat(target.path)
+                if (owned.st_dev == current.st_dev && owned.st_ino == current.st_ino) {
+                    Os.remove(target.path)
+                }
+            } catch (cleanup: ErrnoException) {
+                if (cleanup.errno != OsConstants.ENOENT) failure.addSuppressed(cleanup)
+            }
+            throw if (failure is IOException) {
+                failure
+            } else {
+                IOException("Unable to copy published download", failure)
+            }
+        } finally {
+            if (output != null) {
+                runCatching { output.close() }
+            }
+        }
     }
 
     private fun checkedLegacyFile(location: StoredFileLocation): File {
@@ -632,6 +703,7 @@ class DownloadStorage(private val context: Context) :
 
     private companion object {
         val MEDIA_STORE_RELATIVE_PATH = "${Environment.DIRECTORY_DOWNLOADS}/Transfer/"
+        const val LEGACY_FILE_MODE = 438 // 0666, filtered by the filesystem umask.
     }
 }
 

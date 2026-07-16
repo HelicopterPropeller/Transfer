@@ -214,7 +214,7 @@ class ResumeCoordinator(
             expiresAt = expiresAt,
             completingFinalDigest = finalDigest.copyOf()
         )
-        val published = files.publish(active.handle)
+        val published = files.publish(active.handle, finalDigest)
         if (!store.finishIncomingCompletion(
                 completing,
                 completing.toReceipt(finalDigest, published, now)
@@ -291,13 +291,13 @@ class ResumeCoordinator(
                 val checkpoint = recoverCompletingDigest(original) ?: return@forEach
                 val finalDigest = checkpoint.completingFinalDigest ?: return@forEach
                 val alreadyPublished = files.recoverPublished(
-                    checkpoint.location.toStoredLocation(), checkpoint.displayName
+                    checkpoint.location.toStoredLocation(), checkpoint.displayName, finalDigest
                 )
                 val published = if (alreadyPublished == null) {
                     val handle = files.reopen(
                         checkpoint.location.toStoredLocation(), checkpoint.displayName
                     ) ?: return@forEach
-                    files.publish(handle)
+                    files.publish(handle, finalDigest)
                 } else alreadyPublished
                 val completedAt = clock()
                 if (store.finishIncomingCompletion(

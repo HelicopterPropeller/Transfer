@@ -43,8 +43,15 @@ interface ResumableIncomingFileStore {
         location: StoredFileLocation,
         displayName: String
     ): InputStream? = openInput(location)
-    suspend fun publish(handle: ResumableFileHandle): String?
+    suspend fun publish(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray? = null
+    ): String?
     /** Returns the result of an already-completed publish without publishing a second file. */
-    suspend fun recoverPublished(location: StoredFileLocation, displayName: String): String? = null
+    suspend fun recoverPublished(
+        location: StoredFileLocation,
+        displayName: String,
+        expectedDigest: ByteArray? = null
+    ): String? = null
     suspend fun delete(location: StoredFileLocation)
 }

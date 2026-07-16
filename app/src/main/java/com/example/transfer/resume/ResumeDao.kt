@@ -190,7 +190,10 @@ interface ResumeDao {
         finalDigest: ByteArray, now: Long, expiresAt: Long
     ): Int
 
-    @Query("SELECT * FROM incoming_checkpoints WHERE operationState = 'COMPLETING'")
+    @Query(
+        "SELECT * FROM incoming_checkpoints " +
+            "WHERE operationState = 'COMPLETING' AND cleanupToken IS NULL"
+    )
     suspend fun findCompletingIncoming(): List<IncomingCheckpointEntity>
 
     @Query(
@@ -200,7 +203,7 @@ interface ResumeDao {
         WHERE transferId = :transferId AND generation = :generation
           AND storageKind = :storageKind AND storageValue = :storageValue
           AND confirmedBytes = fileSize AND operationState = 'COMPLETING'
-          AND completingFinalDigest IS NULL
+          AND completingFinalDigest IS NULL AND cleanupToken IS NULL
         """
     )
     suspend fun persistRecoveredCompletingDigest(
@@ -219,6 +222,7 @@ interface ResumeDao {
         WHERE transferId = :transferId AND generation = :generation
           AND storageKind = :storageKind AND storageValue = :storageValue
           AND operationState = 'COMPLETING' AND completingFinalDigest = :finalDigest
+          AND cleanupToken IS NULL
         """
     )
     suspend fun deleteCompletingIncoming(
@@ -250,14 +254,14 @@ interface ResumeDao {
         storageKind: String,
         storageValue: String
     ): Boolean {
-        insertCompletedReceipt(receipt)
-        val actual = findCompletedReceipt(receipt.transferId)
-        check(actual != null && actual.sameValue(receipt)) { "Completed receipt identity conflict" }
         check(
             deleteCompletingIncoming(
                 receipt.transferId, generation, storageKind, storageValue, receipt.finalDigest
             ) > 0
         ) { "Completing checkpoint changed" }
+        insertCompletedReceipt(receipt)
+        val actual = findCompletedReceipt(receipt.transferId)
+        check(actual != null && actual.sameValue(receipt)) { "Completed receipt identity conflict" }
         return true
     }
 
@@ -387,7 +391,16 @@ interface ResumeDao {
         UPDATE incoming_checkpoints
         SET cleanupToken = :token, cleanupClaimedAt = :now
         WHERE expiresAt <= :now
-          AND sessionToken IS NULL AND operationState = 'IDLE'
+          AND (
+            (operationState = 'IDLE' AND sessionToken IS NULL)
+            OR (
+              operationState = 'COMPLETING'
+              AND (
+                sessionToken IS NULL OR sessionClaimedAt IS NULL
+                OR sessionClaimedAt < :staleClaimBefore
+              )
+            )
+          )
           AND (cleanupToken IS NULL OR cleanupClaimedAt < :staleClaimBefore)
         """
     )

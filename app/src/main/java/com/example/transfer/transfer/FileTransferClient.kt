@@ -5,6 +5,7 @@ import com.example.transfer.protocol.ConnectionKind
 import com.example.transfer.protocol.ConnectionProtocol
 import com.example.transfer.protocol.DigestChain
 import com.example.transfer.protocol.PrefixDigest
+import com.example.transfer.protocol.ProtocolException
 import com.example.transfer.protocol.ResumeProtocol
 import com.example.transfer.protocol.ResumeState
 import com.example.transfer.protocol.ResumeStatus
@@ -56,7 +57,7 @@ class FileTransferClient {
                 ConnectionProtocol.writePreamble(output, ConnectionKind.RESUME_QUERY)
                 ResumeProtocol.writeOffer(output, offer)
                 output.flush()
-                ResumeProtocol.readStatus(input, offer)
+                readResumeStatus(input, offer)
             }
         } finally {
             clearOperation(operation.id)
@@ -217,6 +218,23 @@ class FileTransferClient {
             throw ResumeValidationException("Source prefix does not match receiver checkpoint")
         }
         return PreparedStream(prefix.scannedBytes, prefix.nextChunkIndex, prefix.wholeDigest)
+    }
+
+    private fun readResumeStatus(
+        input: DataInputStream,
+        offer: TransferOffer
+    ): ResumeStatus {
+        input.mark(1)
+        val firstResponse = input.readUnsignedByte()
+        input.reset()
+        return try {
+            ResumeProtocol.readStatus(input, offer)
+        } catch (_: EOFException) {
+            if (firstResponse == TransferProtocol.FATAL) {
+                throw ProtocolException("对端协议版本不兼容，请将两台设备都升级到最新版")
+            }
+            throw ProtocolException("Receiver closed the resume response early")
+        }
     }
 
     private fun sendPreparedChunks(

@@ -1159,7 +1159,10 @@ private class SocketFiles : ResumableIncomingFileStore {
         }
     }
 
-    override suspend fun publish(handle: ResumableFileHandle): String {
+    override suspend fun publish(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray?
+    ): String {
         publishCount++
         published = true
         publishBarrier?.also { barrier ->

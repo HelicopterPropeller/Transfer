@@ -60,7 +60,10 @@ class ResumableFileStoreContractTest {
         override suspend fun openInput(location: StoredFileLocation): InputStream? =
             files[location]?.let { ByteArrayInputStream(it.bytes) }
 
-        override suspend fun publish(handle: ResumableFileHandle): String {
+        override suspend fun publish(
+            handle: ResumableFileHandle,
+            expectedDigest: ByteArray?
+        ): String {
             handle.close()
             return "fake://${handle.location.value}"
         }

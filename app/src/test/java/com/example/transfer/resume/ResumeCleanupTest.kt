@@ -98,6 +98,18 @@ class ResumeCleanupTest {
     }
 
     @Test
+    fun `partial deletion failure still cleans independent expired metadata`() = runBlocking {
+        val store = CleanupStore(listOf(checkpoint("broken")))
+        val cleanup = ResumeCleanup(store, CleanupFiles(fail = true), { now }, { 0L }, {})
+
+        assertThrows<IllegalStateException> { cleanup.runIfDue(force = true) }
+
+        assertEquals(now - ResumeCleanup.RETENTION_MILLIS, store.outgoingCutoff)
+        assertEquals(now, store.receiptExpiryNow)
+        assertEquals(store.claimToken, store.releasedClaimToken)
+    }
+
+    @Test
     fun `cleanup cancellation stops deletion releases claim and rethrows`() = runBlocking {
         val store = CleanupStore(listOf(checkpoint("first"), checkpoint("second")))
         val files = CleanupFiles(cancelValue = "first")
@@ -199,5 +211,8 @@ private class CleanupFiles(
     override suspend fun create(transferId: String, fileName: String, mimeType: String): ResumableFileHandle = error("unused")
     override suspend fun reopen(location: StoredFileLocation, displayName: String): ResumableFileHandle? = error("unused")
     override suspend fun openInput(location: StoredFileLocation): InputStream? = error("unused")
-    override suspend fun publish(handle: ResumableFileHandle): String? = error("unused")
+    override suspend fun publish(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray?
+    ): String? = error("unused")
 }

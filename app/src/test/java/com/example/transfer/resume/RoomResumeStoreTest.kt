@@ -5,6 +5,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -230,6 +231,103 @@ class RoomResumeStoreTest {
     }
 
     @Test
+    fun `cleanup claims an expired completing checkpoint after its lease is stale`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(
+            incoming("t1").copy(
+                expiresAt = 10L,
+                operationState = IncomingOperationState.COMPLETING,
+                sessionToken = "completion",
+                sessionClaimedAt = 20L
+            )
+        )
+
+        val claimed = store.claimExpiredIncoming(100L, 50L, "cleanup")
+
+        assertEquals(listOf("t1"), claimed.map { it.transferId })
+    }
+
+    @Test
+    fun `cleanup cannot claim a completing checkpoint with a recent lease`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(
+            incoming("t1").copy(
+                expiresAt = 10L,
+                operationState = IncomingOperationState.COMPLETING,
+                sessionToken = "completion",
+                sessionClaimedAt = 80L
+            )
+        )
+
+        assertTrue(store.claimExpiredIncoming(100L, 50L, "cleanup").isEmpty())
+    }
+
+    @Test
+    fun `cleanup cannot claim an unowned active checkpoint`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(
+            incoming("t1").copy(
+                expiresAt = 10L,
+                operationState = IncomingOperationState.ACTIVE,
+                sessionToken = null,
+                sessionClaimedAt = null
+            )
+        )
+
+        assertTrue(store.claimExpiredIncoming(100L, 50L, "cleanup").isEmpty())
+    }
+
+    @Test
+    fun `cleanup claimed completing checkpoint is hidden from recovery scan`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(staleCompleting("t1", ByteArray(32)))
+        assertEquals(1, store.claimExpiredIncoming(100L, 50L, "cleanup").size)
+
+        assertTrue(store.findCompletingIncoming().isEmpty())
+    }
+
+    @Test
+    fun `cleanup claimed completing checkpoint rejects recovered digest persistence`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        store.saveIncoming(staleCompleting("t1", finalDigest = null))
+        val beforeClaim = requireNotNull(store.findIncoming("t1"))
+        assertEquals(1, store.claimExpiredIncoming(100L, 50L, "cleanup").size)
+
+        assertNull(
+            store.persistRecoveredCompletingDigest(
+                beforeClaim, ByteArray(32), now = 101L, expiresAt = 200L
+            )
+        )
+    }
+
+    @Test
+    fun `cleanup claimed completing checkpoint rejects receipt completion`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        val digest = ByteArray(32)
+        store.saveIncoming(staleCompleting("t1", digest))
+        val beforeClaim = requireNotNull(store.findIncoming("t1"))
+        assertEquals(1, store.claimExpiredIncoming(100L, 50L, "cleanup").size)
+        val receipt = CompletedReceipt(
+            transferId = beforeClaim.transferId,
+            senderDeviceId = beforeClaim.senderDeviceId,
+            fileName = beforeClaim.fileName,
+            mimeType = beforeClaim.mimeType,
+            fileSize = beforeClaim.fileSize,
+            chunkSize = beforeClaim.chunkSize,
+            finalDigest = digest,
+            publishedUri = "fake://received/a.bin",
+            publishedName = beforeClaim.displayName,
+            completedAt = 101L,
+            expiresAt = 200L
+        )
+
+        assertThrows(IllegalStateException::class.java) {
+            runBlocking { store.finishIncomingCompletion(beforeClaim, receipt) }
+        }
+        assertNull(store.findCompletedReceipt("t1", now = 101L))
+    }
+
+    @Test
     fun `heartbeat advances active lease and completing is never stale-cleared`() = runBlocking {
         val store = RoomResumeStore(FakeResumeDao())
         val original = incoming("t1")
@@ -342,6 +440,19 @@ class RoomResumeStoreTest {
         createdAt = 10L,
         updatedAt = 10L,
         expiresAt = 100L
+    )
+
+    private fun staleCompleting(
+        transferId: String,
+        finalDigest: ByteArray?
+    ) = incoming(transferId).copy(
+        confirmedBytes = 32L,
+        nextChunkIndex = 4,
+        expiresAt = 10L,
+        operationState = IncomingOperationState.COMPLETING,
+        sessionToken = "completion",
+        sessionClaimedAt = 20L,
+        completingFinalDigest = finalDigest
     )
 
     private fun outgoing(
@@ -479,7 +590,9 @@ private class FakeResumeDao : ResumeDao {
     }
 
     override suspend fun findCompletingIncoming(): List<IncomingCheckpointEntity> =
-        incoming.values.filter { it.operationState == IncomingOperationState.COMPLETING }
+        incoming.values.filter {
+            it.operationState == IncomingOperationState.COMPLETING && it.cleanupToken == null
+        }
 
     override suspend fun persistRecoveredCompletingDigest(
         transferId: String,
@@ -492,6 +605,7 @@ private class FakeResumeDao : ResumeDao {
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.cleanupToken != null ||
             current.completingFinalDigest != null || current.confirmedBytes != current.fileSize ||
             current.generation != generation || current.storageKind != storageKind ||
             current.storageValue != storageValue
@@ -508,6 +622,7 @@ private class FakeResumeDao : ResumeDao {
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (current.operationState != IncomingOperationState.COMPLETING ||
+            current.cleanupToken != null ||
             current.generation != generation || current.storageKind != storageKind ||
             current.storageValue != storageValue ||
             current.completingFinalDigest?.contentEquals(finalDigest) != true
@@ -704,8 +819,14 @@ private class FakeResumeDao : ResumeDao {
         token: String
     ): Int {
         val eligible = incoming.values.filter {
+            val idle =
+                it.operationState == IncomingOperationState.IDLE && it.sessionToken == null
+            val staleCompleting = it.operationState == IncomingOperationState.COMPLETING && (
+                it.sessionToken == null || it.sessionClaimedAt == null ||
+                    it.sessionClaimedAt < staleClaimBefore
+                )
             it.expiresAt <= now &&
-                it.sessionToken == null &&
+                (idle || staleCompleting) &&
                 (it.cleanupToken == null || (it.cleanupClaimedAt ?: Long.MIN_VALUE) < staleClaimBefore)
         }
         eligible.forEach { entity ->

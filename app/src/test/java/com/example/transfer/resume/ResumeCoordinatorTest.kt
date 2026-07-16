@@ -1634,7 +1634,10 @@ private class FakeFiles : ResumableIncomingFileStore {
         displayName: String
     ): InputStream? = openInputFailure?.let { throw it } ?:
         (entries[location] ?: publishedEntries[location])?.let { ByteArrayInputStream(it.bytes) }
-    override suspend fun publish(handle: ResumableFileHandle): String {
+    override suspend fun publish(
+        handle: ResumableFileHandle,
+        expectedDigest: ByteArray?
+    ): String {
         if (failBeforePublishOnce) {
             failBeforePublishOnce = false
             throw IllegalStateException("publish failed before effect")
@@ -1647,7 +1650,11 @@ private class FakeFiles : ResumableIncomingFileStore {
         if (crashAfterPublish) throw SimulatedProcessDeath()
         return "fake://${handle.location.value}"
     }
-    override suspend fun recoverPublished(location: StoredFileLocation, displayName: String): String? =
+    override suspend fun recoverPublished(
+        location: StoredFileLocation,
+        displayName: String,
+        expectedDigest: ByteArray?
+    ): String? =
         if (location in published) "fake://${location.value}" else null
     override suspend fun delete(location: StoredFileLocation) {
         if (location.value in cancelDeleteValues) throw CancellationException("delete cancelled")

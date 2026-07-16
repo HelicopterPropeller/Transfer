@@ -47,10 +47,31 @@ class ResumeCleanup(
                     }
                 }
             }
-            deletionError?.let { throw it }
-            store.deleteClaimedIncoming(token)
-            store.deleteExpiredOutgoing(now - RETENTION_MILLIS)
-            store.deleteExpiredCompletedReceipts(now)
+            var cleanupError = deletionError
+            if (cleanupError == null) {
+                try {
+                    store.deleteClaimedIncoming(token)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    cleanupError = appendFailure(cleanupError, error)
+                }
+            }
+            try {
+                store.deleteExpiredOutgoing(now - RETENTION_MILLIS)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                cleanupError = appendFailure(cleanupError, error)
+            }
+            try {
+                store.deleteExpiredCompletedReceipts(now)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                cleanupError = appendFailure(cleanupError, error)
+            }
+            cleanupError?.let { throw it }
             saveLastRun(now)
             return expired.size
         } catch (error: CancellationException) {
@@ -68,6 +89,12 @@ class ResumeCleanup(
         } catch (releaseError: Exception) {
             error.addSuppressed(releaseError)
         }
+    }
+
+    private fun appendFailure(current: Exception?, next: Exception): Exception {
+        if (current == null) return next
+        current.addSuppressed(next)
+        return current
     }
 
     companion object {

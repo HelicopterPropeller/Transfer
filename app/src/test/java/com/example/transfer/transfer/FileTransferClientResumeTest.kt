@@ -4,6 +4,7 @@ import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.ConnectionKind
 import com.example.transfer.protocol.ConnectionProtocol
 import com.example.transfer.protocol.PrefixDigestScanner
+import com.example.transfer.protocol.ProtocolException
 import com.example.transfer.protocol.ResumeProtocol
 import com.example.transfer.protocol.ResumeState
 import com.example.transfer.protocol.ResumeStatus
@@ -34,6 +35,32 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class FileTransferClientResumeTest {
+    @Test
+    fun `query reports an explicit incompatibility when a v3 receiver rejects the v4 preamble`() = runBlocking {
+        val offer = offer(fileSize = 1)
+        val server = ServerSocket(0)
+        val serverJob = async(Dispatchers.IO) {
+            server.accept().use { socket ->
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                input.readInt() // A v3 receiver mistakes the LTF4 magic for its header length.
+                output.writeByte(TransferProtocol.FATAL)
+                output.flush()
+            }
+        }
+
+        val error = runCatching {
+            FileTransferClient().queryResume(
+                InetAddress.getLoopbackAddress(), server.localPort, offer
+            )
+        }.exceptionOrNull()
+
+        assertTrue(error is ProtocolException)
+        assertEquals("对端协议版本不兼容，请将两台设备都升级到最新版", error?.message)
+        serverJob.await()
+        server.close()
+    }
+
     @Test
     fun `client sends no chunk until receiver replies ready`() = runBlocking {
         val bytes = byteArrayOf(4, 5, 6)
