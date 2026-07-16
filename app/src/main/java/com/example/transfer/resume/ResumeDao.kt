@@ -91,7 +91,8 @@ interface ResumeDao {
     @Query(
         """
         UPDATE incoming_checkpoints
-        SET displayName = :displayName, mimeType = :mimeType, fileSize = :fileSize,
+        SET senderDeviceId = :senderDeviceId, fileName = :fileName,
+            displayName = :displayName, mimeType = :mimeType, fileSize = :fileSize,
             chunkSize = :chunkSize, confirmedBytes = 0, nextChunkIndex = 0,
             chainDigest = :chainDigest, lastChunkHash = :lastChunkHash,
             storageKind = :newStorageKind, storageValue = :newStorageValue,
@@ -109,10 +110,20 @@ interface ResumeDao {
         expectedStorageKind: String, expectedStorageValue: String,
         expectedNextChunkIndex: Int, newGeneration: Long,
         newStorageKind: String, newStorageValue: String, displayName: String,
-        mimeType: String, fileSize: Long, chunkSize: Int,
+        senderDeviceId: String, fileName: String, mimeType: String,
+        fileSize: Long, chunkSize: Int,
         chainDigest: ByteArray, lastChunkHash: ByteArray,
         now: Long, expiresAt: Long
     ): Int
+
+    @Query(
+        """
+        SELECT * FROM incoming_checkpoints
+        WHERE retiredStorageKind IS NOT NULL AND retiredStorageValue IS NOT NULL
+        ORDER BY updatedAt, transferId
+        """
+    )
+    suspend fun findIncomingWithRetiredStorage(): List<IncomingCheckpointEntity>
 
     @Query(
         """

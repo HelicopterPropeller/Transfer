@@ -53,6 +53,7 @@ interface ResumeStore {
     ): Boolean = error("finishIncomingCompletion is not implemented")
     suspend fun clearRetiredIncomingForRecovery(expected: IncomingCheckpoint): Boolean =
         error("clearRetiredIncomingForRecovery is not implemented")
+    suspend fun findIncomingWithRetiredStorage(): List<IncomingCheckpoint> = emptyList()
     suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean =
         error("insertStagingJournal is not implemented")
     suspend fun findStagingJournals(): List<IncomingStagingJournal> = emptyList()
@@ -161,6 +162,8 @@ class RoomResumeStore(
         newStorageKind = replacement.storageKind,
         newStorageValue = replacement.storageValue,
         displayName = replacement.displayName,
+        senderDeviceId = replacement.senderDeviceId,
+        fileName = replacement.fileName,
         mimeType = replacement.mimeType,
         fileSize = replacement.fileSize,
         chunkSize = replacement.chunkSize,
@@ -244,6 +247,9 @@ class RoomResumeStore(
             retired.kind, retired.value
         ) > 0
     }
+
+    override suspend fun findIncomingWithRetiredStorage(): List<IncomingCheckpoint> =
+        dao.findIncomingWithRetiredStorage().map { it.toDomain() }
 
     override suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean =
         dao.insertStagingJournal(journal.toEntity()) != -1L

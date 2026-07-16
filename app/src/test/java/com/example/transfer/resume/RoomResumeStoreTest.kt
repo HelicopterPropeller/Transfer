@@ -10,6 +10,43 @@ import org.junit.Test
 
 class RoomResumeStoreTest {
     @Test
+    fun `restart replacement persists every offered identity field`() = runBlocking {
+        val store = RoomResumeStore(FakeResumeDao())
+        val original = incoming("t1").copy(
+            senderDeviceId = "old-sender",
+            fileName = "old.bin",
+            sessionToken = "owner",
+            sessionClaimedAt = 20L,
+            operationState = IncomingOperationState.ACTIVE
+        )
+        store.saveIncoming(original)
+        val replacement = original.copy(
+            senderDeviceId = "new-sender",
+            fileName = "new.bin",
+            displayName = "new (1).bin",
+            mimeType = "application/new",
+            fileSize = 64L,
+            chunkSize = 16,
+            confirmedBytes = 0L,
+            nextChunkIndex = 0,
+            storageValue = "content://pending/replacement",
+            generation = original.generation + 1,
+            retiredStorageKind = original.storageKind,
+            retiredStorageValue = original.storageValue
+        )
+
+        assertTrue(store.replaceIncomingForRestart(original, replacement, "owner"))
+
+        val persisted = requireNotNull(store.findIncoming("t1"))
+        assertEquals(replacement.senderDeviceId, persisted.senderDeviceId)
+        assertEquals(replacement.fileName, persisted.fileName)
+        assertEquals(replacement.displayName, persisted.displayName)
+        assertEquals(replacement.mimeType, persisted.mimeType)
+        assertEquals(replacement.fileSize, persisted.fileSize)
+        assertEquals(replacement.chunkSize, persisted.chunkSize)
+    }
+
+    @Test
     fun `resume link key is source uri plus peer id`() = runBlocking {
         val dao = FakeResumeDao()
         val store = RoomResumeStore(dao)
@@ -536,13 +573,15 @@ private class FakeResumeDao : ResumeDao {
         transferId: String, token: String, expectedGeneration: Long,
         expectedStorageKind: String, expectedStorageValue: String,
         expectedNextChunkIndex: Int, newGeneration: Long, newStorageKind: String,
-        newStorageValue: String, displayName: String, mimeType: String,
+        newStorageValue: String, displayName: String, senderDeviceId: String,
+        fileName: String, mimeType: String,
         fileSize: Long, chunkSize: Int, chainDigest: ByteArray,
         lastChunkHash: ByteArray, now: Long, expiresAt: Long
     ): Int {
         val current = incoming[transferId] ?: return 0
         if (!current.ownedBy(token, expectedGeneration, expectedStorageKind, expectedStorageValue, expectedNextChunkIndex)) return 0
         incoming[transferId] = current.copy(
+            senderDeviceId = senderDeviceId, fileName = fileName,
             displayName = displayName, mimeType = mimeType, fileSize = fileSize,
             chunkSize = chunkSize, confirmedBytes = 0, nextChunkIndex = 0,
             chainDigest = chainDigest, lastChunkHash = lastChunkHash,
@@ -552,6 +591,11 @@ private class FakeResumeDao : ResumeDao {
         )
         return 1
     }
+
+    override suspend fun findIncomingWithRetiredStorage(): List<IncomingCheckpointEntity> =
+        incoming.values.filter {
+            it.retiredStorageKind != null && it.retiredStorageValue != null
+        }
 
     override suspend fun clearRetiredIncoming(
         transferId: String, token: String, generation: Long, storageKind: String,

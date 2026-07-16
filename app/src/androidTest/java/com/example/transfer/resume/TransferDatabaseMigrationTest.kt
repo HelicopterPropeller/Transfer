@@ -251,6 +251,46 @@ class TransferDatabaseMigrationTest {
     }
 
     @Test
+    fun realRoomRestartReplacementPersistsNewOfferIdentity() = runBlocking {
+        withResumeDatabase { database ->
+            val store = RoomResumeStore(database.resumeDao())
+            val originalEntity = incomingEntity("restart-identity").copy(
+                senderDeviceId = "old-sender",
+                fileName = "old.bin",
+                sessionToken = "owner",
+                sessionClaimedAt = 20L,
+                operationState = IncomingOperationState.ACTIVE
+            )
+            database.resumeDao().upsertIncoming(originalEntity)
+            val original = requireNotNull(store.findIncoming(originalEntity.transferId))
+            val replacement = original.copy(
+                senderDeviceId = "new-sender",
+                fileName = "new.bin",
+                displayName = "new (1).bin",
+                mimeType = "application/new",
+                fileSize = 64L,
+                chunkSize = 16,
+                confirmedBytes = 0L,
+                nextChunkIndex = 0,
+                storageValue = "content://pending/replacement",
+                generation = original.generation + 1,
+                retiredStorageKind = original.storageKind,
+                retiredStorageValue = original.storageValue
+            )
+
+            assertTrue(store.replaceIncomingForRestart(original, replacement, "owner"))
+
+            val persisted = requireNotNull(store.findIncoming(original.transferId))
+            assertEquals("new-sender", persisted.senderDeviceId)
+            assertEquals("new.bin", persisted.fileName)
+            assertEquals("new (1).bin", persisted.displayName)
+            assertEquals("application/new", persisted.mimeType)
+            assertEquals(64L, persisted.fileSize)
+            assertEquals(16, persisted.chunkSize)
+        }
+    }
+
+    @Test
     fun realRoomCompletionTransactionPersistsReceiptAndDeletesCheckpoint() = runBlocking {
         withResumeDatabase { database ->
             val dao = database.resumeDao()

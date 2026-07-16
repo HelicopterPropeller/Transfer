@@ -761,6 +761,83 @@ class ResumeCoordinatorTest {
     }
 
     @Test
+    fun `restart cancellation after checkpoint switch closes handle and releases replacement ownership`() = runBlocking {
+        val store = FakeResumeStore().apply {
+            journalDeleteFailure = CancellationException("cancel after switch")
+        }
+        val files = FakeFiles().apply { failCreatedHandleClose = true }
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        store.saveIncoming(checkpoint(offer, old))
+        val coordinator = coordinator(store, files)
+
+        val error = assertThrows<CancellationException> {
+            coordinator.openIncoming(
+                offer, TransferStartMode.RESTART, coordinator.queryIncoming(offer)
+            )
+        }
+
+        assertEquals("cancel after switch", error.message)
+        assertEquals("close failed", error.suppressed.single().message)
+        assertTrue(files.createdHandles.single().isClosed)
+        val replacement = requireNotNull(store.findIncoming(offer.transferId))
+        assertEquals(1L, replacement.generation)
+        assertNull(replacement.sessionToken)
+        assertEquals(IncomingOperationState.IDLE, replacement.operationState)
+        assertNull(replacement.retiredStorageValue)
+        assertFalse(files.contains(old))
+        assertEquals(1, store.stagingJournals.size)
+    }
+
+    @Test
+    fun `restart cancellation while deleting retired file keeps durable recovery state`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        files.cancelDeleteValues += old.value
+        store.saveIncoming(checkpoint(offer, old))
+        val coordinator = coordinator(store, files)
+
+        val error = assertThrows<CancellationException> {
+            coordinator.openIncoming(
+                offer, TransferStartMode.RESTART, coordinator.queryIncoming(offer)
+            )
+        }
+
+        assertEquals("delete cancelled", error.message)
+        assertTrue(files.createdHandles.single().isClosed)
+        val replacement = requireNotNull(store.findIncoming(offer.transferId))
+        assertNull(replacement.sessionToken)
+        assertEquals(IncomingOperationState.IDLE, replacement.operationState)
+        assertEquals(old.value, replacement.retiredStorageValue)
+        assertEquals(1, store.stagingJournals.size)
+        assertTrue(files.contains(old))
+    }
+
+    @Test
+    fun `process reopen retries retired cleanup without a staging journal`() = runBlocking {
+        val store = FakeResumeStore()
+        val files = FakeFiles()
+        val offer = offer()
+        val retired = files.put("retired-no-journal", byteArrayOf(1))
+        val current = files.put("current-no-journal", ByteArray(0))
+        store.saveIncoming(
+            checkpoint(offer, current).copy(
+                generation = 2,
+                retiredStorageKind = retired.kind,
+                retiredStorageValue = retired.value
+            )
+        )
+
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+
+        assertFalse(files.contains(retired))
+        assertNull(store.findIncoming(offer.transferId)?.retiredStorageValue)
+        assertTrue(files.contains(current))
+    }
+
+    @Test
     fun `stale commit index throws checkpoint conflict`() = runBlocking {
         val store = FakeResumeStore().apply { allowCommit = false }
         val coordinator = coordinator(store, FakeFiles())
@@ -849,6 +926,37 @@ class ResumeCoordinatorTest {
         assertFalse(files.contains(old))
         assertTrue(files.contains(StoredFileLocation(recovered.storageKind, recovered.storageValue)))
         assertTrue(store.stagingJournals.isEmpty())
+    }
+
+    @Test
+    fun `startup keeps switched journal until retired deletion succeeds even when staging lookup misses`() = runBlocking {
+        val store = FakeResumeStore().apply { crashAfterRestartReplace = true }
+        val files = FakeFiles()
+        val offer = offer()
+        val old = files.put(offer.transferId, byteArrayOf(1))
+        store.saveIncoming(checkpoint(offer, old))
+
+        assertThrows<SimulatedProcessDeath> {
+            coordinator(store, files).openIncoming(
+                offer,
+                TransferStartMode.RESTART,
+                coordinator(store, files).queryIncoming(offer)
+            )
+        }
+        val replacement = requireNotNull(store.findIncoming(offer.transferId))
+        files.forgetStaging(StoredFileLocation(replacement.storageKind, replacement.storageValue))
+        files.failDeleteValues += old.value
+        store.crashAfterRestartReplace = false
+
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+
+        assertEquals(1, store.stagingJournals.size)
+        assertEquals(old.value, store.findIncoming(offer.transferId)?.retiredStorageValue)
+
+        files.failDeleteValues.clear()
+        coordinator(store, files).recoverInterruptedState(Long.MAX_VALUE)
+        assertTrue(store.stagingJournals.isEmpty())
+        assertNull(store.findIncoming(offer.transferId)?.retiredStorageValue)
     }
 
     @Test
@@ -1135,6 +1243,7 @@ private class FakeResumeStore : ResumeStore {
     var allowRelease = true
     var allowJournalInsert = true
     var journalInsertFailure: Throwable? = null
+    var journalDeleteFailure: Throwable? = null
     var releaseFailureAfterClear: Throwable? = null
     var allowExpiryUpdate = true
     var removeAfterExpiryUpdate = false
@@ -1324,6 +1433,8 @@ private class FakeResumeStore : ResumeStore {
         )
         return true
     }
+    override suspend fun findIncomingWithRetiredStorage(): List<IncomingCheckpoint> =
+        incoming.values.filter { it.retiredLocation != null }
     override suspend fun insertStagingJournal(journal: IncomingStagingJournal): Boolean {
         journalInsertFailure?.let { throw it }
         if (!allowJournalInsert) return false
@@ -1333,8 +1444,10 @@ private class FakeResumeStore : ResumeStore {
     }
     override suspend fun findStagingJournals(): List<IncomingStagingJournal> =
         stagingJournals.values.toList()
-    override suspend fun deleteStagingJournal(journal: IncomingStagingJournal): Boolean =
-        stagingJournals.remove(journal.transferId, journal)
+    override suspend fun deleteStagingJournal(journal: IncomingStagingJournal): Boolean {
+        journalDeleteFailure?.let { throw it }
+        return stagingJournals.remove(journal.transferId, journal)
+    }
     override suspend fun deleteOwnedIncoming(expected: IncomingCheckpoint, token: String): Boolean {
         val current = incoming[expected.transferId] ?: return false
         if (current.sessionToken != token || current.generation != expected.generation ||
@@ -1435,6 +1548,7 @@ private class FakeFiles : ResumableIncomingFileStore {
     private val published = mutableSetOf<StoredFileLocation>()
     private val publishedEntries = linkedMapOf<StoredFileLocation, FakeEntry>()
     val deleted = mutableListOf<StoredFileLocation>()
+    val createdHandles = mutableListOf<FakeHandle>()
     var reopenCount = 0
     var failCreate = false
     var crashAfterCreate = false
@@ -1443,10 +1557,15 @@ private class FakeFiles : ResumableIncomingFileStore {
     var failBeforePublishOnce = false
     var publishCount = 0
     var openInputFailure: Exception? = null
+    var failCreatedHandleClose = false
     val failDeleteValues = mutableSetOf<String>()
+    val cancelDeleteValues = mutableSetOf<String>()
 
     fun contains(location: StoredFileLocation) = entries.containsKey(location)
     fun stagingCount() = staging.size
+    fun forgetStaging(location: StoredFileLocation) {
+        staging.entries.removeAll { it.value == location }
+    }
     fun wasPublished(location: StoredFileLocation) = location in published
 
     fun put(id: String, bytes: ByteArray): StoredFileLocation {
@@ -1468,7 +1587,10 @@ private class FakeFiles : ResumableIncomingFileStore {
         staging[transferId] = location
         if (crashAfterCreate) throw SimulatedProcessDeath()
         if (failAfterCreate) throw IllegalStateException("create partially failed")
-        return FakeHandle(location, entry)
+        return FakeHandle(location, entry).also {
+            it.failClose = failCreatedHandleClose
+            createdHandles += it
+        }
     }
     override suspend fun findStaging(transferId: String): StoredFileLocation? = staging[transferId]
     override suspend fun reopen(location: StoredFileLocation, displayName: String): ResumableFileHandle? {
@@ -1498,6 +1620,7 @@ private class FakeFiles : ResumableIncomingFileStore {
     override suspend fun recoverPublished(location: StoredFileLocation, displayName: String): String? =
         if (location in published) "fake://${location.value}" else null
     override suspend fun delete(location: StoredFileLocation) {
+        if (location.value in cancelDeleteValues) throw CancellationException("delete cancelled")
         if (location.value in failDeleteValues) throw IllegalStateException("delete failed")
         deleted += location
         entries.remove(location)
@@ -1514,7 +1637,8 @@ private class FakeHandle(
     override val displayName: String get() = entry.name
     var forced = false
     var failClose = false
-    private var closed = false
+    var isClosed = false
+        private set
     override fun length() = entry.bytes.size.toLong()
     override fun writeAt(offset: Long, source: ByteArray, length: Int) {
         val end = offset.toInt() + length
@@ -1524,7 +1648,7 @@ private class FakeHandle(
     override fun truncate(length: Long) { entry.bytes = entry.bytes.copyOf(length.toInt()) }
     override fun force() { forced = true }
     override fun close() {
-        closed = true
+        isClosed = true
         if (failClose) throw IllegalStateException("close failed")
     }
 }

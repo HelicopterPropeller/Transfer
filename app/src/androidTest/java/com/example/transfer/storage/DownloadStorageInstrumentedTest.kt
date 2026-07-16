@@ -57,6 +57,7 @@ class DownloadStorageInstrumentedTest {
         reopened.close()
 
         storage.delete(created.location)
+        storage.delete(created.location)
         assertNull(storage.reopen(created.location, "resume.bin"))
         assertNull(storage.openInput(created.location))
     }
@@ -80,6 +81,9 @@ class DownloadStorageInstrumentedTest {
             byteArrayOf(4, 5, 6),
             storage.openCompletionInput(created.location, "publish.bin")?.readBytes()
         )
+        assertThrows(SecurityException::class.java) {
+            runBlocking { storage.delete(created.location) }
+        }
 
         resolver.query(
             uri,

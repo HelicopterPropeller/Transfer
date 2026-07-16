@@ -267,14 +267,21 @@ class ResumeCoordinator(
         store.findStagingJournals().forEach { journal ->
             val staged = files.findStaging(journal.stagingId)
             val current = store.findIncoming(journal.transferId)
-            val switched = staged != null && current != null &&
-                current.storageKind == staged.kind && current.storageValue == staged.value
+            val switched = current != null && (
+                (staged != null && current.storageKind == staged.kind &&
+                    current.storageValue == staged.value) ||
+                    journal.stagingId == stagingId(current.transferId, current.generation)
+                )
             if (switched) {
-                recoverRetiredAfterProcessDeath(current!!)
+                if (!recoverRetiredAfterProcessDeath(current!!)) return@forEach
             } else if (staged != null) {
                 files.delete(staged)
             }
             if (store.deleteStagingJournal(journal)) recovered++
+        }
+
+        store.findIncomingWithRetiredStorage().forEach { checkpoint ->
+            if (recoverRetiredAfterProcessDeath(checkpoint)) recovered++
         }
 
         store.findCompletingIncoming().forEach { original ->
@@ -400,23 +407,25 @@ class ResumeCoordinator(
             if (!store.replaceIncomingForRestart(current, replacement, token)) {
                 throw CheckpointConflictException("Incoming checkpoint changed during restart")
             }
+        } catch (error: CancellationException) {
+            cleanupRestartSwitchFailure(current, replacement, handle, journal, token, error)
+            throw error
         } catch (error: Exception) {
-            val removed = cleanupStaged(handle, error)
-            deleteJournalAfterCleanup(journal, removed, error)
-            releaseSessionAfterFailure(current, token, error)
+            cleanupRestartSwitchFailure(current, replacement, handle, journal, token, error)
             throw error
         }
-        deleteJournalAfterSwitch(journal)
         var active = replacement
         try {
             files.delete(current.location.toStoredLocation())
             if (store.clearRetiredIncoming(active, token)) {
                 active = active.copy(retiredStorageKind = null, retiredStorageValue = null)
+                deleteJournalAfterSwitch(journal)
             }
         } catch (cancelled: CancellationException) {
+            cleanupActiveReplacementAfterFailure(replacement, handle, token, cancelled)
             throw cancelled
         } catch (_: Exception) {
-            // Retired location remains durable and is retried by later open/cleanup.
+            // Retired location and staging journal remain durable for startup recovery.
         }
         return IncomingResumeSession(handle, active, prefix, token)
     }
@@ -676,6 +685,63 @@ class ResumeCoordinator(
             }
         } catch (error: Throwable) {
             original.addSuppressed(error)
+        }
+    }
+
+    private suspend fun cleanupRestartSwitchFailure(
+        original: IncomingCheckpoint,
+        replacement: IncomingCheckpoint,
+        handle: ResumableFileHandle,
+        journal: IncomingStagingJournal,
+        token: String,
+        failure: Throwable
+    ) {
+        val switched = try {
+            withContext(NonCancellable) {
+                store.findIncoming(replacement.transferId)?.let { current ->
+                    current.generation == replacement.generation &&
+                        current.storageKind == replacement.storageKind &&
+                        current.storageValue == replacement.storageValue &&
+                        current.sessionToken == token &&
+                        current.operationState == IncomingOperationState.ACTIVE
+                } == true
+            }
+        } catch (lookupError: Throwable) {
+            failure.addSuppressed(lookupError)
+            true
+        }
+        if (switched) {
+            cleanupActiveReplacementAfterFailure(replacement, handle, token, failure)
+            return
+        }
+        withContext(NonCancellable) {
+            val removed = cleanupStaged(handle, failure)
+            deleteJournalAfterCleanup(journal, removed, failure)
+            releaseSessionAfterFailure(original, token, failure)
+        }
+    }
+
+    private suspend fun cleanupActiveReplacementAfterFailure(
+        replacement: IncomingCheckpoint,
+        handle: ResumableFileHandle,
+        token: String,
+        failure: Throwable
+    ) {
+        withContext(NonCancellable) {
+            try {
+                handle.close()
+            } catch (closeError: Throwable) {
+                failure.addSuppressed(closeError)
+            }
+            try {
+                if (!store.releaseIncomingSession(replacement, token)) {
+                    throw CheckpointConflictException(
+                        "Replacement session no longer owns checkpoint"
+                    )
+                }
+            } catch (releaseError: Throwable) {
+                failure.addSuppressed(releaseError)
+            }
         }
     }
 

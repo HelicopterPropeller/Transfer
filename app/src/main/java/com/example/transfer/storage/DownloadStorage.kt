@@ -230,7 +230,21 @@ class DownloadStorage(private val context: Context) :
                     return@withContext
                 }
                 val uri = ownedPendingMediaStoreUri(location) ?: return@withContext
-                context.contentResolver.delete(uri, null, null)
+                val resolver = context.contentResolver
+                val selection =
+                    "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND " +
+                        "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? AND " +
+                        "${MediaStore.MediaColumns.IS_PENDING}=1"
+                val selectionArgs = arrayOf(MEDIA_STORE_RELATIVE_PATH, context.packageName)
+                MediaStoreDeleteVerifier.deleteOwnedPending(
+                    object : MediaStoreDeleteGateway {
+                        override fun delete(): Int =
+                            resolver.delete(uri, selection, selectionArgs)
+
+                        override fun queryState(): MediaStoreDeleteState =
+                            mediaStoreDeleteState(uri)
+                    }
+                )
             }
 
             StoredFileLocation.LEGACY_FILE -> {
@@ -456,15 +470,28 @@ class DownloadStorage(private val context: Context) :
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun ownedMediaStorePendingState(uri: Uri): Boolean? {
+        return when (mediaStoreDeleteState(uri)) {
+            MediaStoreDeleteState.ABSENT -> null
+            MediaStoreDeleteState.UNKNOWN ->
+                throw IOException("Unable to query MediaStore download")
+            MediaStoreDeleteState.OWNED_PENDING -> true
+            MediaStoreDeleteState.OWNED_PUBLISHED -> false
+            MediaStoreDeleteState.UNOWNED ->
+                throw SecurityException("MediaStore item is not an owned Transfer download")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun mediaStoreDeleteState(uri: Uri): MediaStoreDeleteState {
         val projection = arrayOf(
             MediaStore.MediaColumns.RELATIVE_PATH,
             MediaStore.MediaColumns.OWNER_PACKAGE_NAME,
             MediaStore.MediaColumns.IS_PENDING
         )
         val cursor = context.contentResolver.query(uri, projection, null, null, null)
-            ?: return null
+            ?: return MediaStoreDeleteState.UNKNOWN
         cursor.use {
-            if (!it.moveToFirst()) return null
+            if (!it.moveToFirst()) return MediaStoreDeleteState.ABSENT
             val relativePath = it.getString(0)
             val ownerPackageName = it.getString(1)
             val isPending = it.getInt(2)
@@ -472,9 +499,13 @@ class DownloadStorage(private val context: Context) :
                 relativePath != MEDIA_STORE_RELATIVE_PATH ||
                 ownerPackageName != context.packageName
             ) {
-                throw SecurityException("MediaStore item is not an owned Transfer download")
+                return MediaStoreDeleteState.UNOWNED
             }
-            return isPending == 1
+            return if (isPending == 1) {
+                MediaStoreDeleteState.OWNED_PENDING
+            } else {
+                MediaStoreDeleteState.OWNED_PUBLISHED
+            }
         }
     }
 
