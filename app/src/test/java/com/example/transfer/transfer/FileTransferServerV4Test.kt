@@ -127,9 +127,9 @@ class FileTransferServerV4Test {
             )
             assertTrue(result.isSuccess)
             withTimeout(2_000) {
-                while (harness.attemptEvents.none { it.first == "end" }) delay(10)
+                while (harness.attemptEventSnapshot().none { it.first == "end" }) delay(10)
             }
-            val events = harness.attemptEvents.toList()
+            val events = harness.attemptEventSnapshot()
             assertTrue(events.map { it.first }.containsAll(listOf("start", "progress", "complete", "end")))
             assertEquals(1, events.map { it.second }.toSet().size)
         } finally {
@@ -153,9 +153,9 @@ class FileTransferServerV4Test {
                 assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
             }
             withTimeout(2_000) {
-                while (harness.attemptEvents.none { it.first == "end" }) delay(10)
+                while (harness.attemptEventSnapshot().none { it.first == "end" }) delay(10)
             }
-            val events = harness.attemptEvents.toList()
+            val events = harness.attemptEventSnapshot()
             val errorIndex = events.indexOfFirst { it.first == "error" }
             val endIndex = events.indexOfFirst { it.first == "end" }
             assertTrue(errorIndex >= 0)
@@ -468,6 +468,7 @@ class FileTransferServerV4Test {
     fun `stop after lazy child registration releases permit and registry before restart`() = runBlocking {
         val registered = CountDownLatch(1)
         val releaseStart = CountDownLatch(1)
+        val stopEntered = CountDownLatch(1)
         val hookCalls = AtomicInteger()
         val childStarts = AtomicInteger()
         val job = SupervisorJob()
@@ -481,7 +482,8 @@ class FileTransferServerV4Test {
                     registered.countDown()
                     check(releaseStart.await(2, TimeUnit.SECONDS))
                 }
-            }
+            },
+            onServerStopping = { stopEntered.countDown() }
         )
         val firstReady = CompletableDeferred<Int>()
         server.start(scope, { firstReady.complete(it) }, { _, _ -> }, {}, {})
@@ -489,6 +491,7 @@ class FileTransferServerV4Test {
         try {
             assertTrue(registered.await(2, TimeUnit.SECONDS))
             val stopping = async(Dispatchers.IO) { server.stop() }
+            assertTrue(stopEntered.await(2, TimeUnit.SECONDS))
             releaseStart.countDown()
             withTimeout(2_000) { stopping.await() }
             assertEquals(0, server.registeredClientCount())
@@ -1041,6 +1044,10 @@ private class V4Harness(
                 errors += message
             }
         )
+    }
+
+    fun attemptEventSnapshot(): List<Pair<String, Long>> = synchronized(attemptEvents) {
+        attemptEvents.toList()
     }
 
     suspend fun port() = withTimeout(2_000) { ready.await() }

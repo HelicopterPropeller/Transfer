@@ -138,7 +138,7 @@ class TransferForegroundService : Service() {
         }
         server = FileTransferServer(
             resumeCoordinator = resumeCoordinator,
-            onTransferAttemptStart = incomingAttempts::begin,
+            onTransferAttemptStart = ::beginIncomingAttempt,
             onTransferAttemptEnd = ::endIncomingAttempt,
             history = IncomingHistoryRecorder(historyRepository) { address ->
                 val device = state.value.devices.firstOrNull {
@@ -174,20 +174,32 @@ class TransferForegroundService : Service() {
                 serviceScope,
                 { publish { it.copy(serviceMessage = "后台接收服务运行中 · TCP $it") } },
                 { attemptId, name, progress ->
-                    if (incomingAttempts.isCurrent(attemptId)) publish {
-                        it.copy(transfer = ServiceTransfer("接收", name, progress, "正在接收", true))
+                    publish { current ->
+                        if (!incomingAttempts.isCurrent(attemptId) ||
+                            current.transfer?.incomingAttemptId != attemptId
+                        ) current else current.copy(
+                            transfer = ServiceTransfer(
+                                "接收", name, progress, "正在接收", true,
+                                incomingAttemptId = attemptId
+                            )
+                        )
                     }
                 },
                 { attemptId, name ->
-                    if (incomingAttempts.isCurrent(attemptId)) publish {
-                        it.copy(transfer = ServiceTransfer("接收", name, 100, "接收完成", false))
+                    finishIncomingAttempt(attemptId) { current ->
+                        current.copy(
+                            transfer = ServiceTransfer(
+                                "接收", name, 100, "接收完成", false,
+                                incomingAttemptId = attemptId
+                            )
+                        )
                     }
                 },
                 { attemptId, message ->
                     if (attemptId == null) {
                         publish { it.copy(serviceMessage = message) }
-                    } else if (incomingAttempts.isCurrent(attemptId)) {
-                        publish { current ->
+                    } else {
+                        finishIncomingAttempt(attemptId) { current ->
                             val transfer = current.transfer
                             current.copy(
                                 transfer = ServiceTransfer(
@@ -195,7 +207,8 @@ class TransferForegroundService : Service() {
                                     transfer?.fileName.orEmpty(),
                                     transfer?.progress ?: 0,
                                     "$message，可稍后续传",
-                                    false
+                                    false,
+                                    incomingAttemptId = attemptId
                                 )
                             )
                         }
@@ -535,11 +548,23 @@ class TransferForegroundService : Service() {
         busy.set(false)
     }
 
-    private fun endIncomingAttempt(attemptId: Long) {
-        if (!incomingAttempts.finish(attemptId)) return
+    private fun beginIncomingAttempt(attemptId: Long): Boolean {
+        if (!incomingAttempts.begin(attemptId)) return false
         publish { current ->
+            current.copy(
+                transfer = ServiceTransfer(
+                    "接收", "", 0, "正在连接", true,
+                    incomingAttemptId = attemptId
+                )
+            )
+        }
+        return true
+    }
+
+    private fun endIncomingAttempt(attemptId: Long) {
+        finishIncomingAttempt(attemptId) { current ->
             val transfer = current.transfer
-            if (transfer?.direction == "接收" && transfer.active) {
+            if (transfer?.incomingAttemptId == attemptId && transfer.active) {
                 current.copy(
                     transfer = transfer.copy(
                         active = false,
@@ -548,6 +573,17 @@ class TransferForegroundService : Service() {
                 )
             } else {
                 current
+            }
+        }
+    }
+
+    private fun finishIncomingAttempt(
+        attemptId: Long,
+        terminal: (ServiceTransferState) -> ServiceTransferState
+    ) {
+        incomingAttempts.finish(attemptId) {
+            publish { current ->
+                if (current.transfer?.incomingAttemptId == attemptId) terminal(current) else current
             }
         }
     }

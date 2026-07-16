@@ -12,7 +12,8 @@ data class ServiceTransfer(
     val fileIndex: Int = 1,
     val fileCount: Int = 1,
     val batchProgress: Int = progress,
-    val pauseState: TransferPauseState = TransferPauseState.RUNNING
+    val pauseState: TransferPauseState = TransferPauseState.RUNNING,
+    val incomingAttemptId: Long? = null
 )
 
 data class ServiceTransferState(
