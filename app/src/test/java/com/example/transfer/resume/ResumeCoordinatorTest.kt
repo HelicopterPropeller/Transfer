@@ -1436,6 +1436,8 @@ private class FakeResumeStore : ResumeStore {
         val current = incoming[expected.transferId] ?: return null
         if (current.operationState != IncomingOperationState.COMPLETING ||
             current.generation != expected.generation || current.storageValue != expected.storageValue ||
+            current.sessionToken != expected.sessionToken ||
+            current.sessionClaimedAt != expected.sessionClaimedAt ||
             (current.sessionToken != null && current.sessionClaimedAt != null &&
                 current.sessionClaimedAt >= staleClaimBefore)
         ) return null

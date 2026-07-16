@@ -227,7 +227,8 @@ class RoomResumeStore(
     ): IncomingCheckpoint? {
         val acquired = dao.acquireCompletingRecovery(
             expected.transferId, expected.generation, expected.storageKind,
-            expected.storageValue, token, now, staleClaimBefore, expiresAt
+            expected.storageValue, expected.sessionToken, expected.sessionClaimedAt,
+            token, now, staleClaimBefore, expiresAt
         ) > 0
         return if (acquired) dao.findIncoming(expected.transferId)?.toDomain() else null
     }

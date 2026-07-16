@@ -4,6 +4,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.security.MessageDigest
+import java.security.SecureRandom
 
 internal object LegacyDownloadFiles {
     fun stablePublishedName(requestedName: String, partialIdentity: String): String {
@@ -50,6 +51,7 @@ internal object LegacyDownloadFiles {
         partial: File,
         requestedName: String,
         expectedDigest: ByteArray,
+        nonceFactory: () -> String = ::newPublishNonce,
         moveIntoPlace: (source: File, target: File) -> Boolean
     ): File {
         require(expectedDigest.size == SHA_256_SIZE) { "Invalid whole-file digest" }
@@ -58,7 +60,9 @@ internal object LegacyDownloadFiles {
 
         recoverPublished(partial, requestedName, expectedDigest)?.let { return it }
         for (attempt in 0 until MAX_PUBLISH_ATTEMPTS) {
-            val candidate = uniquePublishedCandidate(partial, requestedName, expectedDigest, attempt)
+            val candidate = uniquePublishedCandidate(
+                partial, requestedName, expectedDigest, nonceFactory()
+            )
             if (!moveIntoPlace(partial, candidate)) {
                 if (candidate.isFile && matchesDigest(candidate, expectedDigest)) {
                     if (partial.exists()) {
@@ -81,11 +85,17 @@ internal object LegacyDownloadFiles {
         expectedDigest: ByteArray
     ): File? {
         require(expectedDigest.size == SHA_256_SIZE) { "Invalid whole-file digest" }
-        val candidates = sequenceOf(
-            legacyPublishedCandidate(partial, requestedName)
-        ) + (0 until MAX_PUBLISH_ATTEMPTS).asSequence().map { attempt ->
-            uniquePublishedCandidate(partial, requestedName, expectedDigest, attempt)
+        val directory = checkNotNull(partial.canonicalFile.parentFile) {
+            "Partial download has no parent directory"
         }
+        val marker = uniqueNameMarker(partial, expectedDigest)
+        val currentCandidates = directory.listFiles()
+            .orEmpty()
+            .asSequence()
+            .filter { it.name.contains(marker) }
+            .sortedBy(File::getName)
+        val candidates = sequenceOf(legacyPublishedCandidate(partial, requestedName)) +
+            currentCandidates
         for (candidate in candidates) {
             if (!candidate.isFile || !matchesDigest(candidate, expectedDigest)) continue
             if (partial.exists()) {
@@ -111,20 +121,35 @@ internal object LegacyDownloadFiles {
         partial: File,
         requestedName: String,
         expectedDigest: ByteArray,
-        attempt: Int
+        nonce: String
     ): File {
         val directory = checkNotNull(partial.canonicalFile.parentFile) {
             "Partial download has no parent directory"
         }
-        val identity = stableSuffix(partial.canonicalPath)
-        val digest = expectedDigest.take(DIGEST_NAME_BYTES).toHex()
+        require(nonce.length == NONCE_NAME_BYTES * 2 && nonce.all { it in "0123456789abcdef" }) {
+            "Invalid publish nonce"
+        }
         val name = FileNamePolicy.withTimestamp(
             requestedName,
-            "${identity}_$digest",
-            attempt + 1
+            "${uniqueNameMarker(partial, expectedDigest)}_$nonce",
+            1
         )
         return requireContained(directory, File(directory, name).path)
     }
+
+    private fun uniqueNameMarker(partial: File, expectedDigest: ByteArray): String {
+        val identity = MessageDigest.getInstance("SHA-256")
+            .digest(partial.canonicalPath.toByteArray(Charsets.UTF_8))
+            .take(IDENTITY_NAME_BYTES)
+            .toHex()
+        val digest = expectedDigest.take(DIGEST_NAME_BYTES).toHex()
+        return "${identity}_$digest"
+    }
+
+    private fun newPublishNonce(): String = ByteArray(NONCE_NAME_BYTES)
+        .also(SecureRandom()::nextBytes)
+        .asList()
+        .toHex()
 
     private fun matchesDigest(file: File, expectedDigest: ByteArray): Boolean =
         MessageDigest.isEqual(expectedDigest, sha256(file))
@@ -153,5 +178,7 @@ internal object LegacyDownloadFiles {
 
     private const val SHA_256_SIZE = 32
     private const val DIGEST_NAME_BYTES = 12
+    private const val IDENTITY_NAME_BYTES = 16
+    private const val NONCE_NAME_BYTES = 16
     private const val MAX_PUBLISH_ATTEMPTS = 1_000
 }

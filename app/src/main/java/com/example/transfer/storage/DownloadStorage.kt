@@ -12,6 +12,9 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -430,7 +433,7 @@ class DownloadStorage(private val context: Context) :
             partialFile,
             handle.displayName,
             digest,
-            ::moveLegacyFileIntoPlace
+            moveIntoPlace = ::moveLegacyFileIntoPlace
         )
         return FileProvider.getUriForFile(
             context,
@@ -440,7 +443,27 @@ class DownloadStorage(private val context: Context) :
     }
 
     private fun moveLegacyFileIntoPlace(source: File, target: File): Boolean {
-        if (target.exists()) return false
+        try {
+            Os.link(source.path, target.path)
+            if (!source.delete()) {
+                throw IOException("Unable to remove linked partial download")
+            }
+            return true
+        } catch (error: ErrnoException) {
+            if (error.errno == OsConstants.EEXIST) return false
+            if (error.errno !in setOf(
+                    OsConstants.EPERM,
+                    OsConstants.EOPNOTSUPP,
+                    OsConstants.ENOSYS,
+                    OsConstants.EXDEV
+                )
+            ) {
+                throw IOException("Unable to link published download", error)
+            }
+        }
+
+        // Emulated external storage on Android 7-9 commonly rejects hard links. The target
+        // contains a fresh 128-bit nonce and is never probed before this single rename call.
         if (!source.renameTo(target)) {
             if (target.exists()) return false
             throw IOException("Unable to atomically publish received file")

@@ -97,7 +97,7 @@ class LegacyDownloadFilesTest {
         ).apply { writeBytes(byteArrayOf(9, 9, 9)) }
 
         val published = LegacyDownloadFiles.publishWithoutOverwrite(
-            partial, "report.pdf", digest, ::moveExclusive
+            partial, "report.pdf", digest, moveIntoPlace = ::moveExclusive
         )
 
         assertArrayEquals(byteArrayOf(9, 9, 9), preexisting.readBytes())
@@ -160,22 +160,27 @@ class LegacyDownloadFilesTest {
         val partial = File(directory, ".transfer-d.part").apply { writeBytes(bytes) }
         val digest = sha256(bytes)
         var racedTarget: File? = null
+        val nonces = ArrayDeque(listOf("a".repeat(32), "b".repeat(32)))
         val published = LegacyDownloadFiles.publishWithoutOverwrite(
             partial,
             "notes.txt",
-            digest
-        ) { source, target ->
-            if (racedTarget == null) {
-                target.writeBytes(byteArrayOf(99))
-                racedTarget = target
-                false
-            } else {
-                moveExclusive(source, target)
-            }
-        }
+            digest,
+            moveIntoPlace = { source, target ->
+                if (racedTarget == null) {
+                    target.writeBytes(byteArrayOf(99))
+                    racedTarget = target
+                    false
+                } else {
+                    moveExclusive(source, target)
+                }
+            },
+            nonceFactory = { nonces.removeFirst() }
+        )
 
         assertArrayEquals(byteArrayOf(99), requireNotNull(racedTarget).readBytes())
         assertNotEquals(racedTarget?.canonicalPath, published.canonicalPath)
+        assertTrue(requireNotNull(racedTarget).name.contains("a".repeat(32)))
+        assertTrue(published.name.contains("b".repeat(32)))
         assertArrayEquals(bytes, published.readBytes())
     }
 

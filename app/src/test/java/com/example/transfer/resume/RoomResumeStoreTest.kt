@@ -317,6 +317,12 @@ class RoomResumeStoreTest {
 
         assertEquals("recovery", acquired.sessionToken)
         assertEquals(100L, acquired.sessionClaimedAt)
+        assertNull(
+            store.acquireCompletingRecovery(
+                discovered, "second-recovery", now = 101L,
+                staleClaimBefore = Long.MAX_VALUE, expiresAt = 200L
+            )
+        )
         assertTrue(store.claimExpiredIncoming(110L, 50L, "cleanup").isEmpty())
         val receipt = CompletedReceipt(
             acquired.transferId, acquired.senderDeviceId, acquired.fileName, acquired.mimeType,
@@ -650,6 +656,8 @@ private class FakeResumeDao : ResumeDao {
         generation: Long,
         storageKind: String,
         storageValue: String,
+        expectedSessionToken: String?,
+        expectedSessionClaimedAt: Long?,
         token: String,
         now: Long,
         staleClaimBefore: Long,
@@ -659,6 +667,8 @@ private class FakeResumeDao : ResumeDao {
         if (current.operationState != IncomingOperationState.COMPLETING ||
             current.cleanupToken != null || current.generation != generation ||
             current.storageKind != storageKind || current.storageValue != storageValue ||
+            current.sessionToken != expectedSessionToken ||
+            current.sessionClaimedAt != expectedSessionClaimedAt ||
             (current.sessionToken != null && current.sessionClaimedAt != null &&
                 current.sessionClaimedAt >= staleClaimBefore)
         ) return 0

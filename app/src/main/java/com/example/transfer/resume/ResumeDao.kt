@@ -205,6 +205,14 @@ interface ResumeDao {
           AND storageKind = :storageKind AND storageValue = :storageValue
           AND operationState = 'COMPLETING' AND cleanupToken IS NULL
           AND (
+            (:expectedSessionToken IS NULL AND sessionToken IS NULL)
+            OR sessionToken = :expectedSessionToken
+          )
+          AND (
+            (:expectedSessionClaimedAt IS NULL AND sessionClaimedAt IS NULL)
+            OR sessionClaimedAt = :expectedSessionClaimedAt
+          )
+          AND (
             sessionToken IS NULL OR sessionClaimedAt IS NULL
             OR sessionClaimedAt < :staleClaimBefore
           )
@@ -215,6 +223,8 @@ interface ResumeDao {
         generation: Long,
         storageKind: String,
         storageValue: String,
+        expectedSessionToken: String?,
+        expectedSessionClaimedAt: Long?,
         token: String,
         now: Long,
         staleClaimBefore: Long,
