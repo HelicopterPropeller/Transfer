@@ -7,6 +7,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.example.transfer.discovery.DiscoveryManager
@@ -432,9 +433,16 @@ class TransferForegroundService : Service() {
                             onPauseState,
                             onProgress
                         ).let { result ->
-                            finalizeOutgoingNetworkResult(result) {
-                                resumeCoordinator.completeOutgoing(prepared.offer.transferId)
-                            }
+                            finalizeOutgoingNetworkResult(
+                                result,
+                                onCleanupFailure = { error ->
+                                    Log.w(
+                                        LOG_TAG,
+                                        "Unable to delete completed outgoing resume link",
+                                        error
+                                    )
+                                }
+                            ) { resumeCoordinator.completeOutgoing(prepared.offer.transferId) }
                         }
                     }
                 }
@@ -696,5 +704,6 @@ class TransferForegroundService : Service() {
         const val ACTION_RESUME = "com.example.transfer.action.RESUME"
         const val ACTION_STOP = "com.example.transfer.action.STOP"
         private const val MAX_LOCK_MILLIS = 12L * 60 * 60 * 1000
+        private const val LOG_TAG = "TransferService"
     }
 }

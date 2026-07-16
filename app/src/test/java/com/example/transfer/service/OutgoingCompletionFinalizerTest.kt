@@ -8,17 +8,40 @@ import org.junit.Test
 
 class OutgoingCompletionFinalizerTest {
     @Test
-    fun `network success remains success when resume row cleanup fails`() = runBlocking {
+    fun `network success retries cleanup and reports the final persistence failure`() = runBlocking {
         var cleanupAttempts = 0
+        var reported: Throwable? = null
         val networkResult = Result.success(Unit)
 
-        val result = finalizeOutgoingNetworkResult(networkResult) {
+        val result = finalizeOutgoingNetworkResult(
+            networkResult,
+            onCleanupFailure = { reported = it }
+        ) {
+                cleanupAttempts++
+                throw IOException("database locked")
+            }
+
+        assertTrue(result.isSuccess)
+        assertEquals(3, cleanupAttempts)
+        assertEquals("database locked", reported?.message)
+    }
+
+    @Test
+    fun `transient cleanup failure succeeds on retry without reporting`() = runBlocking {
+        var cleanupAttempts = 0
+        var reported = false
+
+        val result = finalizeOutgoingNetworkResult(
+            Result.success(Unit),
+            onCleanupFailure = { reported = true }
+        ) {
             cleanupAttempts++
-            throw IOException("database locked")
+            if (cleanupAttempts == 1) throw IOException("database locked")
         }
 
         assertTrue(result.isSuccess)
-        assertEquals(1, cleanupAttempts)
+        assertEquals(2, cleanupAttempts)
+        assertTrue(!reported)
     }
 
     @Test
