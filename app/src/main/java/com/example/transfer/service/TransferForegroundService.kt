@@ -10,6 +10,10 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.edit
 import androidx.core.net.toUri
+import com.example.transfer.batch.OutgoingBatchCoordinator
+import com.example.transfer.batch.OutgoingBatchItem
+import com.example.transfer.batch.OutgoingBatchState
+import com.example.transfer.batch.RoomOutgoingBatchStore
 import com.example.transfer.discovery.DiscoveryManager
 import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.history.HistoryPeer
@@ -24,6 +28,7 @@ import com.example.transfer.resume.ResumeCleanup
 import com.example.transfer.resume.RoomResumeStore
 import com.example.transfer.storage.DownloadStorage
 import com.example.transfer.transfer.FileTransferClient
+import com.example.transfer.transfer.BatchFailure
 import com.example.transfer.transfer.BatchTransferItem
 import com.example.transfer.transfer.FileTransferServer
 import com.example.transfer.transfer.SendFileSource
@@ -38,6 +43,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,13 +51,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 
 private data class PreparedOutgoingFile(
     val device: DiscoveredDevice,
-    val prepared: PreparedTransfer
+    val prepared: PreparedTransfer,
+    val batchItem: OutgoingBatchItem,
+    val preparationFailures: List<BatchFailure>
 )
 
 class TransferForegroundService : Service() {
@@ -83,6 +92,7 @@ class TransferForegroundService : Service() {
     private lateinit var outgoingHistoryRecorder: OutgoingHistoryRecorder
     private lateinit var historyStartupGate: HistoryStartupGate
     private lateinit var resumeCoordinator: ResumeCoordinator
+    private lateinit var outgoingBatchCoordinator: OutgoingBatchCoordinator
     private lateinit var resumeStartupGate: ResumeStartupGate
     private lateinit var resumeMaintenance: ResumeMaintenance
     private lateinit var localDeviceId: String
@@ -118,11 +128,15 @@ class TransferForegroundService : Service() {
         val downloadStorage = DownloadStorage(this)
         val resumeStore = RoomResumeStore(database.resumeDao())
         resumeCoordinator = ResumeCoordinator(resumeStore, downloadStorage)
+        outgoingBatchCoordinator = OutgoingBatchCoordinator(
+            RoomOutgoingBatchStore(database.outgoingBatchDao())
+        )
         val resumePreferences = getSharedPreferences("resume", 0)
         resumeStartupGate = ResumeStartupGate(
             scope = serviceScope,
             recover = {
                 resumeCoordinator.recoverInterruptedState(Long.MAX_VALUE)
+                outgoingBatchCoordinator.recoverInterrupted()
             }
         )
         resumeMaintenance = ResumeMaintenance(serviceScope) {
@@ -170,6 +184,7 @@ class TransferForegroundService : Service() {
                 }
             }
         ) {
+            refreshRecoverableBatch()
             historyStartupGate.awaitReady()
             server.start(
                 serviceScope,
@@ -244,49 +259,68 @@ class TransferForegroundService : Service() {
         terminationGate.runIfOpen gate@{
             val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return@gate
             val reservation = resumePreflight.reserve(busy::get) ?: return@gate
-            val sourceResolver = SelectedFileResolver(this)
-            val sources = files.map { file ->
-                val uri = file.uri.toUri()
-                SendFileSource(
-                    displayName = file.displayName,
-                    mimeType = file.mimeType,
-                    length = file.size,
-                    sourceUri = file.uri,
-                    lastModified = file.lastModified,
-                    openStream = {
-                        contentResolver.openInputStream(uri)
-                            ?: error("无法读取所选文件")
-                    },
-                    metadataProvider = {
-                        val current = sourceResolver.stat(uri)
-                            ?: error("无法读取所选文件")
-                        SendFileMetadata(current.size, current.lastModified)
-                    }
-                )
-            }
             lateinit var job: Job
             job = serviceScope.launch(start = CoroutineStart.LAZY) {
+                var batchId: String? = null
                 try {
                     historyStartupGate.awaitReady()
                     resumeStartupGate.awaitReady()
-                    val prepared = sources.map { source ->
-                        val transfer = resumeCoordinator.prepareOutgoing(
-                            source, device.id, localDeviceId
+                    val batch = outgoingBatchCoordinator.acquire(device.id, files)
+                    batchId = batch.batch.batchId
+                    refreshRecoverableBatch()
+                    val sourceResolver = SelectedFileResolver(this@TransferForegroundService)
+                    val candidates = batch.pendingItems.map { item ->
+                        item to createBatchSource(item, sourceResolver)
+                    }
+                    val preflight = durableResumePreflight(
+                        items = candidates,
+                        prepare = { (_, source) ->
+                            resumeCoordinator.prepareOutgoing(source, device.id, localDeviceId)
+                        },
+                        persistPrepared = { (item, _), transfer ->
+                            check(outgoingBatchCoordinator.saveTransferId(
+                                item, transfer.offer.transferId
+                            )) { "无法保存批次文件断点标识" }
+                        },
+                        query = { transfer ->
+                            client.queryResume(device.address, device.port, transfer.offer)
+                        }
+                    )
+                    val preparationFailures = preflight.preparationFailures.map { failure ->
+                        BatchFailure(
+                            fileName = failure.item.second.displayName,
+                            message = failure.error.message ?: "无法读取所选文件"
                         )
-                        val status = client.queryResume(
-                            device.address, device.port, transfer.offer
-                        )
+                    }
+                    val prepared = preflight.ready.map { ready ->
                         ResumePreflightFile(
-                            value = PreparedOutgoingFile(device, transfer),
-                            fileName = source.displayName,
-                            status = status
+                            value = PreparedOutgoingFile(
+                                device = device,
+                                prepared = ready.prepared,
+                                batchItem = ready.item.first,
+                                preparationFailures = preparationFailures
+                            ),
+                            fileName = ready.item.second.displayName,
+                            status = ready.remote
                         )
+                    }
+                    if (prepared.isEmpty()) {
+                        outgoingBatchCoordinator.markBatch(
+                            batch.batch.batchId, OutgoingBatchState.INTERRUPTED
+                        )
+                        refreshRecoverableBatch()
+                        resumePreflight.cancelReservation(reservation)
+                        publish { current ->
+                            current.withInactiveBatchFailure("没有可读取的待发送文件")
+                        }
+                        return@launch
                     }
                     when (val result = resumePreflight.finish(
                         reservation, prepared, acquireBusy = ::beginTransfer
                     )) {
                         is ResumePreflightResult.Ready -> {
                             if (!startPreparedOutgoing(result.files, alreadyHeld = true)) {
+                                interruptOutgoingBatch(batch.batch.batchId)
                                 publishBusyRace()
                             }
                         }
@@ -313,14 +347,20 @@ class TransferForegroundService : Service() {
                                 }
                             }
                         )
-                        ResumePreflightResult.Busy -> publishBusyRace()
-                        ResumePreflightResult.Ignored -> Unit
+                        ResumePreflightResult.Busy -> {
+                            interruptOutgoingBatch(batch.batch.batchId)
+                            publishBusyRace()
+                        }
+                        ResumePreflightResult.Ignored ->
+                            interruptOutgoingBatch(batch.batch.batchId)
                     }
                 } catch (exception: CancellationException) {
                     resumePreflight.cancelReservation(reservation)
+                    batchId?.let { interruptOutgoingBatch(it) }
                     throw exception
                 } catch (exception: Exception) {
                     resumePreflight.cancelReservation(reservation)
+                    batchId?.let { interruptOutgoingBatch(it) }
                     publish { current ->
                         val message = "发送预检失败：${exception.message ?: "未知错误"}"
                         if (current.transfer?.active == true) {
@@ -380,6 +420,7 @@ class TransferForegroundService : Service() {
         }
         if (!alreadyHeld && !beginTransfer()) return false
         val device = files.first().value.device
+        val batchId = files.first().value.batchItem.batchId
         val sources = files.map { it.value.prepared.source }
         val controller = TransferPauseController()
         activePauseController = controller
@@ -410,31 +451,50 @@ class TransferForegroundService : Service() {
         }
         job = serviceScope.launch(start = CoroutineStart.LAZY) {
             try {
+                check(outgoingBatchCoordinator.markBatch(
+                    batchId, OutgoingBatchState.ACTIVE
+                )) { "无法更新批次状态" }
                 val onPauseState: (TransferPauseState) -> Unit = { publishPauseState(controller) }
                 val runner = TransferBatchRunner(controller) { source, onProgress ->
                     val selected = files.first { it.value.prepared.source === source }
                     val prepared = selected.value.prepared
-                    outgoingHistoryRecorder.send(
-                        source = source,
-                        peer = HistoryPeer(
-                            id = device.id,
-                            name = device.name,
-                            address = device.address.hostAddress
-                        ),
-                        controller = controller
-                    ) {
-                        client.sendPrepared(
-                            device.address,
-                            device.port,
-                            prepared.copy(resumeStatus = selected.status),
-                            selected.mode,
-                            selected.status,
-                            controller,
-                            onPauseState,
-                            onProgress
-                        ).let { result ->
+                    val batchItem = selected.value.batchItem
+                    check(outgoingBatchCoordinator.markItemActive(batchItem)) {
+                        "无法更新批次文件状态"
+                    }
+                    val result = try {
+                        outgoingHistoryRecorder.send(
+                            source = source,
+                            peer = HistoryPeer(
+                                id = device.id,
+                                name = device.name,
+                                address = device.address.hostAddress
+                            ),
+                            controller = controller,
+                        ) {
+                            val networkResult = client.sendPrepared(
+                                device.address,
+                                device.port,
+                                prepared.copy(resumeStatus = selected.status),
+                                selected.mode,
+                                selected.status,
+                                controller,
+                                onPauseState,
+                                onProgress
+                            )
+                            val durableResult = if (networkResult.isSuccess) {
+                                if (outgoingBatchCoordinator.markItemSucceeded(batchItem)) {
+                                    networkResult
+                                } else {
+                                    Result.failure(IllegalStateException(
+                                        "接收方已完成，但无法保存批次完成状态"
+                                    ))
+                                }
+                            } else {
+                                networkResult
+                            }
                             finalizeOutgoingNetworkResult(
-                                result,
+                                durableResult,
                                 onCleanupFailure = { error ->
                                     Log.w(
                                         LOG_TAG,
@@ -444,7 +504,12 @@ class TransferForegroundService : Service() {
                                 }
                             ) { resumeCoordinator.completeOutgoing(prepared.offer.transferId) }
                         }
+                    } catch (cancelled: CancellationException) {
+                        markOutgoingItemPendingBestEffort(batchItem)
+                        throw cancelled
                     }
+                    if (result.isFailure) markOutgoingItemPendingBestEffort(batchItem)
+                    result
                 }
                 var lastProgress: com.example.transfer.transfer.BatchTransferProgress? = null
                 val result = runner.runItems(
@@ -464,6 +529,10 @@ class TransferForegroundService : Service() {
                     },
                     onPauseState = onPauseState
                 )
+                val combinedResult = result.copy(
+                    failures = files.first().value.preparationFailures + result.failures
+                )
+                finishOutgoingBatchAttempt(batchId)
                 publish { current ->
                     if (activePauseController !== controller) current else {
                         val terminal = lastProgress
@@ -471,7 +540,7 @@ class TransferForegroundService : Service() {
                             direction = "发送",
                             fileName = terminal?.fileName ?: sources.last().displayName,
                             progress = terminal?.fileProgress ?: 0,
-                            message = formatBatchCompletion(result),
+                            message = formatBatchCompletion(combinedResult),
                             active = false,
                             fileIndex = terminal?.fileIndex ?: sources.size,
                             fileCount = sources.size,
@@ -481,8 +550,10 @@ class TransferForegroundService : Service() {
                     }
                 }
             } catch (exception: CancellationException) {
+                interruptOutgoingBatch(batchId)
                 throw exception
             } catch (exception: Exception) {
+                interruptOutgoingBatch(batchId)
                 publish { current ->
                     if (activePauseController !== controller) current else {
                         current.withInactiveBatchFailure(
@@ -594,6 +665,80 @@ class TransferForegroundService : Service() {
                 if (current.transfer?.incomingAttemptId == attemptId) terminal(current) else current
             }
         }
+    }
+
+    private fun createBatchSource(
+        item: OutgoingBatchItem,
+        sourceResolver: SelectedFileResolver
+    ): SendFileSource {
+        val uri = item.sourceUri.toUri()
+        return SendFileSource(
+            displayName = item.displayName,
+            mimeType = item.mimeType,
+            length = item.fileSize,
+            sourceUri = item.sourceUri,
+            lastModified = item.lastModified,
+            openStream = {
+                contentResolver.openInputStream(uri) ?: error("无法读取所选文件")
+            },
+            metadataProvider = {
+                val current = sourceResolver.stat(uri) ?: error("无法读取所选文件")
+                SendFileMetadata(current.size, current.lastModified)
+            }
+        )
+    }
+
+    private suspend fun markOutgoingItemPendingBestEffort(item: OutgoingBatchItem) {
+        withContext(NonCancellable) {
+            runCatching { outgoingBatchCoordinator.markItemPending(item) }
+                .onFailure { error ->
+                    Log.w(LOG_TAG, "Unable to restore outgoing batch item to pending", error)
+                }
+        }
+    }
+
+    private suspend fun interruptOutgoingBatch(batchId: String) {
+        withContext(NonCancellable) {
+            runCatching {
+                outgoingBatchCoordinator.markBatch(batchId, OutgoingBatchState.INTERRUPTED)
+                outgoingBatchCoordinator.recoverInterrupted()
+                refreshRecoverableBatch()
+            }.onFailure { error ->
+                Log.w(LOG_TAG, "Unable to persist interrupted outgoing batch", error)
+            }
+        }
+    }
+
+    private suspend fun finishOutgoingBatchAttempt(batchId: String) {
+        withContext(NonCancellable) {
+            val snapshot = outgoingBatchCoordinator.find(batchId)
+            if (snapshot != null && snapshot.pendingItems.isEmpty()) {
+                outgoingBatchCoordinator.delete(batchId)
+            } else if (snapshot != null) {
+                outgoingBatchCoordinator.markBatch(batchId, OutgoingBatchState.INTERRUPTED)
+                outgoingBatchCoordinator.recoverInterrupted()
+            }
+            refreshRecoverableBatch()
+        }
+    }
+
+    private suspend fun refreshRecoverableBatch() {
+        val recoverable = outgoingBatchCoordinator.latestRecoverable()?.let { snapshot ->
+            RecoverableOutgoingBatch(
+                batchId = snapshot.batch.batchId,
+                peerDeviceId = snapshot.batch.peerDeviceId,
+                files = snapshot.pendingItems.map { item ->
+                    SelectedFile(
+                        uri = item.sourceUri,
+                        displayName = item.displayName,
+                        mimeType = item.mimeType,
+                        size = item.fileSize,
+                        lastModified = item.lastModified
+                    )
+                }
+            )
+        }
+        publish { current -> current.copy(recoverableBatch = recoverable) }
     }
 
     private fun publish(transform: (ServiceTransferState) -> ServiceTransferState) {

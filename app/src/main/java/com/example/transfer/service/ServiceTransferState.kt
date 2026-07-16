@@ -2,6 +2,13 @@ package com.example.transfer.service
 
 import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.transfer.TransferPauseState
+import com.example.transfer.ui.SelectedFile
+
+data class RecoverableOutgoingBatch(
+    val batchId: String,
+    val peerDeviceId: String,
+    val files: List<SelectedFile>
+)
 
 data class ServiceTransfer(
     val direction: String,
@@ -20,7 +27,8 @@ data class ServiceTransferState(
     val devices: List<DiscoveredDevice> = emptyList(),
     val serviceMessage: String = "等待设备或文件",
     val transfer: ServiceTransfer? = null,
-    val resumePrompt: ResumePrompt? = null
+    val resumePrompt: ResumePrompt? = null,
+    val recoverableBatch: RecoverableOutgoingBatch? = null
 )
 
 internal class ServiceTerminationGate {

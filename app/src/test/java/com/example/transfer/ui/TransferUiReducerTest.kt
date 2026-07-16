@@ -4,6 +4,7 @@ import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransfer
 import com.example.transfer.service.ServiceTransferState
 import com.example.transfer.service.ResumePrompt
+import com.example.transfer.service.RecoverableOutgoingBatch
 import com.example.transfer.transfer.TransferPauseState
 import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
@@ -27,6 +28,39 @@ class TransferUiReducerTest {
 
         assertEquals(prompt, waiting.resumePrompt)
         assertNull(cleared.resumePrompt)
+    }
+
+    @Test
+    fun `service recovery restores files and preferred peer into empty selection`() {
+        val files = listOf(SelectedFile("content://old", "old.bin", "application/octet-stream", 8L))
+
+        val recovered = TransferUiReducer.withServiceState(
+            TransferUiState(),
+            ServiceTransferState(
+                devices = listOf(peerA),
+                recoverableBatch = RecoverableOutgoingBatch("batch", peerA.id, files)
+            )
+        )
+
+        assertEquals(files, recovered.selectedFiles)
+        assertEquals(peerA.id, recovered.preferredDeviceId)
+        assertEquals(peerA.id, recovered.selectedDeviceId)
+    }
+
+    @Test
+    fun `service recovery never replaces a new user selection`() {
+        val current = listOf(SelectedFile("content://new", "new.bin", "application/octet-stream", 4L))
+        val old = listOf(SelectedFile("content://old", "old.bin", "application/octet-stream", 8L))
+
+        val recovered = TransferUiReducer.withServiceState(
+            TransferUiState(selectedFiles = current),
+            ServiceTransferState(
+                recoverableBatch = RecoverableOutgoingBatch("batch", peerA.id, old)
+            )
+        )
+
+        assertEquals(current, recovered.selectedFiles)
+        assertNull(recovered.preferredDeviceId)
     }
 
     @Test

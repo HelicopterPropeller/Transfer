@@ -50,11 +50,12 @@ class TransferDatabaseMigrationTest {
 
         val migrated = helper.runMigrationsAndValidate(
             TEST_DATABASE,
-            4,
+            5,
             true,
             TransferHistoryDatabase.MIGRATION_1_2,
             TransferHistoryDatabase.MIGRATION_2_3,
-            TransferHistoryDatabase.MIGRATION_3_4
+            TransferHistoryDatabase.MIGRATION_3_4,
+            TransferHistoryDatabase.MIGRATION_4_5
         )
 
         migrated.query("SELECT * FROM transfer_history").use { cursor ->
@@ -84,6 +85,8 @@ class TransferDatabaseMigrationTest {
         assertTableEmpty(migrated, "incoming_checkpoints")
         assertTableEmpty(migrated, "outgoing_resume_links")
         assertTableEmpty(migrated, "completed_receipts")
+        assertTableEmpty(migrated, "outgoing_batches")
+        assertTableEmpty(migrated, "outgoing_batch_items")
         assertTrue("completingFinalDigest" in tableColumns(migrated, "incoming_checkpoints"))
         assertEquals(
             setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue"),
@@ -91,6 +94,41 @@ class TransferDatabaseMigrationTest {
                 setOf("generation", "sessionToken", "sessionClaimedAt", "retiredStorageKind", "retiredStorageValue")
             )
         )
+        migrated.close()
+    }
+
+    @Test
+    fun migration4To5PreservesResumeLinksAndCreatesBatchTables() {
+        helper.createDatabase(TEST_DATABASE, 4).apply {
+            createVersionOneHistoryTable()
+            TransferHistoryDatabase.MIGRATION_1_2.migrate(this)
+            TransferHistoryDatabase.MIGRATION_2_3.migrate(this)
+            TransferHistoryDatabase.MIGRATION_3_4.migrate(this)
+            execSQL(
+                """INSERT INTO outgoing_resume_links
+                (transferId,sourceUri,peerDeviceId,fileName,mimeType,fileSize,lastModified,
+                 chunkSize,createdAt,updatedAt)
+                VALUES ('kept-outgoing','content://source/kept','peer-1','kept.bin',
+                 'application/octet-stream',8,10,1048576,1,2)""".trimIndent()
+            )
+            close()
+        }
+
+        val migrated = helper.runMigrationsAndValidate(
+            TEST_DATABASE, 5, true, TransferHistoryDatabase.MIGRATION_4_5
+        )
+
+        migrated.query(
+            "SELECT transferId,sourceUri,peerDeviceId FROM outgoing_resume_links"
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals("kept-outgoing", cursor.getString(0))
+            assertEquals("content://source/kept", cursor.getString(1))
+            assertEquals("peer-1", cursor.getString(2))
+            assertTrue(!cursor.moveToNext())
+        }
+        assertTableEmpty(migrated, "outgoing_batches")
+        assertTableEmpty(migrated, "outgoing_batch_items")
         migrated.close()
     }
 
@@ -132,7 +170,8 @@ class TransferDatabaseMigrationTest {
         ).addMigrations(
             TransferHistoryDatabase.MIGRATION_1_2,
             TransferHistoryDatabase.MIGRATION_2_3,
-            TransferHistoryDatabase.MIGRATION_3_4
+            TransferHistoryDatabase.MIGRATION_3_4,
+            TransferHistoryDatabase.MIGRATION_4_5
         ).build()
         try {
             val files = MigrationRecoveryFiles(ByteArray(0))

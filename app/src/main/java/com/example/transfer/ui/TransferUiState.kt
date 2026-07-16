@@ -130,7 +130,16 @@ data class TransferUiState(
 
 object TransferUiReducer {
     fun withServiceState(state: TransferUiState, service: ServiceTransferState): TransferUiState {
-        val withDevices = withDevices(state, service.devices)
+        val withRecovery = service.recoverableBatch?.takeIf {
+            state.selectedFiles.isEmpty()
+        }?.let { recoverable ->
+            state.copy(
+                selectedFiles = recoverable.files,
+                preferredDeviceId = recoverable.peerDeviceId,
+                notice = null
+            )
+        } ?: state
+        val withDevices = withDevices(withRecovery, service.devices)
         val transfer = service.transfer?.let {
             TransferStatus(
                 it.direction, it.fileName, it.progress, it.message, it.active,

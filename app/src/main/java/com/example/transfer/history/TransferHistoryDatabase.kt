@@ -6,6 +6,9 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.transfer.batch.OutgoingBatchDao
+import com.example.transfer.batch.OutgoingBatchEntity
+import com.example.transfer.batch.OutgoingBatchItemEntity
 import com.example.transfer.resume.IncomingCheckpointEntity
 import com.example.transfer.resume.IncomingStagingJournalEntity
 import com.example.transfer.resume.OutgoingResumeLinkEntity
@@ -18,14 +21,17 @@ import com.example.transfer.resume.ResumeDao
         IncomingCheckpointEntity::class,
         IncomingStagingJournalEntity::class,
         OutgoingResumeLinkEntity::class,
-        CompletedReceiptEntity::class
+        CompletedReceiptEntity::class,
+        OutgoingBatchEntity::class,
+        OutgoingBatchItemEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class TransferHistoryDatabase : RoomDatabase() {
     abstract fun transferHistoryDao(): TransferHistoryDao
     abstract fun resumeDao(): ResumeDao
+    abstract fun outgoingBatchDao(): OutgoingBatchDao
 
     companion object {
         val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -125,6 +131,45 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS outgoing_batches (
+                        batchId TEXT NOT NULL PRIMARY KEY,
+                        peerDeviceId TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS outgoing_batch_items (
+                        batchId TEXT NOT NULL,
+                        position INTEGER NOT NULL,
+                        sourceUri TEXT NOT NULL,
+                        displayName TEXT NOT NULL,
+                        mimeType TEXT NOT NULL,
+                        fileSize INTEGER NOT NULL,
+                        lastModified INTEGER,
+                        transferId TEXT,
+                        state TEXT NOT NULL,
+                        updatedAt INTEGER NOT NULL,
+                        PRIMARY KEY(batchId, position),
+                        FOREIGN KEY(batchId) REFERENCES outgoing_batches(batchId)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_outgoing_batch_items_batchId " +
+                        "ON outgoing_batch_items(batchId)"
+                )
+            }
+        }
+
         @Volatile
         private var instance: TransferHistoryDatabase? = null
 
@@ -134,7 +179,7 @@ abstract class TransferHistoryDatabase : RoomDatabase() {
                     context.applicationContext,
                     TransferHistoryDatabase::class.java,
                     "transfer_history.db"
-                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                     .also { instance = it }
             }
