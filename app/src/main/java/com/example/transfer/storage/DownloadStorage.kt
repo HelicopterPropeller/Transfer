@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
@@ -517,13 +518,29 @@ class DownloadStorage(private val context: Context) :
                 "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND " +
                 "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? AND " +
                 "${MediaStore.MediaColumns.IS_PENDING}=1"
-        context.contentResolver.query(
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-            projection,
-            selection,
-            arrayOf(mediaStoreStagingName(transferId), MEDIA_STORE_RELATIVE_PATH, context.packageName),
-            null
-        )?.use {
+        val selectionArgs =
+            arrayOf(mediaStoreStagingName(transferId), MEDIA_STORE_RELATIVE_PATH, context.packageName)
+        val cursor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection,
+                Bundle().apply {
+                    putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                    putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
+                    putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+                },
+                null
+            )
+        } else {
+            context.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                selectionArgs,
+                null
+            )
+        }
+        cursor?.use {
             if (it.moveToFirst()) {
                 return ContentUris.withAppendedId(
                     MediaStore.Downloads.EXTERNAL_CONTENT_URI, it.getLong(0)
