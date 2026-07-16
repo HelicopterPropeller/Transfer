@@ -58,6 +58,7 @@ class ResumeCoordinator(
         peerDeviceId: String,
         senderDeviceId: String
     ): PreparedTransfer {
+        source.requireUnchanged()
         val sourceUri = requireNotNull(source.sourceUri) { "A stable source URI is required for resume" }
         val now = clock()
         val saved = store.resolveOutgoing(

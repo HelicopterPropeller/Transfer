@@ -33,6 +33,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Semaphore
 
 fun interface ChunkVerifier {
@@ -49,6 +50,8 @@ class FileTransferServer(
     private val chunkVerifier: ChunkVerifier = ChunkVerifier.SHA256,
     private val onTransferStart: () -> Boolean = { true },
     private val onTransferEnd: () -> Unit = {},
+    private val onTransferAttemptStart: ((Long) -> Boolean)? = null,
+    private val onTransferAttemptEnd: ((Long) -> Unit)? = null,
     private val pausedSessionLeaseMillis: Int = DEFAULT_PAUSED_SESSION_LEASE_MILLIS,
     private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
     private val history: IncomingTransferHistory = IncomingTransferHistory.None,
@@ -72,6 +75,7 @@ class FileTransferServer(
     private val clientJobs = linkedSetOf<Job>()
     private val activeConnections = Semaphore(maxActiveConnections)
     private val concurrentQueries = Semaphore(maxConcurrentQueries)
+    private val nextAttemptId = AtomicLong()
 
     fun start(
         scope: CoroutineScope,
@@ -79,6 +83,20 @@ class FileTransferServer(
         onProgress: (String, Int) -> Unit,
         onComplete: (String) -> Unit,
         onError: (String) -> Unit
+    ) = start(
+        scope,
+        onStarted,
+        { _, name, progress -> onProgress(name, progress) },
+        { _, name -> onComplete(name) },
+        { _, message -> onError(message) }
+    )
+
+    fun start(
+        scope: CoroutineScope,
+        onStarted: (Int) -> Unit,
+        onProgress: (Long, String, Int) -> Unit,
+        onComplete: (Long, String) -> Unit,
+        onError: (Long?, String) -> Unit
     ) {
         val serverJob = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             try {
@@ -124,8 +142,18 @@ class FileTransferServer(
                                 onClientStarted()
                                 if (!isActive) receiveSession.requestLocalStop()
                                 runCatching { receive(receiveSession, onProgress, onComplete) }
-                                    .onFailure { if (isActive) onError(it.message ?: "Receive failed") }
+                                    .onFailure {
+                                        if (isActive) onError(
+                                            receiveSession.attemptId,
+                                            it.message ?: "Receive failed"
+                                        )
+                                    }
                             } finally {
+                                if (receiveSession.attemptAdmitted) {
+                                    receiveSession.attemptId?.let { attemptId ->
+                                        onTransferAttemptEnd?.invoke(attemptId) ?: onTransferEnd()
+                                    }
+                                }
                                 releaseRegistration()
                             }
                         }
@@ -153,7 +181,7 @@ class FileTransferServer(
                     }
                 }
             } catch (error: Exception) {
-                if (isActive) onError(error.message ?: "Receive service failed")
+                if (isActive) onError(null, error.message ?: "Receive service failed")
             } finally {
                 synchronized(lifecycleLock) {
                     serverSocket = null
@@ -205,8 +233,8 @@ class FileTransferServer(
 
     private suspend fun receive(
         receiveSession: ReceiveSession,
-        onProgress: (String, Int) -> Unit,
-        onComplete: (String) -> Unit
+        onProgress: (Long, String, Int) -> Unit,
+        onComplete: (Long, String) -> Unit
     ) {
         receiveV4(receiveSession, resumeCoordinator, onProgress, onComplete)
     }
@@ -214,8 +242,8 @@ class FileTransferServer(
     private suspend fun receiveV4(
         receiveSession: ReceiveSession,
         coordinator: ResumeCoordinator,
-        onProgress: (String, Int) -> Unit,
-        onComplete: (String) -> Unit
+        onProgress: (Long, String, Int) -> Unit,
+        onComplete: (Long, String) -> Unit
     ) {
         val socket = receiveSession.socket
         socket.use {
@@ -256,8 +284,8 @@ class FileTransferServer(
         coordinator: ResumeCoordinator,
         input: DataInputStream,
         output: DataOutputStream,
-        onProgress: (String, Int) -> Unit,
-        onComplete: (String) -> Unit
+        onProgress: (Long, String, Int) -> Unit,
+        onComplete: (Long, String) -> Unit
     ) {
         val offer = ResumeProtocol.readOffer(input)
         val mode = ResumeProtocol.readStartMode(input)
@@ -274,7 +302,11 @@ class FileTransferServer(
             output.flush()
             return
         }
-        if (!onTransferStart()) throw ProtocolException("Another transfer is active")
+        val attemptId = nextAttemptId.incrementAndGet()
+        receiveSession.attemptId = attemptId
+        val started = onTransferAttemptStart?.invoke(attemptId) ?: onTransferStart()
+        if (!started) throw ProtocolException("Another transfer is active")
+        receiveSession.attemptAdmitted = true
 
         var session: IncomingResumeSession? = null
         var historyId: Long? = null
@@ -307,7 +339,9 @@ class FileTransferServer(
             output.flush()
             val received = receiveV4Frames(
                 receiveSession.socket, coordinator, session, offer.fileSize,
-                input, output, onProgress, onCheckpoint = { session = it }
+                input, output,
+                { name, progress -> onProgress(attemptId, name, progress) },
+                onCheckpoint = { session = it }
             )
             session = received.session
             val senderDigest = received.wholeDigest
@@ -320,7 +354,7 @@ class FileTransferServer(
             historyBestEffort { history.succeed(historyId, receivedUri) }
             output.writeByte(TransferProtocol.SUCCESS)
             output.flush()
-            onComplete(session.handle.displayName)
+            onComplete(attemptId, session.handle.displayName)
         } catch (error: Exception) {
             if (!completed) {
                 val termination = receiveSession.classifyFailure(error)
@@ -336,8 +370,6 @@ class FileTransferServer(
                 }
             }
             throw error
-        } finally {
-            onTransferEnd()
         }
     }
 
@@ -466,6 +498,8 @@ class FileTransferServer(
 
     private class ReceiveSession(val socket: Socket) {
         private val termination = AtomicReference(ReceiveTermination.ACTIVE)
+        @Volatile var attemptId: Long? = null
+        @Volatile var attemptAdmitted: Boolean = false
 
         fun requestLocalStop() {
             termination.compareAndSet(ReceiveTermination.ACTIVE, ReceiveTermination.LOCAL_STOP)

@@ -77,6 +77,8 @@ class FileTransferClient {
             val operation = registerOperation(pauseController)
             try {
                 checkActive(operation.id)
+                prepared.source.requireUnchanged()
+                checkActive(operation.id)
                 val openedSource = prepared.source.openStream()
                 attachSource(operation.id, openedSource)
                 openedSource.use { fileInput ->

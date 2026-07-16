@@ -9,7 +9,8 @@ data class SelectedFile(
     val uri: String,
     val displayName: String,
     val mimeType: String,
-    val size: Long
+    val size: Long,
+    val lastModified: Long? = null
 )
 
 internal fun <T> validateThenPersist(

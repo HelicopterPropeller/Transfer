@@ -9,12 +9,10 @@ import kotlinx.coroutines.launch
 
 internal class ResumeStartupGate(
     private val scope: CoroutineScope,
-    recover: suspend () -> Unit,
-    cleanup: suspend () -> Unit
+    recover: suspend () -> Unit
 ) {
     private val initialization: Deferred<Unit> = scope.async {
         recover()
-        cleanup()
     }
 
     suspend fun awaitReady() {

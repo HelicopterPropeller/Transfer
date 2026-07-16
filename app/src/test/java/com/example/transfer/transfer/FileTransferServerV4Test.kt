@@ -36,6 +36,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +54,118 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class FileTransferServerV4Test {
+    @Test
+    fun `pause lease is cumulative across acknowledgements for multiple chunks`() = runBlocking {
+        val monotonic = AtomicLong(0)
+        val harness = V4Harness(
+            pausedSessionLeaseMillis = 100,
+            monotonicMillis = monotonic::get
+        )
+        val chunk = ByteArray(TransferProtocol.CHUNK_SIZE) { 3 }
+        val offer = harness.offer(chunk.size.toLong() * 2 + 1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
+
+                sendChunk(output, input, 0, chunk)
+                pauseAndResume(output, input) { monotonic.set(60) }
+                sendChunk(output, input, 1, chunk)
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+                monotonic.set(101)
+                TransferFrameCodec.writeType(output, TransferFrameType.RESUME)
+                output.flush()
+                assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
+            }
+            withTimeout(2_000) { harness.history.failed.await() }
+            assertEquals(chunk.size.toLong() * 2, harness.store.findIncoming(offer.transferId)?.confirmedBytes)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `one acknowledged chunk grants at most one pause`() = runBlocking {
+        val harness = V4Harness()
+        val chunk = ByteArray(TransferProtocol.CHUNK_SIZE) { 4 }
+        val offer = harness.offer(chunk.size.toLong() + 1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
+                sendChunk(output, input, 0, chunk)
+                pauseAndResume(output, input) {}
+
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
+            }
+            withTimeout(2_000) { harness.history.failed.await() }
+            assertEquals(chunk.size.toLong(), harness.store.findIncoming(offer.transferId)?.confirmedBytes)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `incoming attempt callbacks carry one stable id through terminal end`() = runBlocking {
+        val harness = V4Harness(recordAttempts = true)
+        val bytes = byteArrayOf(7)
+        try {
+            val result = FileTransferClient().sendPrepared(
+                InetAddress.getLoopbackAddress(), harness.port(), harness.prepared(bytes),
+                TransferStartMode.NEW, ResumeStatus(ResumeState.NONE),
+                TransferPauseController(), {}, {}
+            )
+            assertTrue(result.isSuccess)
+            withTimeout(2_000) {
+                while (harness.attemptEvents.none { it.first == "end" }) delay(10)
+            }
+            val events = harness.attemptEvents.toList()
+            assertTrue(events.map { it.first }.containsAll(listOf("start", "progress", "complete", "end")))
+            assertEquals(1, events.map { it.second }.toSet().size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `incoming failure callback precedes matching attempt end`() = runBlocking {
+        val harness = V4Harness(recordAttempts = true)
+        val offer = harness.offer(1)
+        try {
+            Socket(InetAddress.getLoopbackAddress(), harness.port()).use { socket ->
+                socket.soTimeout = 2_000
+                val input = DataInputStream(socket.getInputStream())
+                val output = DataOutputStream(socket.getOutputStream())
+                start(output, offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE))
+                assertReady(input)
+                TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+                output.flush()
+                assertEquals(TransferProtocol.FATAL, input.readUnsignedByte())
+            }
+            withTimeout(2_000) {
+                while (harness.attemptEvents.none { it.first == "end" }) delay(10)
+            }
+            val events = harness.attemptEvents.toList()
+            val errorIndex = events.indexOfFirst { it.first == "error" }
+            val endIndex = events.indexOfFirst { it.first == "end" }
+            assertTrue(errorIndex >= 0)
+            assertTrue(errorIndex < endIndex)
+            assertEquals(events[errorIndex].second, events[endIndex].second)
+        } finally {
+            harness.close()
+        }
+    }
+
     @Test
     fun `server defaults bound active sockets and concurrent queries`() {
         assertEquals(16, FileTransferServer.MAX_ACTIVE_CONNECTIONS)
@@ -843,6 +956,32 @@ class FileTransferServerV4Test {
         val response = ResumeProtocol.readStartResponse(input)
         assertEquals(com.example.transfer.protocol.TransferStartResponse.READY, response.response)
     }
+
+    private fun sendChunk(
+        output: DataOutputStream,
+        input: DataInputStream,
+        index: Int,
+        bytes: ByteArray
+    ) {
+        TransferFrameCodec.writeType(output, TransferFrameType.CHUNK)
+        ChunkCodec.write(output, ChunkCodec.create(index, bytes))
+        output.flush()
+        assertEquals(TransferProtocol.ACK, input.readUnsignedByte())
+    }
+
+    private fun pauseAndResume(
+        output: DataOutputStream,
+        input: DataInputStream,
+        beforeResume: () -> Unit
+    ) {
+        TransferFrameCodec.writeType(output, TransferFrameType.PAUSE)
+        output.flush()
+        assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+        beforeResume()
+        TransferFrameCodec.writeType(output, TransferFrameType.RESUME)
+        output.flush()
+        assertEquals(TransferProtocol.CONTROL_ACK, input.readUnsignedByte())
+    }
 }
 
 private class V4Harness(
@@ -851,13 +990,16 @@ private class V4Harness(
     private val configuredHistory: SocketHistory = SocketHistory(),
     pausedSessionLeaseMillis: Int = 30 * 60 * 1000,
     maxActiveConnections: Int = FileTransferServer.MAX_ACTIVE_CONNECTIONS,
-    maxConcurrentQueries: Int = FileTransferServer.MAX_CONCURRENT_QUERIES
+    maxConcurrentQueries: Int = FileTransferServer.MAX_CONCURRENT_QUERIES,
+    private val recordAttempts: Boolean = false,
+    monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 }
 ) {
     val store = SocketResumeStore()
     val files = SocketFiles()
     val completed = CompletableDeferred<Unit>()
     val history = configuredHistory
     val errors = java.util.Collections.synchronizedList(mutableListOf<String>())
+    val attemptEvents = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Long>>())
     private val job = SupervisorJob()
     private val scope = CoroutineScope(job + Dispatchers.IO)
     private val ready = CompletableDeferred<Int>()
@@ -869,11 +1011,16 @@ private class V4Harness(
         resumeCoordinator = ResumeCoordinator(store, files),
         chunkVerifier = verifier,
         pausedSessionLeaseMillis = pausedSessionLeaseMillis,
-        onTransferStart = {
+        monotonicMillis = monotonicMillis,
+        onTransferAttemptStart = { attemptId ->
+            if (recordAttempts) attemptEvents += "start" to attemptId
             startCalls++
             if (exclusiveBusyGate && busy) false else { busy = true; true }
         },
-        onTransferEnd = { busy = false },
+        onTransferAttemptEnd = { attemptId ->
+            if (recordAttempts) attemptEvents += "end" to attemptId
+            busy = false
+        },
         history = history,
         maxActiveConnections = maxActiveConnections,
         maxConcurrentQueries = maxConcurrentQueries,
@@ -882,8 +1029,17 @@ private class V4Harness(
 
     init {
         server.start(
-            scope, { ready.complete(it) }, { _, _ -> }, { completed.complete(Unit) },
-            { errors += it }
+            scope,
+            { ready.complete(it) },
+            { attemptId, _, _ -> if (recordAttempts) attemptEvents += "progress" to attemptId },
+            { attemptId, _ ->
+                if (recordAttempts) attemptEvents += "complete" to attemptId
+                completed.complete(Unit)
+            },
+            { attemptId, message ->
+                if (recordAttempts && attemptId != null) attemptEvents += "error" to attemptId
+                errors += message
+            }
         )
     }
 

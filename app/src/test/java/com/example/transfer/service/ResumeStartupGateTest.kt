@@ -22,12 +22,7 @@ class ResumeStartupGateTest {
     }
 
     @Test
-    fun `cleanup failure is reported once without reaching coroutine exception handler`() = runBlocking {
-        assertLaunchFailureIsHandled(failCleanup = true)
-    }
-
-    @Test
-    fun `recovery then cleanup complete before sender and receiver entry`() = runBlocking {
+    fun `recovery completes before sender and receiver entry`() = runBlocking {
         val recoveryStarted = CompletableDeferred<Unit>()
         val releaseRecovery = CompletableDeferred<Unit>()
         val events = mutableListOf<String>()
@@ -37,8 +32,7 @@ class ResumeStartupGateTest {
                 events += "recover"
                 recoveryStarted.complete(Unit)
                 releaseRecovery.await()
-            },
-            cleanup = { events += "cleanup" }
+            }
         )
         val receiver = gate.launchWhenReady { events += "receive" }
         val sender = async {
@@ -55,8 +49,7 @@ class ResumeStartupGateTest {
         sender.await()
 
         assertEquals("recover", events[0])
-        assertEquals("cleanup", events[1])
-        assertTrue(events.drop(2).toSet() == setOf("receive", "send"))
+        assertTrue(events.drop(1).toSet() == setOf("receive", "send"))
     }
 
     @Test
@@ -64,8 +57,7 @@ class ResumeStartupGateTest {
         val entered = CompletableDeferred<Unit>()
         val gate = ResumeStartupGate(
             scope = this,
-            recover = { throw IOException("resume database unavailable") },
-            cleanup = { error("cleanup must not run") }
+            recover = { throw IOException("resume database unavailable") }
         )
         val receiver = gate.launchWhenReady { entered.complete(Unit) }
 
@@ -76,17 +68,16 @@ class ResumeStartupGateTest {
         assertFalse(entered.isCompleted)
     } }
 
-    private suspend fun assertLaunchFailureIsHandled(failCleanup: Boolean) {
+    private suspend fun assertLaunchFailureIsHandled(failCleanup: Boolean = false) {
         val unhandled = mutableListOf<Throwable>()
         val handler = CoroutineExceptionHandler { _, error -> unhandled += error }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined + handler)
         val failures = mutableListOf<Throwable>()
         var serverStarted = false
-        val expectedMessage = if (failCleanup) "cleanup failed" else "recover failed"
+        val expectedMessage = "recover failed"
         val gate = ResumeStartupGate(
             scope = scope,
-            recover = { if (!failCleanup) throw IOException(expectedMessage) },
-            cleanup = { if (failCleanup) throw IOException(expectedMessage) }
+            recover = { throw IOException(expectedMessage) }
         )
         try {
             gate.launchWhenReady(

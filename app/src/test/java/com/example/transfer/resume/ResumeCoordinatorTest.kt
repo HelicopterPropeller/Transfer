@@ -12,6 +12,7 @@ import com.example.transfer.storage.ResumableFileHandle
 import com.example.transfer.storage.ResumableIncomingFileStore
 import com.example.transfer.storage.StoredFileLocation
 import com.example.transfer.transfer.SendFileSource
+import com.example.transfer.transfer.SendFileMetadata
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertArrayEquals
@@ -31,6 +32,32 @@ import java.util.concurrent.Executors
 
 class ResumeCoordinatorTest {
     private val now = 1_000_000L
+
+    @Test
+    fun `prepare rejects source whose current size differs from selection metadata`() = runBlocking {
+        val store = FakeResumeStore()
+        val coordinator = coordinator(store)
+        val stale = source(length = 3L, currentLength = 4L)
+
+        val failure = runCatching {
+            coordinator.prepareOutgoing(stale, "peer-1", "sender-1")
+        }.exceptionOrNull()
+
+        assertTrue(failure is ResumeValidationException)
+        assertTrue(store.outgoing.isEmpty())
+    }
+
+    @Test
+    fun `prepare rejects source whose current modification time changed`() = runBlocking {
+        val coordinator = coordinator()
+        val stale = source(lastModified = 42L, currentLastModified = 43L)
+
+        val failure = runCatching {
+            coordinator.prepareOutgoing(stale, "peer-1", "sender-1")
+        }.exceptionOrNull()
+
+        assertTrue(failure is ResumeValidationException)
+    }
 
     @Test
     fun `stable source identity reuses transfer id`() = runBlocking {
@@ -1170,14 +1197,17 @@ class ResumeCoordinatorTest {
     private fun source(
         bytes: ByteArray = byteArrayOf(1, 2, 3),
         length: Long = bytes.size.toLong(),
-        lastModified: Long? = 42L
+        lastModified: Long? = 42L,
+        currentLength: Long = length,
+        currentLastModified: Long? = lastModified
     ) = SendFileSource(
         displayName = "a.bin",
         mimeType = "application/octet-stream",
         length = length,
         sourceUri = "content://a",
         lastModified = lastModified,
-        openStream = { ByteArrayInputStream(bytes) }
+        openStream = { ByteArrayInputStream(bytes) },
+        metadataProvider = { SendFileMetadata(currentLength, currentLastModified) }
     )
 
     private fun offer(fileSize: Long = 3L) = TransferOffer(

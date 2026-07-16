@@ -38,6 +38,34 @@ import org.junit.Test
 
 class FileTransferClientOperationTest {
     @Test
+    fun `send rejects changed source before opening stream or connecting`() = runBlocking {
+        val offer = offer(3)
+        var opens = 0
+        val source = SendFileSource(
+            offer.fileName,
+            offer.mimeType,
+            offer.fileSize,
+            "content://changed",
+            10L,
+            openStream = {
+                opens++
+                ByteArrayInputStream(byteArrayOf(1, 2, 3))
+            },
+            metadataProvider = { SendFileMetadata(4L, 10L) }
+        )
+
+        val result = FileTransferClient().sendPrepared(
+            InetAddress.getLoopbackAddress(), 1,
+            PreparedTransfer(offer, source, ResumeStatus(ResumeState.NONE)),
+            TransferStartMode.NEW, ResumeStatus(ResumeState.NONE),
+            TransferPauseController(), {}, {}
+        )
+
+        assertTrue(result.exceptionOrNull() is com.example.transfer.resume.ResumeValidationException)
+        assertEquals(0, opens)
+    }
+
+    @Test
     fun `resume query timeout scales conservatively with offered file size`() {
         assertEquals(15_000, FileTransferClient.queryReadTimeoutMillis(0))
         assertTrue(
@@ -315,7 +343,7 @@ class FileTransferClientOperationTest {
         offer,
         SendFileSource(
             offer.fileName, offer.mimeType, offer.fileSize,
-            "content://test/${offer.transferId}", 1L, open
+            "content://test/${offer.transferId}", 1L, openStream = open
         ),
         ResumeStatus(ResumeState.NONE)
     )
