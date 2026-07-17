@@ -81,6 +81,7 @@ class TransferForegroundService : Service() {
             this@TransferForegroundService.confirmResume(promptId, choice)
         override fun pause(): Boolean = this@TransferForegroundService.pause()
         override fun resume(): Boolean = this@TransferForegroundService.resume()
+        override fun cancelOutgoing(): Boolean = this@TransferForegroundService.cancelOutgoing()
         override fun createPairingOffer(): Boolean =
             this@TransferForegroundService.createPairingOffer()
         override fun dismissPairingOffer(rawPayload: String): Boolean =
@@ -273,6 +274,7 @@ class TransferForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_PAUSE) pause()
         if (intent?.action == ACTION_RESUME) resume()
+        if (intent?.action == ACTION_CANCEL) cancelOutgoing()
         if (intent?.action == ACTION_STOP) {
             shutdown()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -681,6 +683,11 @@ class TransferForegroundService : Service() {
                 }
             } catch (exception: CancellationException) {
                 interruptOutgoingBatch(batchId)
+                publish { current ->
+                    if (activePauseController !== controller) current else {
+                        current.withCancelledOutgoing("传输已取消，可稍后继续")
+                    }
+                }
                 throw exception
             } catch (exception: Exception) {
                 interruptOutgoingBatch(batchId)
@@ -745,6 +752,17 @@ class TransferForegroundService : Service() {
     fun resume(): Boolean {
         val controller = activePauseController ?: return false
         return controller.requestResume()
+    }
+
+    fun cancelOutgoing(): Boolean {
+        val controller = activePauseController ?: return false
+        val job = activeBatchJob ?: return false
+        if (controller.state == TransferPauseState.CANCELLED) return false
+        controller.cancel()
+        publishPauseState(controller)
+        client.cancelActive()
+        job.cancel(CancellationException("Outgoing transfer cancelled"))
+        return true
     }
 
     private fun beginTransfer(): Boolean {
@@ -979,6 +997,7 @@ class TransferForegroundService : Service() {
         const val ACTION_START = "com.example.transfer.action.START"
         const val ACTION_PAUSE = "com.example.transfer.action.PAUSE"
         const val ACTION_RESUME = "com.example.transfer.action.RESUME"
+        const val ACTION_CANCEL = "com.example.transfer.action.CANCEL"
         const val ACTION_STOP = "com.example.transfer.action.STOP"
         private const val MAX_LOCK_MILLIS = 12L * 60 * 60 * 1000
         private const val LOG_TAG = "TransferService"

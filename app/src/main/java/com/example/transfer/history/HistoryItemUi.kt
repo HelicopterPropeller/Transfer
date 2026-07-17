@@ -24,7 +24,8 @@ data class HistoryItemUi(
     val sourceUri: String?,
     val receivedUri: String?,
     val showResend: Boolean,
-    val showOpen: Boolean
+    val showOpen: Boolean,
+    val isActiveOutgoing: Boolean
 ) {
     companion object {
         @RequiresApi(Build.VERSION_CODES.O)
@@ -73,7 +74,9 @@ data class HistoryItemUi(
                     !entry.sourceUri.isNullOrBlank(),
                 showOpen = entry.direction == TransferDirection.RECEIVE &&
                     entry.status == TransferHistoryStatus.SUCCESS &&
-                    !entry.receivedUri.isNullOrBlank()
+                    !entry.receivedUri.isNullOrBlank(),
+                isActiveOutgoing = entry.direction == TransferDirection.SEND &&
+                    entry.status == TransferHistoryStatus.IN_PROGRESS
             )
         }
 

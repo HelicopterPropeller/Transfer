@@ -17,7 +17,10 @@ data class HistoryUiState(
     val items: List<HistoryItemUi> = emptyList(),
     val empty: Boolean = true,
     val errorMessage: String? = null
-)
+) {
+    val hasActiveOutgoing: Boolean
+        get() = items.any(HistoryItemUi::isActiveOutgoing)
+}
 
 class HistoryViewModel(application: Application) : AndroidViewModel(application) {
     private val store: TransferHistoryStore = TransferHistoryRepository(

@@ -12,6 +12,22 @@ import java.util.TimeZone
 
 class HistoryItemUiTest {
     @Test
+    fun `only in-progress outgoing rows cancel the active batch when deleted`() {
+        assertTrue(item(entry(
+            direction = TransferDirection.SEND,
+            status = TransferHistoryStatus.IN_PROGRESS
+        )).isActiveOutgoing)
+        assertFalse(item(entry(
+            direction = TransferDirection.SEND,
+            status = TransferHistoryStatus.INTERRUPTED
+        )).isActiveOutgoing)
+        assertFalse(item(entry(
+            direction = TransferDirection.RECEIVE,
+            status = TransferHistoryStatus.IN_PROGRESS
+        )).isActiveOutgoing)
+    }
+
+    @Test
     fun `mapper preserves peer id for retry preference`() {
         assertEquals("peer-a", item(entry()).peerId)
     }

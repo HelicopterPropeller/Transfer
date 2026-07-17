@@ -128,6 +128,11 @@ data class TransferUiState(
             it.active && it.direction == "发送" &&
                 (it.pauseState == TransferPauseState.PAUSING || it.pauseState == TransferPauseState.PAUSED)
         } == true
+
+    val canCancel: Boolean
+        get() = transfer?.let {
+            it.active && it.direction == "发送" && it.pauseState != TransferPauseState.CANCELLED
+        } == true
 }
 
 object TransferUiReducer {

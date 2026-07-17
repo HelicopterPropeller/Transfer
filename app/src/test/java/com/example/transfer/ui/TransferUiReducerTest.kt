@@ -17,6 +17,24 @@ import java.net.InetAddress
 
 class TransferUiReducerTest {
     @Test
+    fun `active outgoing transfer can be cancelled including while paused`() {
+        val running = TransferUiState(transfer = TransferStatus(
+            "发送", "a.txt", 40, "正在发送", true,
+            pauseState = TransferPauseState.RUNNING
+        ))
+        val paused = running.copy(transfer = running.transfer!!.copy(
+            pauseState = TransferPauseState.PAUSED
+        ))
+        val incoming = running.copy(transfer = running.transfer!!.copy(direction = "接收"))
+        val finished = running.copy(transfer = running.transfer!!.copy(active = false))
+
+        assertTrue(running.canCancel)
+        assertTrue(paused.canCancel)
+        assertFalse(incoming.canCancel)
+        assertFalse(finished.canCancel)
+    }
+
+    @Test
     fun `verified qr peer is selected once and pairing offer is surfaced`() {
         val offer = PairingOfferUi("lantransfer://pair?...", "192.168.1.20", 123L)
         val result = TransferUiReducer.withServiceState(

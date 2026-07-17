@@ -26,12 +26,15 @@ import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.doOnLayout
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.transfer.history.HistoryActivity
 import com.example.transfer.history.HistoryRetryContract
 import com.example.transfer.pairing.QrBitmapEncoder
+import com.example.transfer.pairing.QrDisplaySizer
+import com.example.transfer.pairing.QrScanConfiguration
 import com.example.transfer.service.PairingOfferUi
 import com.example.transfer.service.TransferForegroundService
 import com.example.transfer.service.ResumeChoice
@@ -83,6 +86,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var transferProgress: ProgressBar
     private lateinit var transferMessageText: TextView
     private lateinit var pauseResumeButton: MaterialButton
+    private lateinit var cancelTransferButton: MaterialButton
     private var pairingDialog: AlertDialog? = null
     private var pairingDialogPayload: String? = null
     private var pairingCountdown: CountDownTimer? = null
@@ -148,6 +152,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocuments.launch(arrayOf("*/*")) }
         sendButton.setOnClickListener { viewModel.sendSelected() }
         pauseResumeButton.setOnClickListener { viewModel.togglePause() }
+        cancelTransferButton.setOnClickListener { confirmCancelTransfer() }
         val serviceIntent = Intent(this, TransferForegroundService::class.java)
             .setAction(TransferForegroundService.ACTION_START)
         ContextCompat.startForegroundService(this, serviceIntent)
@@ -198,6 +203,7 @@ class MainActivity : AppCompatActivity() {
         transferProgress = findViewById(R.id.transferProgress)
         transferMessageText = findViewById(R.id.transferMessageText)
         pauseResumeButton = findViewById(R.id.pauseResumeButton)
+        cancelTransferButton = findViewById(R.id.cancelTransferButton)
     }
 
     private fun render(state: TransferUiState) {
@@ -240,6 +246,7 @@ class MainActivity : AppCompatActivity() {
                 transferMessageText.text = getString(R.string.transfer_message, transfer.progress, transfer.message)
                 pauseResumeButton.visibility = if (state.canPause || state.canResume) View.VISIBLE else View.GONE
                 pauseResumeButton.setText(if (state.canPause) R.string.pause else R.string.resume)
+                cancelTransferButton.visibility = if (state.canCancel) View.VISIBLE else View.GONE
             }
         }
         state.resumePrompt?.let { prompt ->
@@ -313,12 +320,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun launchQrScanner() {
         scanQr.launch(
-            ScanOptions()
-                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                .setPrompt(getString(R.string.scan_connection_qr))
-                .setBeepEnabled(false)
-                .setOrientationLocked(false)
+            QrScanConfiguration.applyTo(
+                ScanOptions().setPrompt(getString(R.string.qr_scan_instruction))
+            )
         )
+    }
+
+    private fun confirmCancelTransfer() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.cancel_transfer_title)
+            .setMessage(R.string.cancel_transfer_message)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.cancel_transfer) { _, _ -> viewModel.cancelOutgoing() }
+            .show()
     }
 
     private fun renderPairingOffer(offer: PairingOfferUi?) {
@@ -362,12 +376,23 @@ class MainActivity : AppCompatActivity() {
         dialog.findViewById<TextView>(R.id.pairingAddressText)?.text =
             getString(R.string.connection_qr_address, offer.address)
         val imageView = dialog.findViewById<ImageView>(R.id.pairingQrImage)
-        lifecycleScope.launch {
-            val size = (280 * resources.displayMetrics.density).toInt().coerceIn(280, 1024)
-            val bitmap = withContext(Dispatchers.Default) {
-                QrBitmapEncoder.encode(offer.rawPayload, size)
+        dialog.findViewById<View>(R.id.pairingDialogContent)?.doOnLayout { content ->
+            val density = resources.displayMetrics.density
+            val size = QrDisplaySizer.side(
+                availableWidthPx = content.width - content.paddingStart - content.paddingEnd,
+                maximumPx = (280 * density).toInt(),
+                fallbackPx = (240 * density).toInt()
+            )
+            imageView?.layoutParams = imageView?.layoutParams?.apply {
+                width = size
+                height = size
             }
-            if (pairingDialogPayload == offer.rawPayload) imageView?.setImageBitmap(bitmap)
+            lifecycleScope.launch {
+                val bitmap = withContext(Dispatchers.Default) {
+                    QrBitmapEncoder.encode(offer.rawPayload, size)
+                }
+                if (pairingDialogPayload == offer.rawPayload) imageView?.setImageBitmap(bitmap)
+            }
         }
         pairingCountdown?.cancel()
         val remaining = (offer.expiresAt - System.currentTimeMillis()).coerceAtLeast(0L)

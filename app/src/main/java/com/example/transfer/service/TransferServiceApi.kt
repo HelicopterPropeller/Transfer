@@ -10,6 +10,7 @@ interface TransferServiceApi {
     fun confirmResume(promptId: Long, choice: ResumeChoice): Boolean
     fun pause(): Boolean
     fun resume(): Boolean
+    fun cancelOutgoing(): Boolean = false
     fun createPairingOffer(): Boolean
     fun dismissPairingOffer(rawPayload: String): Boolean
     fun connectQr(rawPayload: String): Boolean

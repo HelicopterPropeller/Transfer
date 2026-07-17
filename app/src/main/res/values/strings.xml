@@ -54,6 +54,14 @@
     <string name="refresh_connection_qr">Refresh</string>
     <string name="camera_permission_denied">Camera permission is required to scan a QR code</string>
     <string name="qr_scan_cancelled">QR scan cancelled</string>
+    <string name="qr_scan_title">Scan connection QR</string>
+    <string name="qr_scan_instruction">Place the connection QR code inside the frame</string>
+    <string name="qr_scan_close">Close scanner</string>
+    <string name="cancel_transfer">取消传输</string>
+    <string name="cancel_transfer_title">取消当前发送？</string>
+    <string name="cancel_transfer_message">将停止整个多文件发送批次，未完成的文件可稍后继续传输。</string>
+    <string name="delete_active_history_message">删除这条记录会同时取消当前整个多文件发送批次，未完成的文件可稍后继续。</string>
+    <string name="clear_active_history_message">清空记录会同时取消当前整个多文件发送批次，未完成的文件可稍后继续。</string>
     <plurals name="resume_transfer_message">
         <item quantity="one">%d 个中断文件可以继续传输</item>
         <item quantity="other">%d 个中断文件可以继续传输</item>

@@ -9,4 +9,7 @@
     <color name="text_secondary">#5C667A</color>
     <color name="text_tertiary">#8791A4</color>
     <color name="status_green">#18865D</color>
+    <color name="qr_scan_background">#0B1020</color>
+    <color name="qr_scan_mask">#990B1020</color>
+    <color name="qr_scan_control">#B31B2235</color>
 </resources>

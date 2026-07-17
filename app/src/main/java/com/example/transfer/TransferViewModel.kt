@@ -96,6 +96,10 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun cancelOutgoing() {
+        service?.cancelOutgoing()
+    }
+
     fun confirmResume(promptId: Long, choice: ResumeChoice) {
         pendingResumeConfirmation.confirm(promptId, choice)
     }

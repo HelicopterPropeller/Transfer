@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/qr_scan_background">
+
+    <com.journeyapps.barcodescanner.DecoratedBarcodeView
+        android:id="@+id/zxing_barcode_scanner"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        app:zxing_preview_scaling_strategy="centerCrop"
+        app:zxing_scanner_layout="@layout/view_qr_barcode_scanner"
+        app:zxing_use_texture_view="false"
+        app:zxing_viewfinder_laser="@color/brand_blue"
+        app:zxing_viewfinder_mask="@color/qr_scan_mask" />
+
+    <TextView
+        android:id="@+id/qrScanCloseButton"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/bg_qr_scan_control"
+        android:contentDescription="@string/qr_scan_close"
+        android:gravity="center"
+        android:text="×"
+        android:textColor="@android:color/white"
+        android:textSize="30sp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="27dp"
+        android:text="@string/qr_scan_title"
+        android:textColor="@android:color/white"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp"
+        android:layout_marginBottom="48dp"
+        android:background="@drawable/bg_qr_scan_control"
+        android:gravity="center"
+        android:paddingStart="20dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="12dp"
+        android:text="@string/qr_scan_instruction"
+        android:textColor="@android:color/white"
+        android:textSize="15sp" />
+</FrameLayout>

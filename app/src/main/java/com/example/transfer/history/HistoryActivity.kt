@@ -8,6 +8,7 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -15,6 +16,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.example.transfer.MainActivity
 import com.example.transfer.R
+import com.example.transfer.service.TransferForegroundService
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -26,6 +28,7 @@ class HistoryActivity : AppCompatActivity() {
     private lateinit var adapter: HistoryAdapter
     private lateinit var emptyView: View
     private lateinit var clearButton: MaterialButton
+    private var latestState = HistoryUiState()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,6 +62,7 @@ class HistoryActivity : AppCompatActivity() {
     }
 
     private fun render(state: HistoryUiState) {
+        latestState = state
         adapter.submitList(state.items)
         emptyView.visibility = if (state.empty) View.VISIBLE else View.GONE
         clearButton.isEnabled = !state.empty
@@ -71,19 +75,47 @@ class HistoryActivity : AppCompatActivity() {
     private fun confirmDelete(item: HistoryItemUi) {
         MaterialAlertDialogBuilder(this)
             .setTitle(R.string.delete_history_title)
-            .setMessage(R.string.delete_history_message)
+            .setMessage(if (item.isActiveOutgoing) {
+                R.string.delete_active_history_message
+            } else {
+                R.string.delete_history_message
+            })
             .setNegativeButton(R.string.cancel, null)
-            .setPositiveButton(R.string.delete_record) { _, _ -> viewModel.delete(item.id) }
+            .setPositiveButton(R.string.delete_record) { _, _ ->
+                HistoryMutationPolicy.mutate(
+                    cancelActiveOutgoing = item.isActiveOutgoing,
+                    cancel = ::requestOutgoingCancellation,
+                    mutation = { viewModel.delete(item.id) }
+                )
+            }
             .show()
     }
 
     private fun confirmClear() {
         MaterialAlertDialogBuilder(this)
             .setTitle(R.string.clear_history_title)
-            .setMessage(R.string.clear_history_message)
+            .setMessage(if (latestState.hasActiveOutgoing) {
+                R.string.clear_active_history_message
+            } else {
+                R.string.clear_history_message
+            })
             .setNegativeButton(R.string.cancel, null)
-            .setPositiveButton(R.string.clear_history) { _, _ -> viewModel.clear() }
+            .setPositiveButton(R.string.clear_history) { _, _ ->
+                HistoryMutationPolicy.mutate(
+                    cancelActiveOutgoing = latestState.hasActiveOutgoing,
+                    cancel = ::requestOutgoingCancellation,
+                    mutation = viewModel::clear
+                )
+            }
             .show()
+    }
+
+    private fun requestOutgoingCancellation() {
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, TransferForegroundService::class.java)
+                .setAction(TransferForegroundService.ACTION_CANCEL)
+        )
     }
 
     private fun performPrimaryAction(item: HistoryItemUi) {

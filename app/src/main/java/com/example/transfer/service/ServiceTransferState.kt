@@ -109,6 +109,16 @@ internal fun ServiceTransferState.withInactiveBatchFailure(message: String): Ser
     })
 }
 
+internal fun ServiceTransferState.withCancelledOutgoing(message: String): ServiceTransferState {
+    val current = transfer ?: return this
+    if (current.direction != "发送") return this
+    return copy(transfer = current.copy(
+        message = message,
+        active = false,
+        pauseState = TransferPauseState.CANCELLED
+    ))
+}
+
 internal fun ServiceTransferState.withResumePromptPublicationFailure(
     failedPromptId: Long,
     message: String

@@ -43,6 +43,10 @@
             android:name=".history.HistoryActivity"
             android:exported="false" />
         <activity
+            android:name=".pairing.QrScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
             android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
