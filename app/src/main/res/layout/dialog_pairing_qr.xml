@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    android:paddingStart="24dp"
+    android:paddingTop="8dp"
+    android:paddingEnd="24dp"
+    android:paddingBottom="8dp">
+
+    <ImageView
+        android:id="@+id/pairingQrImage"
+        android:layout_width="280dp"
+        android:layout_height="280dp"
+        android:contentDescription="@string/connection_qr_content_description"
+        android:scaleType="fitCenter" />
+
+    <TextView
+        android:id="@+id/pairingAddressText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textColor="@color/text_secondary"
+        android:textSize="14sp" />
+
+    <TextView
+        android:id="@+id/pairingCountdownText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:textColor="@color/text_secondary"
+        android:textSize="14sp" />
+</LinearLayout>

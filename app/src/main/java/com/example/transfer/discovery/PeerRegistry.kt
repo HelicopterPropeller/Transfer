@@ -8,20 +8,32 @@ class PeerRegistry(private val selfId: String) {
     @Synchronized
     fun update(packet: DiscoveryPacket, address: InetAddress, nowMillis: Long): Boolean {
         if (packet.id == selfId) return false
+        val origin = peers[packet.id]?.origin ?: PeerOrigin.UDP
         peers[packet.id] = DiscoveredDevice(
             id = packet.id,
             name = packet.name,
             address = address,
             port = packet.port,
-            lastSeenMillis = nowMillis
+            lastSeenMillis = nowMillis,
+            origin = origin
         )
+        return true
+    }
+
+    @Synchronized
+    fun addSessionPeer(device: DiscoveredDevice): Boolean {
+        if (device.id == selfId) return false
+        peers[device.id] = device.copy(origin = PeerOrigin.QR)
         return true
     }
 
     @Synchronized
     fun removeExpired(nowMillis: Long): Boolean {
         val sizeBefore = peers.size
-        peers.entries.removeAll { nowMillis - it.value.lastSeenMillis > EXPIRY_MILLIS }
+        peers.entries.removeAll {
+            it.value.origin == PeerOrigin.UDP &&
+                nowMillis - it.value.lastSeenMillis > EXPIRY_MILLIS
+        }
         return peers.size != sizeBefore
     }
 

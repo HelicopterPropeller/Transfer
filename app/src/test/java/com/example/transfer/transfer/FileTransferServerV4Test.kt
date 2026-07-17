@@ -1,6 +1,12 @@
 package com.example.transfer.transfer
 
 import com.example.transfer.history.IncomingTransferHistory
+import com.example.transfer.pairing.PairingProtocol
+import com.example.transfer.pairing.PairingRequest
+import com.example.transfer.pairing.PairingRequestHandler
+import com.example.transfer.pairing.PairingResponse
+import com.example.transfer.pairing.PairingStatus
+import com.example.transfer.pairing.PairingTokenManager
 import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.ConnectionKind
 import com.example.transfer.protocol.ConnectionProtocol
@@ -899,6 +905,41 @@ class FileTransferServerV4Test {
     }
 
     @Test
+    fun `pairing bypasses transfer busy gate and token is consumed once`() = runBlocking {
+        val tokenManager = PairingTokenManager(randomBytes = { ByteArray(it) { 9 } })
+        val token = tokenManager.issue()
+        val harness = V4Harness(
+            exclusiveBusyGate = true,
+            pairingRequestHandler = PairingRequestHandler { request ->
+                if (tokenManager.consume(request.token)) {
+                    PairingResponse.accepted("receiver", "Receiver", 42043)
+                } else {
+                    PairingResponse(PairingStatus.REJECTED)
+                }
+            }
+        )
+        val offer = harness.offer(1)
+        var active: Socket? = null
+        try {
+            active = Socket(InetAddress.getLoopbackAddress(), harness.port())
+            start(
+                DataOutputStream(BufferedOutputStream(active.getOutputStream())),
+                offer, TransferStartMode.NEW, ResumeStatus(ResumeState.NONE)
+            )
+            withTimeout(2_000) {
+                while (harness.store.findIncoming(offer.transferId) == null) delay(10)
+            }
+
+            assertEquals(PairingStatus.ACCEPTED, harness.pair(token.value).status)
+            assertEquals(PairingStatus.REJECTED, harness.pair(token.value).status)
+            assertEquals(1, harness.startCalls)
+        } finally {
+            active?.close()
+            harness.close()
+        }
+    }
+
+    @Test
     fun `raw v3 receives explicit fatal response`() = runBlocking {
         val harness = V4Harness()
         try {
@@ -995,7 +1036,10 @@ private class V4Harness(
     maxActiveConnections: Int = FileTransferServer.MAX_ACTIVE_CONNECTIONS,
     maxConcurrentQueries: Int = FileTransferServer.MAX_CONCURRENT_QUERIES,
     private val recordAttempts: Boolean = false,
-    monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 }
+    monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
+    pairingRequestHandler: PairingRequestHandler = PairingRequestHandler {
+        PairingResponse(PairingStatus.REJECTED)
+    }
 ) {
     val store = SocketResumeStore()
     val files = SocketFiles()
@@ -1025,6 +1069,7 @@ private class V4Harness(
             busy = false
         },
         history = history,
+        pairingRequestHandler = pairingRequestHandler,
         maxActiveConnections = maxActiveConnections,
         maxConcurrentQueries = maxConcurrentQueries,
         onServerStopping = { stopping.countDown() }
@@ -1051,6 +1096,17 @@ private class V4Harness(
     }
 
     suspend fun port() = withTimeout(2_000) { ready.await() }
+
+    suspend fun pair(token: String): PairingResponse =
+        Socket(InetAddress.getLoopbackAddress(), port()).use { socket ->
+            socket.soTimeout = 2_000
+            val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+            ConnectionProtocol.writePreamble(output, ConnectionKind.PAIR_REQUEST)
+            PairingProtocol.writeRequest(output, PairingRequest(token, "sender", "Sender"))
+            output.flush()
+            PairingProtocol.readResponse(input)
+        }
 
     fun offer(size: Long) = TransferOffer(
         UUID.randomUUID().toString(), "sender", "a.bin", "application/octet-stream", size

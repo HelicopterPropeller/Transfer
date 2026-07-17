@@ -16,12 +16,20 @@ import com.example.transfer.batch.OutgoingBatchState
 import com.example.transfer.batch.RoomOutgoingBatchStore
 import com.example.transfer.discovery.DiscoveryManager
 import com.example.transfer.discovery.DiscoveredDevice
+import com.example.transfer.discovery.PeerOrigin
 import com.example.transfer.history.HistoryPeer
 import com.example.transfer.history.IncomingHistoryRecorder
 import com.example.transfer.history.OutgoingHistoryRecorder
 import com.example.transfer.history.TransferHistoryDatabase
 import com.example.transfer.history.TransferHistoryRepository
 import com.example.transfer.protocol.TransferStartMode
+import com.example.transfer.pairing.PairingClient
+import com.example.transfer.pairing.PairingPayload
+import com.example.transfer.pairing.PairingPayloadCodec
+import com.example.transfer.pairing.PairingResponse
+import com.example.transfer.pairing.PairingStatus
+import com.example.transfer.pairing.PairingTokenManager
+import com.example.transfer.pairing.WifiLanAddressProvider
 import com.example.transfer.resume.ResumeCoordinator
 import com.example.transfer.resume.PreparedTransfer
 import com.example.transfer.resume.ResumeCleanup
@@ -73,6 +81,14 @@ class TransferForegroundService : Service() {
             this@TransferForegroundService.confirmResume(promptId, choice)
         override fun pause(): Boolean = this@TransferForegroundService.pause()
         override fun resume(): Boolean = this@TransferForegroundService.resume()
+        override fun createPairingOffer(): Boolean =
+            this@TransferForegroundService.createPairingOffer()
+        override fun dismissPairingOffer(rawPayload: String): Boolean =
+            this@TransferForegroundService.dismissPairingOffer(rawPayload)
+        override fun connectQr(rawPayload: String): Boolean =
+            this@TransferForegroundService.connectQr(rawPayload)
+        override fun acknowledgeQrPeer(deviceId: String): Boolean =
+            this@TransferForegroundService.acknowledgeQrPeer(deviceId)
     }
 
     private val binder = LocalBinder()
@@ -96,7 +112,12 @@ class TransferForegroundService : Service() {
     private lateinit var resumeStartupGate: ResumeStartupGate
     private lateinit var resumeMaintenance: ResumeMaintenance
     private lateinit var localDeviceId: String
+    private lateinit var localDeviceName: String
+    private lateinit var lanAddressProvider: WifiLanAddressProvider
     private val client = FileTransferClient()
+    private val pairingClient = PairingClient()
+    private val pairingTokens = PairingTokenManager()
+    private val pairingConnecting = AtomicBoolean(false)
     @Volatile private var activePauseController: TransferPauseController? = null
     @Volatile private var activeBatchJob: Job? = null
     @Volatile private var activePreflightJob: Job? = null
@@ -122,9 +143,10 @@ class TransferForegroundService : Service() {
                 preferences.edit { putString("device_id", it) }
             }
         }
-        val deviceName = listOf(Build.MANUFACTURER, Build.MODEL).filter(String::isNotBlank)
+        localDeviceName = listOf(Build.MANUFACTURER, Build.MODEL).filter(String::isNotBlank)
             .joinToString(" ").ifBlank { "Android 设备" }
-        discovery = DiscoveryManager(this, localDeviceId, deviceName)
+        lanAddressProvider = WifiLanAddressProvider(this)
+        discovery = DiscoveryManager(this, localDeviceId, localDeviceName)
         val downloadStorage = DownloadStorage(this)
         val resumeStore = RoomResumeStore(database.resumeDao())
         resumeCoordinator = ResumeCoordinator(resumeStore, downloadStorage)
@@ -153,6 +175,15 @@ class TransferForegroundService : Service() {
         }
         server = FileTransferServer(
             resumeCoordinator = resumeCoordinator,
+            pairingRequestHandler = { request ->
+                val port = server.listeningPort()
+                if (port != null && pairingTokens.consume(request.token)) {
+                    publish { current -> current.copy(pairingOffer = null) }
+                    PairingResponse.accepted(localDeviceId, localDeviceName, port)
+                } else {
+                    PairingResponse(PairingStatus.REJECTED)
+                }
+            },
             onTransferAttemptStart = ::beginIncomingAttempt,
             onTransferAttemptEnd = ::endIncomingAttempt,
             history = IncomingHistoryRecorder(historyRepository) { address ->
@@ -252,6 +283,105 @@ class TransferForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
+
+    fun createPairingOffer(): Boolean {
+        var created = false
+        terminationGate.runIfOpen {
+            val port = server.listeningPort()
+            val address = lanAddressProvider.currentPrivateIpv4()
+            if (port == null || address == null) {
+                publishNow { current ->
+                    current.copy(serviceMessage = "QR connection requires an active private Wi-Fi address")
+                }
+                return@runIfOpen
+            }
+            val token = pairingTokens.issue()
+            val payload = PairingPayload(
+                version = 4,
+                deviceId = localDeviceId,
+                deviceName = localDeviceName,
+                ip = address.hostAddress.orEmpty(),
+                port = port,
+                token = token.value,
+                expiresAt = token.expiresAt
+            )
+            val raw = runCatching { PairingPayloadCodec.encode(payload) }.getOrElse {
+                pairingTokens.invalidate()
+                publishNow { current -> current.copy(serviceMessage = "Unable to create pairing QR") }
+                return@runIfOpen
+            }
+            publishNow { current ->
+                current.copy(pairingOffer = PairingOfferUi(raw, payload.ip, token.expiresAt))
+            }
+            created = true
+        }
+        return created
+    }
+
+    fun dismissPairingOffer(rawPayload: String): Boolean {
+        var dismissed = false
+        terminationGate.runIfOpen {
+            if (state.value.pairingOffer?.rawPayload != rawPayload) return@runIfOpen
+            pairingTokens.invalidate()
+            publishNow { current -> current.copy(pairingOffer = null) }
+            dismissed = true
+        }
+        return dismissed
+    }
+
+    fun connectQr(rawPayload: String): Boolean {
+        val payload = runCatching {
+            PairingPayloadCodec.decode(rawPayload, System.currentTimeMillis())
+        }.getOrElse {
+            publish { current -> current.copy(serviceMessage = "Invalid or expired connection QR") }
+            return false
+        }
+        if (payload.deviceId == localDeviceId || !pairingConnecting.compareAndSet(false, true)) {
+            publish { current -> current.copy(serviceMessage = "Unable to connect to this QR") }
+            return false
+        }
+        val started = terminationGate.runIfOpen {
+            serviceScope.launch {
+                try {
+                    val peer = pairingClient.connect(payload, localDeviceId, localDeviceName)
+                    discovery.addQrPeer(
+                        DiscoveredDevice(
+                            id = peer.id,
+                            name = peer.name,
+                            address = peer.address,
+                            port = peer.port,
+                            lastSeenMillis = System.currentTimeMillis(),
+                            origin = PeerOrigin.QR
+                        )
+                    )
+                    publish { current ->
+                        current.copy(
+                            preferredQrPeerId = peer.id,
+                            serviceMessage = "Connected to ${peer.name} by QR"
+                        )
+                    }
+                } catch (error: Exception) {
+                    publish { current ->
+                        current.copy(serviceMessage = "QR connection failed: ${error.message.orEmpty()}")
+                    }
+                } finally {
+                    pairingConnecting.set(false)
+                }
+            }
+        }
+        if (!started) pairingConnecting.set(false)
+        return started
+    }
+
+    fun acknowledgeQrPeer(deviceId: String): Boolean {
+        var acknowledged = false
+        terminationGate.runIfOpen {
+            if (state.value.preferredQrPeerId != deviceId) return@runIfOpen
+            publishNow { current -> current.copy(preferredQrPeerId = null) }
+            acknowledged = true
+        }
+        return acknowledged
+    }
 
     fun send(deviceId: String, files: List<SelectedFile>): Boolean {
         if (files.isEmpty() || checkedBatchLength(files.map { it.size }) == null) return false
@@ -805,9 +935,11 @@ class TransferForegroundService : Service() {
     }
 
     private fun cancelResourcesOnce() {
+        pairingTokens.invalidate()
         shutdownCoordinator.shutdown(
             cancelOutgoing = {
                 resumePreflight.clear()
+                pairingClient.cancelActive()
                 activePreflightJob?.cancel()
                 activePauseController?.cancel()
                 client.cancelActive()

@@ -42,6 +42,18 @@
     <string name="resume_transfer_title">继续传输？</string>
     <string name="resume_available">继续传输</string>
     <string name="restart_all">全部重传</string>
+    <string name="show_connection_qr">Show QR</string>
+    <string name="scan_connection_qr">Scan QR</string>
+    <string name="connection_qr_title">Connect by QR</string>
+    <string name="connection_qr_content_description">Connection QR code</string>
+    <string name="connection_qr_address">Wi-Fi address: %1$s</string>
+    <plurals name="connection_qr_expires">
+        <item quantity="one">Expires in %d second</item>
+        <item quantity="other">Expires in %d seconds</item>
+    </plurals>
+    <string name="refresh_connection_qr">Refresh</string>
+    <string name="camera_permission_denied">Camera permission is required to scan a QR code</string>
+    <string name="qr_scan_cancelled">QR scan cancelled</string>
     <plurals name="resume_transfer_message">
         <item quantity="one">%d 个中断文件可以继续传输</item>
         <item quantity="other">%d 个中断文件可以继续传输</item>

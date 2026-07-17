@@ -27,4 +27,33 @@ class PeerRegistryTest {
         assertTrue(registry.removeExpired(6_301))
         assertEquals(emptyList<DiscoveredDevice>(), registry.snapshot())
     }
+
+    @Test
+    fun `qr peers survive udp expiry and udp refresh preserves qr origin`() {
+        val registry = PeerRegistry("self")
+        val qrAddress = InetAddress.getByName("192.168.1.8")
+        val udpAddress = InetAddress.getByName("192.168.1.9")
+
+        assertTrue(registry.addSessionPeer(
+            DiscoveredDevice("peer", "QR Peer", qrAddress, 42043, 0, PeerOrigin.QR)
+        ))
+        assertFalse(registry.removeExpired(100_000))
+        assertEquals(PeerOrigin.QR, registry.snapshot().single().origin)
+
+        assertTrue(registry.update(DiscoveryPacket("peer", "UDP Peer", 42044), udpAddress, 100_001))
+        val refreshed = registry.snapshot().single()
+        assertEquals(PeerOrigin.QR, refreshed.origin)
+        assertEquals(udpAddress, refreshed.address)
+        assertFalse(registry.removeExpired(200_000))
+    }
+
+    @Test
+    fun `registry rejects qr self peer`() {
+        val registry = PeerRegistry("self")
+        assertFalse(registry.addSessionPeer(
+            DiscoveredDevice(
+                "self", "Me", InetAddress.getByName("192.168.1.2"), 42043, 0, PeerOrigin.QR
+            )
+        ))
+    }
 }

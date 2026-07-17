@@ -3,6 +3,7 @@ package com.example.transfer.ui
 import com.example.transfer.discovery.DiscoveredDevice
 import com.example.transfer.service.ServiceTransferState
 import com.example.transfer.service.ResumePrompt
+import com.example.transfer.service.PairingOfferUi
 import com.example.transfer.transfer.TransferPauseState
 
 data class SelectedFile(
@@ -107,7 +108,8 @@ data class TransferUiState(
     val notice: String? = null,
     val serviceStatus: String = "正在启动接收服务…",
     val transfer: TransferStatus? = null,
-    val resumePrompt: ResumePrompt? = null
+    val resumePrompt: ResumePrompt? = null,
+    val pairingOffer: PairingOfferUi? = null
 ) {
     val canSend: Boolean
         get() = selectedDeviceId != null &&
@@ -139,7 +141,15 @@ object TransferUiReducer {
                 notice = null
             )
         } ?: state
-        val withDevices = withDevices(withRecovery, service.devices)
+        val preferredQr = service.preferredQrPeerId?.takeIf { id ->
+            service.devices.any { it.id == id }
+        }
+        val withDevices = withDevices(withRecovery, service.devices).let { current ->
+            if (preferredQr == null) current else current.copy(
+                selectedDeviceId = preferredQr,
+                preferredDeviceId = null
+            )
+        }
         val transfer = service.transfer?.let {
             TransferStatus(
                 it.direction, it.fileName, it.progress, it.message, it.active,
@@ -149,7 +159,8 @@ object TransferUiReducer {
         return withDevices.copy(
             serviceStatus = service.serviceMessage,
             transfer = transfer,
-            resumePrompt = service.resumePrompt
+            resumePrompt = service.resumePrompt,
+            pairingOffer = service.pairingOffer
         )
     }
 

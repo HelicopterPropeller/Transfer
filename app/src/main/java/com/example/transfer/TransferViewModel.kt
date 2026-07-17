@@ -24,6 +24,7 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
     val state: StateFlow<TransferUiState> = mutableState.asStateFlow()
     private var service: TransferServiceApi? = null
     private var serviceCollection: Job? = null
+    private var pendingQrPayload: String? = null
     private val pendingResumeConfirmation = PendingResumeConfirmationController()
 
     fun attachService(newService: TransferServiceApi) {
@@ -37,7 +38,14 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
             newService.state.collect { serviceState ->
                 pendingResumeConfirmation.onPromptChanged(serviceState.resumePrompt?.id)
                 mutableState.update { TransferUiReducer.withServiceState(it, serviceState) }
+                serviceState.preferredQrPeerId?.takeIf { id ->
+                    mutableState.value.selectedDeviceId == id
+                }?.let(newService::acknowledgeQrPeer)
             }
+        }
+        pendingQrPayload?.also {
+            pendingQrPayload = null
+            newService.connectQr(it)
         }
     }
 
@@ -90,6 +98,24 @@ class TransferViewModel(application: Application) : AndroidViewModel(application
 
     fun confirmResume(promptId: Long, choice: ResumeChoice) {
         pendingResumeConfirmation.confirm(promptId, choice)
+    }
+
+    fun createPairingOffer() {
+        if (service?.createPairingOffer() != true) showMessage("Pairing service is not ready")
+    }
+
+    fun dismissPairingOffer(rawPayload: String) {
+        service?.dismissPairingOffer(rawPayload)
+    }
+
+    fun connectQr(rawPayload: String) {
+        val currentService = service
+        if (currentService == null) {
+            pendingQrPayload = rawPayload
+            showMessage("Waiting for the pairing service")
+        } else {
+            currentService.connectQr(rawPayload)
+        }
     }
 
     override fun onCleared() {

@@ -30,12 +30,14 @@ class DiscoveryManager(
     private var senderJob: Job? = null
     @Volatile private var socket: DatagramSocket? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var devicesCallback: ((List<DiscoveredDevice>) -> Unit)? = null
 
     fun start(
         scope: CoroutineScope,
         onDevices: (List<DiscoveredDevice>) -> Unit,
         onError: (String) -> Unit
     ) {
+        devicesCallback = onDevices
         if (receiverJob?.isActive == true) return
         val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifiManager.createMulticastLock("transfer-discovery").apply {
@@ -87,6 +89,12 @@ class DiscoveryManager(
         }
     }
 
+    fun addQrPeer(device: DiscoveredDevice): Boolean {
+        val added = registry.addSessionPeer(device)
+        if (added) devicesCallback?.invoke(registry.snapshot())
+        return added
+    }
+
     fun stop() {
         receiverJob?.cancel()
         senderJob?.cancel()
@@ -94,6 +102,7 @@ class DiscoveryManager(
         senderJob = null
         socket?.close()
         socket = null
+        devicesCallback = null
         releaseLock()
     }
 

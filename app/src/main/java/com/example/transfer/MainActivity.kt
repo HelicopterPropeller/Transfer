@@ -4,15 +4,18 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.DialogInterface
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.CountDownTimer
 import android.text.format.Formatter
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.LinearLayout
+import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +31,8 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.transfer.history.HistoryActivity
 import com.example.transfer.history.HistoryRetryContract
+import com.example.transfer.pairing.QrBitmapEncoder
+import com.example.transfer.service.PairingOfferUi
 import com.example.transfer.service.TransferForegroundService
 import com.example.transfer.service.ResumeChoice
 import com.example.transfer.service.TransferServiceApi
@@ -39,6 +44,9 @@ import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import androidx.appcompat.app.AlertDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -75,6 +83,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var transferProgress: ProgressBar
     private lateinit var transferMessageText: TextView
     private lateinit var pauseResumeButton: MaterialButton
+    private var pairingDialog: AlertDialog? = null
+    private var pairingDialogPayload: String? = null
+    private var pairingCountdown: CountDownTimer? = null
 
     private val openDocuments = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val requestToken = latestSelectionRequest.nextTokenForSelection(uris.size)
@@ -104,6 +115,14 @@ class MainActivity : AppCompatActivity() {
     private val requestNotificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         if (!it) viewModel.showMessage(getString(R.string.notification_permission_denied))
     }
+    private val scanQr = registerForActivityResult(ScanContract()) { result ->
+        result.contents?.let(viewModel::connectQr)
+            ?: viewModel.showMessage(getString(R.string.qr_scan_cancelled))
+    }
+    private val requestCameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it) launchQrScanner()
+        else viewModel.showMessage(getString(R.string.camera_permission_denied))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -118,6 +137,12 @@ class MainActivity : AppCompatActivity() {
         deviceNameText.text = viewModel.deviceName
         findViewById<MaterialButton>(R.id.historyButton).setOnClickListener {
             startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        findViewById<MaterialButton>(R.id.showQrButton).setOnClickListener {
+            viewModel.createPairingOffer()
+        }
+        findViewById<MaterialButton>(R.id.scanQrButton).setOnClickListener {
+            requestQrScan()
         }
         restoreHistoryRetry(intent)
         findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocuments.launch(arrayOf("*/*")) }
@@ -149,6 +174,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        pairingDialog?.dismiss()
         viewModel.detachService()
         if (serviceBound) {
             unbindService(serviceConnection)
@@ -175,6 +201,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render(state: TransferUiState) {
+        renderPairingOffer(state.pairingOffer)
         serviceStatusText.text = state.serviceStatus
         emptyDevicesText.visibility = if (state.devices.isEmpty()) View.VISIBLE else View.GONE
         deviceContainer.removeAllViews()
@@ -276,6 +303,89 @@ class MainActivity : AppCompatActivity() {
             }
         }
         return total
+    }
+
+    private fun requestQrScan() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        ) launchQrScanner() else requestCameraPermission.launch(Manifest.permission.CAMERA)
+    }
+
+    private fun launchQrScanner() {
+        scanQr.launch(
+            ScanOptions()
+                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt(getString(R.string.scan_connection_qr))
+                .setBeepEnabled(false)
+                .setOrientationLocked(false)
+        )
+    }
+
+    private fun renderPairingOffer(offer: PairingOfferUi?) {
+        if (offer == null) {
+            pairingCountdown?.cancel()
+            pairingCountdown = null
+            pairingDialogPayload = null
+            pairingDialog?.setOnDismissListener(null)
+            pairingDialog?.dismiss()
+            pairingDialog = null
+            return
+        }
+        val dialog = pairingDialog?.takeIf { it.isShowing } ?: run {
+            val content = layoutInflater.inflate(R.layout.dialog_pairing_qr, null)
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.connection_qr_title)
+                .setView(content)
+                .setPositiveButton(R.string.refresh_connection_qr, null)
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+                .also { created ->
+                    created.setOnShowListener {
+                        created.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                            viewModel.createPairingOffer()
+                        }
+                    }
+                    created.setOnDismissListener {
+                        val raw = pairingDialogPayload
+                        pairingCountdown?.cancel()
+                        pairingCountdown = null
+                        pairingDialogPayload = null
+                        pairingDialog = null
+                        if (raw != null) viewModel.dismissPairingOffer(raw)
+                    }
+                    created.show()
+                    pairingDialog = created
+                }
+        }
+        if (pairingDialogPayload == offer.rawPayload) return
+        pairingDialogPayload = offer.rawPayload
+        dialog.findViewById<TextView>(R.id.pairingAddressText)?.text =
+            getString(R.string.connection_qr_address, offer.address)
+        val imageView = dialog.findViewById<ImageView>(R.id.pairingQrImage)
+        lifecycleScope.launch {
+            val size = (280 * resources.displayMetrics.density).toInt().coerceIn(280, 1024)
+            val bitmap = withContext(Dispatchers.Default) {
+                QrBitmapEncoder.encode(offer.rawPayload, size)
+            }
+            if (pairingDialogPayload == offer.rawPayload) imageView?.setImageBitmap(bitmap)
+        }
+        pairingCountdown?.cancel()
+        val remaining = (offer.expiresAt - System.currentTimeMillis()).coerceAtLeast(0L)
+        pairingCountdown = object : CountDownTimer(remaining, 1_000L) {
+            override fun onTick(millisUntilFinished: Long) {
+                val seconds = ((millisUntilFinished + 999L) / 1_000L).toInt()
+                dialog.findViewById<TextView>(R.id.pairingCountdownText)?.text =
+                    resources.getQuantityString(
+                        R.plurals.connection_qr_expires,
+                        seconds,
+                        seconds
+                    )
+            }
+
+            override fun onFinish() {
+                viewModel.dismissPairingOffer(offer.rawPayload)
+            }
+        }.start()
     }
 
     private fun requestLegacyStoragePermissionIfNeeded() {

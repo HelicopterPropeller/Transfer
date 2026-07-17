@@ -1,6 +1,10 @@
 package com.example.transfer.transfer
 
 import com.example.transfer.history.IncomingTransferHistory
+import com.example.transfer.pairing.PairingProtocol
+import com.example.transfer.pairing.PairingRequestHandler
+import com.example.transfer.pairing.PairingResponse
+import com.example.transfer.pairing.PairingStatus
 import com.example.transfer.protocol.ChunkCodec
 import com.example.transfer.protocol.ConnectionKind
 import com.example.transfer.protocol.ConnectionProtocol
@@ -59,6 +63,9 @@ class FileTransferServer(
     private val afterClientRegisterBeforeStart: () -> Unit = {},
     private val onClientStarted: () -> Unit = {},
     private val onServerStopping: () -> Unit = {},
+    private val pairingRequestHandler: PairingRequestHandler = PairingRequestHandler {
+        PairingResponse(PairingStatus.REJECTED)
+    },
     maxActiveConnections: Int = MAX_ACTIVE_CONNECTIONS,
     maxConcurrentQueries: Int = MAX_CONCURRENT_QUERIES
 ) {
@@ -68,6 +75,7 @@ class FileTransferServer(
     }
 
     @Volatile private var serverSocket: ServerSocket? = null
+    @Volatile private var boundPort: Int? = null
     private var job: Job? = null
     private val lifecycleLock = Any()
     private var stopping = true
@@ -108,6 +116,7 @@ class FileTransferServer(
                         }
                     }
                     if (!registered) return@use
+                    boundPort = server.localPort
                     onStarted(server.localPort)
                     while (isActive) {
                         val socket = server.accept()
@@ -185,6 +194,7 @@ class FileTransferServer(
             } finally {
                 synchronized(lifecycleLock) {
                     serverSocket = null
+                    boundPort = null
                 }
             }
         }
@@ -205,6 +215,7 @@ class FileTransferServer(
             StopSnapshot(job, clients.toList(), clientJobs.toList()).also {
                 job = null
                 serverSocket = null
+                boundPort = null
             }
         }
         onServerStopping()
@@ -267,7 +278,7 @@ class FileTransferServer(
                     ConnectionKind.TRANSFER_START -> receiveV4Transfer(
                         receiveSession, coordinator, input, output, onProgress, onComplete
                     )
-                    ConnectionKind.PAIR_REQUEST -> throw ProtocolException("Pairing is not installed")
+                    ConnectionKind.PAIR_REQUEST -> receivePairing(input, output)
                 }
             } catch (error: Exception) {
                 runCatching {
@@ -277,6 +288,18 @@ class FileTransferServer(
                 throw error
             }
         }
+    }
+
+    fun listeningPort(): Int? = boundPort
+
+    private fun receivePairing(input: DataInputStream, output: DataOutputStream) {
+        val response = try {
+            pairingRequestHandler.handle(PairingProtocol.readRequest(input))
+        } catch (_: Exception) {
+            PairingResponse(PairingStatus.PROTOCOL_ERROR)
+        }
+        PairingProtocol.writeResponse(output, response)
+        output.flush()
     }
 
     private suspend fun receiveV4Transfer(

@@ -10,6 +10,12 @@ data class RecoverableOutgoingBatch(
     val files: List<SelectedFile>
 )
 
+data class PairingOfferUi(
+    val rawPayload: String,
+    val address: String,
+    val expiresAt: Long
+)
+
 data class ServiceTransfer(
     val direction: String,
     val fileName: String,
@@ -28,7 +34,9 @@ data class ServiceTransferState(
     val serviceMessage: String = "等待设备或文件",
     val transfer: ServiceTransfer? = null,
     val resumePrompt: ResumePrompt? = null,
-    val recoverableBatch: RecoverableOutgoingBatch? = null
+    val recoverableBatch: RecoverableOutgoingBatch? = null,
+    val pairingOffer: PairingOfferUi? = null,
+    val preferredQrPeerId: String? = null
 )
 
 internal class ServiceTerminationGate {

@@ -5,6 +5,7 @@ import com.example.transfer.service.ServiceTransfer
 import com.example.transfer.service.ServiceTransferState
 import com.example.transfer.service.ResumePrompt
 import com.example.transfer.service.RecoverableOutgoingBatch
+import com.example.transfer.service.PairingOfferUi
 import com.example.transfer.transfer.TransferPauseState
 import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
@@ -15,6 +16,21 @@ import org.junit.Test
 import java.net.InetAddress
 
 class TransferUiReducerTest {
+    @Test
+    fun `verified qr peer is selected once and pairing offer is surfaced`() {
+        val offer = PairingOfferUi("lantransfer://pair?...", "192.168.1.20", 123L)
+        val result = TransferUiReducer.withServiceState(
+            TransferUiState(selectedDeviceId = peerB.id),
+            ServiceTransferState(
+                devices = listOf(peerA, peerB),
+                pairingOffer = offer,
+                preferredQrPeerId = peerA.id
+            )
+        )
+
+        assertEquals(peerA.id, result.selectedDeviceId)
+        assertEquals(offer, result.pairingOffer)
+    }
     @Test
     fun `service prompt is surfaced and later cleared`() {
         val prompt = ResumePrompt(7, listOf("a.bin"), 2)
