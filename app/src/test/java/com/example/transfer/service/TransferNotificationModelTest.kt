@@ -36,16 +36,43 @@ class TransferNotificationModelTest {
     }
 
     @Test
-    fun `simultaneous active transfers present outgoing first`() {
+    fun `simultaneous active transfers show combined progress and outgoing pause action`() {
         val state = ServiceTransferState(
-            outgoingTransfer = ServiceTransfer("发送", "out.bin", 25, "正在发送", true),
-            incomingTransfer = ServiceTransfer("接收", "in.bin", 75, "正在接收", true)
+            outgoingTransfer = ServiceTransfer(
+                "发送", "out.bin", 25, "正在发送", true,
+                batchProgress = 40,
+                pauseState = TransferPauseState.RUNNING
+            ),
+            incomingTransfer = ServiceTransfer(
+                "接收", "in.bin", 65, "正在接收", true,
+                batchProgress = 70
+            )
         )
 
         val model = TransferNotificationModel.from(state)
 
-        assertEquals("发送文件", model.title)
-        assertEquals("out.bin · 25%", model.text)
+        assertEquals("正在同时收发", model.title)
+        assertEquals("发送 40% · 接收 70%", model.text)
+        assertTrue(model.showProgress)
+        assertEquals(40, model.progress)
+        assertEquals(TransferNotificationAction.PAUSE, model.action)
+    }
+
+    @Test
+    fun `paused outgoing with active incoming offers resume`() {
+        val state = ServiceTransferState(
+            outgoingTransfer = ServiceTransfer(
+                "发送", "out.bin", 40, "已暂停", true,
+                pauseState = TransferPauseState.PAUSED
+            ),
+            incomingTransfer = ServiceTransfer("接收", "in.bin", 70, "正在接收", true)
+        )
+
+        val model = TransferNotificationModel.from(state)
+
+        assertEquals("正在同时收发", model.title)
+        assertEquals("发送 40% · 接收 70%", model.text)
+        assertEquals(TransferNotificationAction.RESUME, model.action)
     }
 
     @Test
@@ -59,6 +86,20 @@ class TransferNotificationModelTest {
 
         assertEquals("接收文件", model.title)
         assertEquals("in.bin · 75%", model.text)
+    }
+
+    @Test
+    fun `outgoing terminal presents before incoming terminal`() {
+        val state = ServiceTransferState(
+            outgoingTransfer = ServiceTransfer("发送", "out.bin", 100, "发送完成", false),
+            incomingTransfer = ServiceTransfer("接收", "in.bin", 100, "接收完成", false)
+        )
+
+        val model = TransferNotificationModel.from(state)
+
+        assertEquals("发送完成", model.title)
+        assertEquals("out.bin", model.text)
+        assertFalse(model.showProgress)
     }
 
     @Test

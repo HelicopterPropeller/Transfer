@@ -13,45 +13,60 @@ data class TransferNotificationModel(
 ) {
     companion object {
         fun from(state: ServiceTransferState): TransferNotificationModel {
-            val transfer = state.outgoingTransfer?.takeIf { it.active }
-                ?: state.incomingTransfer?.takeIf { it.active }
-                ?: state.outgoingTransfer
-                ?: state.incomingTransfer
-                ?: return TransferNotificationModel(
-                "局域网互传运行中", "等待设备或文件", false
-            )
-            if (transfer.active) {
-                val text = if (transfer.fileCount > 1) {
-                    "第 ${transfer.fileIndex}/${transfer.fileCount} 个 · ${transfer.fileName} · ${transfer.batchProgress}%"
-                } else {
-                    "${transfer.fileName} · ${transfer.progress}%"
-                }
-                val action = if (transfer.direction != "发送") {
-                    TransferNotificationAction.NONE
-                } else if (
-                    transfer.pauseState == TransferPauseState.PAUSING ||
-                    transfer.pauseState == TransferPauseState.PAUSED
-                ) {
-                    TransferNotificationAction.RESUME
-                } else if (transfer.pauseState == TransferPauseState.RUNNING) {
-                    TransferNotificationAction.PAUSE
-                } else {
-                    TransferNotificationAction.NONE
-                }
-                return TransferNotificationModel(
-                    "${transfer.direction}文件",
-                    text,
+            val outgoing = state.outgoingTransfer
+            val incoming = state.incomingTransfer
+            return when {
+                outgoing?.active == true && incoming?.active == true -> TransferNotificationModel(
+                    "正在同时收发",
+                    "发送 ${outgoing.batchProgress}% · 接收 ${incoming.batchProgress}%",
                     true,
-                    transfer.batchProgress,
-                    action
+                    outgoing.batchProgress,
+                    outgoingAction(outgoing)
                 )
+                outgoing?.active == true -> singleDirection(outgoing, state.serviceMessage)
+                incoming?.active == true -> singleDirection(incoming, state.serviceMessage)
+                outgoing != null -> singleDirection(outgoing, state.serviceMessage)
+                incoming != null -> singleDirection(incoming, state.serviceMessage)
+                else -> idle()
             }
-            return TransferNotificationModel(
+        }
+
+        private fun idle() = TransferNotificationModel(
+            "局域网互传运行中",
+            "等待设备或文件",
+            false
+        )
+
+        private fun singleDirection(
+            transfer: ServiceTransfer,
+            serviceMessage: String
+        ): TransferNotificationModel {
+            if (!transfer.active) return TransferNotificationModel(
                 transfer.message,
-                transfer.fileName.ifBlank { state.serviceMessage },
+                transfer.fileName.ifBlank { serviceMessage },
                 false,
                 transfer.progress
             )
+
+            val text = if (transfer.fileCount > 1) {
+                "第 ${transfer.fileIndex}/${transfer.fileCount} 个 · ${transfer.fileName} · ${transfer.batchProgress}%"
+            } else {
+                "${transfer.fileName} · ${transfer.progress}%"
+            }
+            return TransferNotificationModel(
+                "${transfer.direction}文件",
+                text,
+                true,
+                transfer.batchProgress,
+                if (transfer.direction == "发送") outgoingAction(transfer) else TransferNotificationAction.NONE
+            )
+        }
+
+        private fun outgoingAction(transfer: ServiceTransfer): TransferNotificationAction = when {
+            transfer.pauseState == TransferPauseState.PAUSING ||
+                transfer.pauseState == TransferPauseState.PAUSED -> TransferNotificationAction.RESUME
+            transfer.pauseState == TransferPauseState.RUNNING -> TransferNotificationAction.PAUSE
+            else -> TransferNotificationAction.NONE
         }
     }
 }
