@@ -3,6 +3,8 @@ package com.example.transfer.apkshare
 import android.net.wifi.WifiManager
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -81,6 +83,41 @@ class HotspotControllerPolicyTest {
 
         assertFalse(owner.offer(late))
         assertEquals(1, late.closeCount.get())
+    }
+
+    @Test
+    fun `result gate never publishes after close returns`() {
+        val gate = HotspotResultGate()
+        val callbackStarted = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val closeReturned = CountDownLatch(1)
+        val firstPublished = AtomicInteger()
+
+        val publisher = Thread {
+            gate.publish {
+                callbackStarted.countDown()
+                releaseCallback.await(2, TimeUnit.SECONDS)
+                firstPublished.incrementAndGet()
+            }
+        }
+        publisher.start()
+        assertTrue(callbackStarted.await(2, TimeUnit.SECONDS))
+
+        val closer = Thread {
+            gate.close()
+            closeReturned.countDown()
+        }
+        closer.start()
+        assertFalse("close returned while a result callback was still publishing", closeReturned.await(100, TimeUnit.MILLISECONDS))
+
+        releaseCallback.countDown()
+        assertTrue(closeReturned.await(2, TimeUnit.SECONDS))
+        publisher.join(2_000)
+        closer.join(2_000)
+
+        assertEquals(1, firstPublished.get())
+        assertFalse(gate.publish { firstPublished.incrementAndGet() })
+        assertEquals(1, firstPublished.get())
     }
 }
 

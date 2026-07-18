@@ -92,6 +92,28 @@ internal class HotspotReservationOwner<T : AutoCloseable> : Closeable {
     }
 }
 
+internal class HotspotResultGate : Closeable {
+    private val lock = Any()
+    private var closed = false
+    private var delivered = false
+
+    val isClosed: Boolean
+        get() = synchronized(lock) { closed }
+
+    fun publish(callback: () -> Unit): Boolean = synchronized(lock) {
+        if (closed || delivered) return false
+        delivered = true
+        callback()
+        true
+    }
+
+    override fun close() {
+        synchronized(lock) {
+            closed = true
+        }
+    }
+}
+
 class HotspotController(
     context: Context,
     private val wifiManager: WifiManager = context.applicationContext
@@ -104,16 +126,12 @@ class HotspotController(
 ) : Closeable {
     private val reservations = HotspotReservationOwner<WifiManager.LocalOnlyHotspotReservation>()
     private val startRequested = AtomicBoolean()
-    private val resultDelivered = AtomicBoolean()
-    private val closed = AtomicBoolean()
+    private val resultGate = HotspotResultGate()
 
     fun start(callback: (HotspotStartResult) -> Unit) {
-        if (closed.get() || !startRequested.compareAndSet(false, true)) {
-            callback(HotspotStartResult.ManualRequired(HotspotFailure.GENERIC))
-            return
-        }
+        if (resultGate.isClosed || !startRequested.compareAndSet(false, true)) return
         if (HotspotPermissionPolicy.requirementFor(apiLevel) == HotspotRequirement.MANUAL) {
-            callback(HotspotStartResult.ManualRequired(HotspotFailure.GENERIC))
+            publishManual(callback, HotspotFailure.GENERIC)
             return
         }
 
@@ -128,9 +146,7 @@ class HotspotController(
                     close()
                     return
                 }
-                if (!closed.get() && resultDelivered.compareAndSet(false, true)) {
-                    callback(HotspotStartResult.Started(credentials, before))
-                } else {
+                if (!resultGate.publish { callback(HotspotStartResult.Started(credentials, before)) }) {
                     close()
                 }
             }
@@ -150,7 +166,7 @@ class HotspotController(
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        resultGate.close()
         reservations.close()
     }
 
@@ -158,9 +174,7 @@ class HotspotController(
         callback: (HotspotStartResult) -> Unit,
         failure: HotspotFailure,
     ) {
-        if (!closed.get() && resultDelivered.compareAndSet(false, true)) {
-            callback(HotspotStartResult.ManualRequired(failure))
-        }
+        resultGate.publish { callback(HotspotStartResult.ManualRequired(failure)) }
     }
 
     private fun credentialsFrom(
