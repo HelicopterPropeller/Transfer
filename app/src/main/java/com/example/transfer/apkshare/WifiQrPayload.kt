@@ -6,7 +6,7 @@ object WifiQrPayload {
 
     private fun escape(value: String): String = buildString {
         value.forEach { char ->
-            if (char in listOf('\\', ';', ',', ':')) append('\\')
+            if (char in listOf('\\', ';', ',', ':', '"')) append('\\')
             append(char)
         }
     }

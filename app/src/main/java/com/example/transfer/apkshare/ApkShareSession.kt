@@ -37,6 +37,7 @@ class ApkShareSession private constructor(
     fun completeAttempt(id: Long): Boolean {
         if (activeAttempt != id) return false
         activeAttempt = null
+        if (nowMillis() >= expiresAtMillis) return false
         consumed = true
         return true
     }
@@ -48,7 +49,9 @@ class ApkShareSession private constructor(
                 ByteArray(size).also(SecureRandom()::nextBytes)
             },
         ): ApkShareSession {
-            val token = randomBytes(24).joinToString("") {
+            val bytes = randomBytes(24)
+            require(bytes.size == 24) { "randomBytes must return exactly 24 bytes" }
+            val token = bytes.joinToString("") {
                 "%02x".format(it.toInt() and 0xff)
             }
             return ApkShareSession(token, nowMillis() + 600_000L, nowMillis)
