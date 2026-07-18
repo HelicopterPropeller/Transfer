@@ -43,6 +43,7 @@ import com.example.transfer.ui.LatestSelectionRequest
 import com.example.transfer.ui.ResumePromptDisplayTracker
 import com.example.transfer.ui.SelectedFile
 import com.example.transfer.ui.SelectedFileResolver
+import com.example.transfer.ui.TransferStatus
 import com.example.transfer.ui.TransferUiState
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
@@ -79,14 +80,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var selectedFileText: TextView
     private lateinit var noticeText: TextView
     private lateinit var sendButton: MaterialButton
-    private lateinit var transferCard: MaterialCardView
-    private lateinit var transferTitleText: TextView
-    private lateinit var transferFileText: TextView
-    private lateinit var transferBatchText: TextView
-    private lateinit var transferProgress: ProgressBar
-    private lateinit var transferMessageText: TextView
-    private lateinit var pauseResumeButton: MaterialButton
-    private lateinit var cancelTransferButton: MaterialButton
+    private lateinit var outgoingTransferCard: MaterialCardView
+    private lateinit var outgoingTransferTitleText: TextView
+    private lateinit var outgoingTransferFileText: TextView
+    private lateinit var outgoingTransferBatchText: TextView
+    private lateinit var outgoingTransferProgress: ProgressBar
+    private lateinit var outgoingTransferMessageText: TextView
+    private lateinit var outgoingPauseResumeButton: MaterialButton
+    private lateinit var outgoingCancelTransferButton: MaterialButton
+    private lateinit var incomingTransferCard: MaterialCardView
+    private lateinit var incomingTransferTitleText: TextView
+    private lateinit var incomingTransferFileText: TextView
+    private lateinit var incomingTransferProgress: ProgressBar
+    private lateinit var incomingTransferMessageText: TextView
     private var pairingDialog: AlertDialog? = null
     private var pairingDialogPayload: String? = null
     private var pairingCountdown: CountDownTimer? = null
@@ -151,8 +157,8 @@ class MainActivity : AppCompatActivity() {
         restoreHistoryRetry(intent)
         findViewById<MaterialButton>(R.id.selectFileButton).setOnClickListener { openDocuments.launch(arrayOf("*/*")) }
         sendButton.setOnClickListener { viewModel.sendSelected() }
-        pauseResumeButton.setOnClickListener { viewModel.togglePause() }
-        cancelTransferButton.setOnClickListener { confirmCancelTransfer() }
+        outgoingPauseResumeButton.setOnClickListener { viewModel.togglePause() }
+        outgoingCancelTransferButton.setOnClickListener { confirmCancelTransfer() }
         val serviceIntent = Intent(this, TransferForegroundService::class.java)
             .setAction(TransferForegroundService.ACTION_START)
         ContextCompat.startForegroundService(this, serviceIntent)
@@ -196,14 +202,19 @@ class MainActivity : AppCompatActivity() {
         selectedFileText = findViewById(R.id.selectedFileText)
         noticeText = findViewById(R.id.noticeText)
         sendButton = findViewById(R.id.sendButton)
-        transferCard = findViewById(R.id.transferCard)
-        transferTitleText = findViewById(R.id.transferTitleText)
-        transferFileText = findViewById(R.id.transferFileText)
-        transferBatchText = findViewById(R.id.transferBatchText)
-        transferProgress = findViewById(R.id.transferProgress)
-        transferMessageText = findViewById(R.id.transferMessageText)
-        pauseResumeButton = findViewById(R.id.pauseResumeButton)
-        cancelTransferButton = findViewById(R.id.cancelTransferButton)
+        outgoingTransferCard = findViewById(R.id.outgoingTransferCard)
+        outgoingTransferTitleText = findViewById(R.id.outgoingTransferTitleText)
+        outgoingTransferFileText = findViewById(R.id.outgoingTransferFileText)
+        outgoingTransferBatchText = findViewById(R.id.outgoingTransferBatchText)
+        outgoingTransferProgress = findViewById(R.id.outgoingTransferProgress)
+        outgoingTransferMessageText = findViewById(R.id.outgoingTransferMessageText)
+        outgoingPauseResumeButton = findViewById(R.id.outgoingPauseResumeButton)
+        outgoingCancelTransferButton = findViewById(R.id.outgoingCancelTransferButton)
+        incomingTransferCard = findViewById(R.id.incomingTransferCard)
+        incomingTransferTitleText = findViewById(R.id.incomingTransferTitleText)
+        incomingTransferFileText = findViewById(R.id.incomingTransferFileText)
+        incomingTransferProgress = findViewById(R.id.incomingTransferProgress)
+        incomingTransferMessageText = findViewById(R.id.incomingTransferMessageText)
     }
 
     private fun render(state: TransferUiState) {
@@ -228,31 +239,8 @@ class MainActivity : AppCompatActivity() {
         noticeText.text = state.notice.orEmpty()
         noticeText.visibility = if (state.notice == null) View.GONE else View.VISIBLE
         sendButton.isEnabled = state.canSend
-        val transfer = state.outgoingTransfer?.takeIf { it.active }
-            ?: state.incomingTransfer?.takeIf { it.active }
-            ?: state.outgoingTransfer
-            ?: state.incomingTransfer
-        transfer.let {
-            transferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
-            if (transfer != null) {
-                transferTitleText.text = if (transfer.direction.isBlank()) transfer.message else getString(R.string.transfer_title, transfer.direction)
-                transferFileText.text = transfer.fileName
-                transferFileText.visibility = if (transfer.fileName.isBlank()) View.GONE else View.VISIBLE
-                transferBatchText.text = getString(
-                    R.string.transfer_batch,
-                    transfer.fileIndex,
-                    transfer.fileCount,
-                    transfer.batchProgress
-                )
-                transferBatchText.visibility = if (transfer.active) View.VISIBLE else View.GONE
-                transferProgress.progress = transfer.progress
-                transferProgress.visibility = if (transfer.active) View.VISIBLE else View.GONE
-                transferMessageText.text = getString(R.string.transfer_message, transfer.progress, transfer.message)
-                pauseResumeButton.visibility = if (state.canPause || state.canResume) View.VISIBLE else View.GONE
-                pauseResumeButton.setText(if (state.canPause) R.string.pause else R.string.resume)
-                cancelTransferButton.visibility = if (state.canCancel) View.VISIBLE else View.GONE
-            }
-        }
+        renderOutgoingTransfer(state.outgoingTransfer, state)
+        renderIncomingTransfer(state.incomingTransfer)
         state.resumePrompt?.let { prompt ->
             if (resumePromptDisplayTracker.shouldShow(prompt.id)) {
                 MaterialAlertDialogBuilder(this)
@@ -277,6 +265,60 @@ class MainActivity : AppCompatActivity() {
                     .show()
             }
         }
+    }
+
+    private fun renderOutgoingTransfer(transfer: TransferStatus?, state: TransferUiState) {
+        outgoingTransferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
+        if (transfer == null) return
+
+        outgoingTransferTitleText.text = if (transfer.direction.isBlank()) {
+            transfer.message
+        } else {
+            getString(R.string.transfer_title, transfer.direction)
+        }
+        outgoingTransferFileText.text = transfer.fileName
+        outgoingTransferFileText.visibility = if (transfer.fileName.isBlank()) View.GONE else View.VISIBLE
+        outgoingTransferBatchText.text = getString(
+            R.string.transfer_batch,
+            transfer.fileIndex,
+            transfer.fileCount,
+            transfer.batchProgress
+        )
+        outgoingTransferBatchText.visibility = if (transfer.active) View.VISIBLE else View.GONE
+        outgoingTransferProgress.progress = transfer.progress
+        outgoingTransferProgress.visibility = if (transfer.active) View.VISIBLE else View.GONE
+        outgoingTransferMessageText.text = getString(
+            R.string.transfer_message,
+            transfer.progress,
+            transfer.message
+        )
+        outgoingPauseResumeButton.visibility = if (state.canPause || state.canResume) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+        outgoingPauseResumeButton.setText(if (state.canPause) R.string.pause else R.string.resume)
+        outgoingCancelTransferButton.visibility = if (state.canCancel) View.VISIBLE else View.GONE
+    }
+
+    private fun renderIncomingTransfer(transfer: TransferStatus?) {
+        incomingTransferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
+        if (transfer == null) return
+
+        incomingTransferTitleText.text = if (transfer.direction.isBlank()) {
+            transfer.message
+        } else {
+            getString(R.string.transfer_title, transfer.direction)
+        }
+        incomingTransferFileText.text = transfer.fileName
+        incomingTransferFileText.visibility = if (transfer.fileName.isBlank()) View.GONE else View.VISIBLE
+        incomingTransferProgress.progress = transfer.progress
+        incomingTransferProgress.visibility = if (transfer.active) View.VISIBLE else View.GONE
+        incomingTransferMessageText.text = getString(
+            R.string.transfer_message,
+            transfer.progress,
+            transfer.message
+        )
     }
 
     private fun restoreHistoryRetry(retryIntent: Intent) {

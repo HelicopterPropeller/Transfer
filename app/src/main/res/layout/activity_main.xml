@@ -208,7 +208,7 @@
             tools:visibility="visible" />
 
         <com.google.android.material.card.MaterialCardView
-            android:id="@+id/transferCard"
+            android:id="@+id/outgoingTransferCard"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
@@ -225,7 +225,7 @@
                 android:padding="18dp">
 
                 <TextView
-                    android:id="@+id/transferTitleText"
+                    android:id="@+id/outgoingTransferTitleText"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:textColor="@color/text_primary"
@@ -234,7 +234,7 @@
                     tools:text="正在接收" />
 
                 <TextView
-                    android:id="@+id/transferFileText"
+                    android:id="@+id/outgoingTransferFileText"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="6dp"
@@ -244,7 +244,7 @@
                     tools:text="photo.jpg" />
 
                 <TextView
-                    android:id="@+id/transferBatchText"
+                    android:id="@+id/outgoingTransferBatchText"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="6dp"
@@ -255,7 +255,7 @@
                     tools:visibility="visible" />
 
                 <ProgressBar
-                    android:id="@+id/transferProgress"
+                    android:id="@+id/outgoingTransferProgress"
                     style="?android:attr/progressBarStyleHorizontal"
                     android:layout_width="match_parent"
                     android:layout_height="8dp"
@@ -264,7 +264,7 @@
                     android:progress="0" />
 
                 <TextView
-                    android:id="@+id/transferMessageText"
+                    android:id="@+id/outgoingTransferMessageText"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
@@ -273,7 +273,7 @@
                     tools:text="50%" />
 
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/pauseResumeButton"
+                    android:id="@+id/outgoingPauseResumeButton"
                     style="@style/Widget.Material3.Button.OutlinedButton"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -283,7 +283,7 @@
                     tools:visibility="visible" />
 
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/cancelTransferButton"
+                    android:id="@+id/outgoingCancelTransferButton"
                     style="@style/Widget.Material3.Button.TextButton"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -291,6 +291,62 @@
                     android:text="@string/cancel_transfer"
                     android:visibility="gone"
                     tools:visibility="visible" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/incomingTransferCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:visibility="gone"
+            app:cardBackgroundColor="@color/card_background"
+            app:cardCornerRadius="18dp"
+            app:cardElevation="0dp"
+            tools:visibility="visible">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="18dp">
+
+                <TextView
+                    android:id="@+id/incomingTransferTitleText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_primary"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    tools:text="正在接收" />
+
+                <TextView
+                    android:id="@+id/incomingTransferFileText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:ellipsize="middle"
+                    android:maxLines="1"
+                    android:textColor="@color/text_secondary"
+                    tools:text="photo.jpg" />
+
+                <ProgressBar
+                    android:id="@+id/incomingTransferProgress"
+                    style="?android:attr/progressBarStyleHorizontal"
+                    android:layout_width="match_parent"
+                    android:layout_height="8dp"
+                    android:layout_marginTop="14dp"
+                    android:max="100"
+                    android:progress="0" />
+
+                <TextView
+                    android:id="@+id/incomingTransferMessageText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp"
+                    tools:text="50%" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
