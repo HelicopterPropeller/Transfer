@@ -233,6 +233,55 @@ class ApkHttpProtocolTest {
         assertFalse(session.authorize(session.token))
     }
 
+    @Test
+    fun `flush failure releases attempt so a complete download can retry`() {
+        val body = "flush-sensitive-apk".toByteArray(UTF_8)
+        val session = fixedSession()
+        val protocol = ApkHttpProtocol(artifactContaining(body), session)
+
+        try {
+            protocol.respond(
+                request(target = "/i/${session.token}/app.apk"),
+                FlushFailingOutputStream(),
+            )
+            fail("Expected the response flush to throw")
+        } catch (_: IOException) {
+            // Expected: a failed flush must release, rather than complete, the attempt.
+        }
+
+        assertTrue("Flush failure consumed the session", session.authorize(session.token))
+        val retry = ByteArrayOutputStream()
+        protocol.respond(request(target = "/i/${session.token}/app.apk"), retry)
+        assertArrayEquals(body, retry.toByteArray().httpResponse().body)
+        assertFalse(session.authorize(session.token))
+    }
+
+    @Test
+    fun `artifact EOF releases attempt so repaired artifact can retry`() {
+        val initialBody = "short".toByteArray(UTF_8)
+        val repairedBody = initialBody + '!'.code.toByte()
+        val artifact = artifactContaining(initialBody).copy(size = repairedBody.size.toLong())
+        val session = fixedSession()
+        val protocol = ApkHttpProtocol(artifact, session)
+
+        try {
+            protocol.respond(
+                request(target = "/i/${session.token}/app.apk"),
+                ByteArrayOutputStream(),
+            )
+            fail("Expected declared-size EOF to throw")
+        } catch (_: IOException) {
+            // Expected: an artifact shorter than its declared size is not complete.
+        }
+
+        assertTrue("Artifact EOF consumed the session", session.authorize(session.token))
+        artifact.file.writeBytes(repairedBody)
+        val retry = ByteArrayOutputStream()
+        protocol.respond(request(target = "/i/${session.token}/app.apk"), retry)
+        assertArrayEquals(repairedBody, retry.toByteArray().httpResponse().body)
+        assertFalse(session.authorize(session.token))
+    }
+
     private fun request(
         method: String = "GET",
         target: String,
@@ -274,6 +323,12 @@ private class FailingOutputStream(private var bytesBeforeFailure: Int) : OutputS
             throw IOException("client disconnected")
         }
         bytesBeforeFailure -= length
+    }
+}
+
+private class FlushFailingOutputStream : ByteArrayOutputStream() {
+    override fun flush() {
+        throw IOException("client disconnected during flush")
     }
 }
 

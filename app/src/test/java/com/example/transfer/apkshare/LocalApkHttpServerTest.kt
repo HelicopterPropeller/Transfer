@@ -2,15 +2,21 @@ package com.example.transfer.apkshare
 
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.BindException
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketAddress
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.system.measureTimeMillis
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -77,6 +83,37 @@ class LocalApkHttpServerTest {
             assertEquals("HTTP/1.1 416 Range Not Satisfiable", response.statusLine)
             assertFalse(response.body.toString(UTF_8).contains("secret"))
             assertTrue(session.authorize(session.token))
+        }
+    }
+
+    @Test
+    fun `bare line breaks and forbidden controls in header values are malformed`() {
+        val malformedHeaders = listOf(
+            "X-Hidden: ok\nRange: bytes=0-1" to "bare LF concealed Range",
+            "X-Bad: before\rafter" to "bare CR",
+            "X-Bad: before\u0001after" to "CTL",
+            "X-Bad: before\u007fafter" to "DEL",
+        )
+
+        malformedHeaders.forEach { (header, description) ->
+            val session = fixedSession()
+            LocalApkHttpServer().use { server ->
+                val port = server.start(
+                    loopbackSelection(),
+                    artifactContaining("secret"),
+                    session,
+                    NoOpListener,
+                )
+                val response = request(
+                    port,
+                    "GET /i/${session.token}/app.apk HTTP/1.1\r\n" +
+                        "Host: local\r\n$header\r\n\r\n",
+                )
+
+                assertEquals(description, "HTTP/1.1 400 Bad Request", response.statusLine)
+                assertFalse(description, response.body.toString(UTF_8).contains("secret"))
+                assertTrue(description, session.authorize(session.token))
+            }
         }
     }
 
@@ -174,8 +211,9 @@ class LocalApkHttpServerTest {
         val session = fixedSession()
         val listener = BlockingStartedListener()
         LocalApkHttpServer().use { server ->
-            val port = server.start(loopbackSelection(), artifactContaining("first-download"), session, listener)
-            val first = connectedSocket(port)
+            val body = ByteArray(8 * 1024 * 1024) { index -> (index % 251).toByte() }
+            val port = server.start(loopbackSelection(), artifactContaining(body), session, listener)
+            val first = connectedSocket(port).apply { receiveBufferSize = 1_024 }
             try {
                 first.getOutputStream().write(
                     "GET /i/${session.token}/app.apk HTTP/1.1\r\nHost: local\r\n\r\n".toByteArray(UTF_8),
@@ -189,7 +227,7 @@ class LocalApkHttpServerTest {
                 )
 
                 assertEquals("HTTP/1.1 409 Conflict", second.statusLine)
-                assertFalse(second.body.toString(UTF_8).contains("first-download"))
+                assertFalse(second.body.contentEquals(body))
             } finally {
                 listener.release.countDown()
                 first.readHttpResponse()
@@ -274,6 +312,73 @@ class LocalApkHttpServerTest {
             stalled.close()
         }
         assertTrue("close() did not close an active client socket", closedByServer)
+    }
+
+    @Test
+    fun `close drops queued callbacks without waiting for a blocking caller callback`() {
+        val callbackExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "test-apk-blocking-callback")
+        }
+        val listener = UninterruptiblyBlockingListener()
+        val server = LocalApkHttpServer(callbackExecutor = callbackExecutor)
+        val session = fixedSession()
+        val socket = try {
+            val port = server.start(loopbackSelection(), artifactContaining("apk"), session, listener)
+            connectedSocket(port).also { client ->
+                client.getOutputStream().write(
+                    "GET /i/${session.token}/app.apk HTTP/1.1\r\nHost: local\r\n\r\n".toByteArray(UTF_8),
+                )
+                client.getOutputStream().flush()
+            }
+        } catch (exception: Exception) {
+            listener.release.countDown()
+            callbackExecutor.shutdownNow()
+            throw exception
+        }
+
+        try {
+            assertTrue("Started callback did not block", listener.started.await(2, TimeUnit.SECONDS))
+            assertEquals("test-apk-blocking-callback", listener.callbackThreadName)
+            assertEventually("Download did not finish while callback was blocked") {
+                !session.authorize(session.token)
+            }
+
+            val closeMillis = measureTimeMillis { server.close() }
+
+            assertTrue("close() waited on caller callback for ${closeMillis}ms", closeMillis < 2_000L)
+            assertTrue("LocalApkHttpServer leaked an owned thread", apkServerThreads().isEmpty())
+            assertFalse("Server closed its caller-owned executor", callbackExecutor.isShutdown)
+            listener.release.countDown()
+            callbackExecutor.submit {}.get(2, TimeUnit.SECONDS)
+            assertEquals(listOf("started"), listener.events)
+        } finally {
+            listener.release.countDown()
+            socket.close()
+            server.close()
+            callbackExecutor.shutdownNow()
+            callbackExecutor.awaitTermination(2, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    fun `bind failure closes the new socket and server remains safely closable`() {
+        val failedSocket = FailingBindServerSocket()
+        val server = LocalApkHttpServer(
+            callbackExecutor = Executor { command -> command.run() },
+            serverSocketFactory = { failedSocket },
+        )
+
+        try {
+            server.start(loopbackSelection(), artifactContaining("apk"), fixedSession(), NoOpListener)
+            fail("Expected bind failure")
+        } catch (_: BindException) {
+            // Expected from the injected socket.
+        } finally {
+            server.close()
+        }
+
+        assertTrue("Failed bind socket was not closed", failedSocket.isClosed)
+        assertTrue("Failed start leaked a server-owned thread", apkServerThreads().isEmpty())
     }
 
     private fun artifactContaining(content: String): ApkArtifact =
@@ -392,6 +497,47 @@ private class BlockingStartedListener : ApkDownloadListener {
     override fun onFailed(message: String) = Unit
 }
 
+private class UninterruptiblyBlockingListener : ApkDownloadListener {
+    val started = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    val events = CopyOnWriteArrayList<String>()
+    var callbackThreadName: String? = null
+
+    override fun onStarted(totalBytes: Long) {
+        callbackThreadName = Thread.currentThread().name
+        events += "started"
+        started.countDown()
+        var interrupted = false
+        while (true) {
+            try {
+                release.await()
+                break
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+    }
+
+    override fun onProgress(bytesSent: Long, totalBytes: Long) {
+        events += "progress"
+    }
+
+    override fun onCompleted() {
+        events += "completed"
+    }
+
+    override fun onFailed(message: String) {
+        events += "failed"
+    }
+}
+
+private class FailingBindServerSocket : ServerSocket() {
+    override fun bind(endpoint: SocketAddress?, backlog: Int) {
+        throw BindException("forced bind failure")
+    }
+}
+
 private data class SocketHttpResponse(
     val statusLine: String,
     val headers: Map<String, String>,
@@ -429,10 +575,8 @@ private fun ByteArray.indexOfSocketHeaderEnd(): Int {
 private fun ipv4(value: String): Inet4Address = InetAddress.getByName(value) as Inet4Address
 
 private fun apkServerThreads(): List<Thread> = Thread.getAllStackTraces().keys.filter { thread ->
-    thread.isAlive && thread.stackTrace.any { frame ->
-        val productionClass = "com.example.transfer.apkshare.LocalApkHttpServer"
-        frame.className == productionClass || frame.className.startsWith(productionClass + '$')
-    }
+    thread.isAlive &&
+        (thread.name == "apk-share-accept" || thread.name.startsWith("apk-share-client-"))
 }
 
 private fun assertEventually(

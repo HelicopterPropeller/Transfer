@@ -10,8 +10,11 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets.UTF_8
+import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.ForkJoinPool
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -23,9 +26,13 @@ interface ApkDownloadListener {
     fun onFailed(message: String)
 }
 
-class LocalApkHttpServer : Closeable {
+class LocalApkHttpServer(
+    callbackExecutor: Executor = ForkJoinPool.commonPool(),
+    private val serverSocketFactory: () -> ServerSocket = ::ServerSocket,
+) : Closeable {
     private val lifecycleLock = Any()
     private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
+    private val callbacks = SerialCallbackDispatcher(callbackExecutor)
     private val clientNumber = AtomicInteger()
     private val clients = Executors.newFixedThreadPool(2) { runnable ->
         Thread(runnable, "apk-share-client-${clientNumber.incrementAndGet()}")
@@ -45,9 +52,14 @@ class LocalApkHttpServer : Closeable {
         check(serverSocket == null && !closed) { "Server has already been started or closed" }
         require(selectedAddress.prefixLength.toInt() in 0..32) { "Invalid IPv4 prefix length" }
 
-        val socket = ServerSocket().apply {
-            reuseAddress = true
-            bind(InetSocketAddress(selectedAddress.address, 0), CLIENT_BACKLOG)
+        val socket = serverSocketFactory()
+        var bound = false
+        try {
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress(selectedAddress.address, 0), CLIENT_BACKLOG)
+            bound = true
+        } finally {
+            if (!bound) closeQuietly(socket)
         }
         serverSocket = socket
         acceptThread = Thread(
@@ -131,6 +143,7 @@ class LocalApkHttpServer : Closeable {
             tracksDownload = DOWNLOAD_TARGET.matches(request.target),
             totalBytes = artifact.size,
             listener = listener,
+            callbacks = callbacks,
         )
         try {
             ApkHttpProtocol(artifact, session).respond(request, trackedOutput)
@@ -189,10 +202,11 @@ class LocalApkHttpServer : Closeable {
             val separator = line.indexOf(':')
             if (separator <= 0) return RequestReadResult.Malformed
             val name = line.substring(0, separator)
-            val value = line.substring(separator + 1).trim()
-            if (!HTTP_TOKEN.matches(name) || value.any { it == '\u0000' }) {
+            val rawValue = line.substring(separator + 1)
+            if (!HTTP_TOKEN.matches(name) || rawValue.any(::isForbiddenHeaderValueCharacter)) {
                 return RequestReadResult.Malformed
             }
+            val value = rawValue.trim(' ', '\t')
             headers[name] = value
         }
         return RequestReadResult.Valid(HttpRequest(method, target, version, headers))
@@ -230,6 +244,7 @@ class LocalApkHttpServer : Closeable {
             acceptThread = null
         }
 
+        callbacks.close()
         closeQuietly(socket)
         activeClients.forEach(::closeQuietly)
         clients.shutdownNow()
@@ -294,6 +309,7 @@ class LocalApkHttpServer : Closeable {
         private val tracksDownload: Boolean,
         private val totalBytes: Long,
         private val listener: ApkDownloadListener,
+        private val callbacks: SerialCallbackDispatcher,
     ) : OutputStream() {
         private var responseStarted = false
         private var downloadStarted = false
@@ -351,15 +367,70 @@ class LocalApkHttpServer : Closeable {
         }
 
         private fun notifyListener(callback: ApkDownloadListener.() -> Unit) {
+            callbacks.dispatch { listener.callback() }
+        }
+    }
+
+    private class SerialCallbackDispatcher(private val executor: Executor) : Closeable {
+        private val lock = Any()
+        private val pending = ArrayDeque<() -> Unit>()
+        private var drainScheduled = false
+        private var closed = false
+
+        fun dispatch(callback: () -> Unit) {
+            val scheduleDrain = synchronized(lock) {
+                if (closed) return
+                pending.addLast(callback)
+                if (drainScheduled) {
+                    false
+                } else {
+                    drainScheduled = true
+                    true
+                }
+            }
+            if (!scheduleDrain) return
+
             try {
-                listener.callback()
-            } catch (_: RuntimeException) {
-                // Listener failures must not corrupt the one-shot download session.
+                executor.execute(::drain)
+            } catch (_: RejectedExecutionException) {
+                synchronized(lock) {
+                    pending.clear()
+                    drainScheduled = false
+                }
+            }
+        }
+
+        private fun drain() {
+            while (true) {
+                val callback = synchronized(lock) {
+                    if (closed) {
+                        pending.clear()
+                        drainScheduled = false
+                        null
+                    } else {
+                        pending.pollFirst().also { next ->
+                            if (next == null) drainScheduled = false
+                        }
+                    }
+                } ?: return
+
+                runCatching(callback)
+            }
+        }
+
+        override fun close() {
+            synchronized(lock) {
+                if (closed) return
+                closed = true
+                pending.clear()
             }
         }
     }
 
     private companion object {
+        fun isForbiddenHeaderValueCharacter(character: Char): Boolean =
+            character.code == 0x7f || character.code < 0x20 && character != '\t'
+
         const val CLIENT_BACKLOG = 4
         const val CLIENT_TIMEOUT_MILLIS = 10_000
         const val MAX_HEADER_BYTES = 8 * 1024
