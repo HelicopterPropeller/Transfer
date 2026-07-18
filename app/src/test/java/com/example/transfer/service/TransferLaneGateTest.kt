@@ -3,6 +3,7 @@ package com.example.transfer.service
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class TransferLaneGateTest {
@@ -78,5 +79,26 @@ class TransferLaneGateTest {
 
         assertFalse(gate.isActive(TransferLane.OUTGOING))
         assertEquals(1, attempts)
+    }
+
+    @Test
+    fun `close all attempts both lanes before rethrowing a release failure`() {
+        var releaseCalls = 0
+        val gate = TransferLaneGate(
+            acquireResources = {},
+            releaseResources = {
+                releaseCalls++
+                if (releaseCalls == 1) throw IllegalStateException("first release failed")
+            }
+        )
+        gate.begin(TransferLane.OUTGOING)
+        gate.begin(TransferLane.INCOMING)
+
+        val failure = assertThrows(IllegalStateException::class.java) { gate.closeAll() }
+
+        assertEquals("first release failed", failure.message)
+        assertFalse(gate.isActive(TransferLane.OUTGOING))
+        assertFalse(gate.isActive(TransferLane.INCOMING))
+        assertEquals(2, releaseCalls)
     }
 }

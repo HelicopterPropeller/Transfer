@@ -101,7 +101,7 @@ class TransferForegroundService : Service() {
     val state: StateFlow<ServiceTransferState> = mutableState.asStateFlow()
     private lateinit var notificationFactory: TransferNotificationFactory
     private lateinit var resourceGuard: TransferResourceGuard
-    private lateinit var transferLanes: TransferLaneGate
+    private lateinit var transferLifecycle: TransferServiceLifecycleCoordinator
     private lateinit var incomingAttempts: IncomingTransferAttemptTracker
     private lateinit var discovery: DiscoveryManager
     private lateinit var server: FileTransferServer
@@ -138,10 +138,12 @@ class TransferForegroundService : Service() {
             notificationFactory.build(TransferNotificationModel.from(mutableState.value))
         )
         resourceGuard = createResourceGuard()
-        transferLanes = TransferLaneGate(resourceGuard::acquire, resourceGuard::release)
+        transferLifecycle = TransferServiceLifecycleCoordinator(
+            TransferLaneGate(resourceGuard::acquire, resourceGuard::release)
+        )
         incomingAttempts = IncomingTransferAttemptTracker(
-            acquire = { transferLanes.begin(TransferLane.INCOMING) },
-            release = { transferLanes.end(TransferLane.INCOMING) },
+            acquire = transferLifecycle::beginIncoming,
+            release = { transferLifecycle.endIncoming() },
         )
         localDeviceId = getSharedPreferences("transfer", 0).let { preferences ->
             preferences.getString("device_id", null) ?: UUID.randomUUID().toString().also {
@@ -395,7 +397,7 @@ class TransferForegroundService : Service() {
         terminationGate.runIfOpen gate@{
             val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return@gate
             val reservation = resumePreflight.reserve {
-                transferLanes.isActive(TransferLane.OUTGOING)
+                transferLifecycle.isOutgoingActive()
             } ?: return@gate
             lateinit var job: Job
             job = serviceScope.launch(start = CoroutineStart.LAZY) {
@@ -771,10 +773,10 @@ class TransferForegroundService : Service() {
         return true
     }
 
-    private fun beginOutgoing(): Boolean = transferLanes.begin(TransferLane.OUTGOING)
+    private fun beginOutgoing(): Boolean = transferLifecycle.beginOutgoing()
 
     private fun endOutgoing() {
-        transferLanes.end(TransferLane.OUTGOING)
+        transferLifecycle.endOutgoing()
     }
 
     private fun beginIncomingAttempt(attemptId: Long): Boolean {
@@ -960,19 +962,24 @@ class TransferForegroundService : Service() {
             cancelOutgoing = {
                 resumePreflight.clear()
                 pairingClient.cancelActive()
-                activePreflightJob?.cancel()
+                val jobSnapshots = listOf(
+                    activePreflightJob,
+                    activeBatchJob,
+                    incomingStartupJob,
+                )
                 activePauseController?.cancel()
                 client.cancelActive()
-                activeBatchJob?.cancel()
+                ServiceShutdownJobs.cancelAndJoin(jobSnapshots)
+                ServiceShutdownJobs.cancelAndJoin(listOf(activeBatchJob))
             },
             preventNewStarts = {
-                incomingStartupJob?.cancel()
-                if (::resumeMaintenance.isInitialized) resumeMaintenance.cancel()
-                serviceScope.cancel()
+                if (::server.isInitialized) server.stop()
+                if (::transferLifecycle.isInitialized) transferLifecycle.drain()
             },
             stopResources = {
-                if (::server.isInitialized) server.stop()
+                if (::resumeMaintenance.isInitialized) resumeMaintenance.cancel()
                 if (::discovery.isInitialized) discovery.stop()
+                serviceScope.cancel()
             }
         )
     }

@@ -31,6 +31,18 @@ internal class TransferLaneGate(
         return true
     }
 
+    fun closeAll() {
+        var failure: Throwable? = null
+        TransferLane.entries.forEach { lane ->
+            try {
+                end(lane)
+            } catch (error: Throwable) {
+                if (failure == null) failure = error else failure.addSuppressed(error)
+            }
+        }
+        failure?.let { throw it }
+    }
+
     fun isActive(lane: TransferLane): Boolean = activeState(lane).get()
 
     private fun activeState(lane: TransferLane): AtomicBoolean = when (lane) {
