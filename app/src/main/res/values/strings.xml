@@ -66,4 +66,18 @@
         <item quantity="one">%d 个中断文件可以继续传输</item>
         <item quantity="other">%d 个中断文件可以继续传输</item>
     </plurals>
+    <string name="apk_share_channel_name">离线分享安装包</string>
+    <string name="apk_share_channel_description">在局域网内提供本应用安装包下载</string>
+    <string name="apk_share_notification_title">离线分享安装包</string>
+    <string name="apk_share_notification_idle">等待选择分享方式</string>
+    <string name="apk_share_notification_preparing">正在准备安装包</string>
+    <string name="apk_share_notification_permission">需要 Wi-Fi 权限</string>
+    <string name="apk_share_notification_hotspot">正在创建本地热点</string>
+    <string name="apk_share_notification_join_hotspot">等待接收方加入热点</string>
+    <string name="apk_share_notification_ready">安装包已可下载</string>
+    <string name="apk_share_notification_downloading">正在发送安装包</string>
+    <string name="apk_share_notification_completed">安装包发送完成</string>
+    <string name="apk_share_notification_manual_hotspot">需要手动开启热点</string>
+    <string name="apk_share_notification_error">安装包分享失败</string>
+    <string name="apk_share_notification_cancelled">安装包分享已取消</string>
 </resources>

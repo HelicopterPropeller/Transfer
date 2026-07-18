@@ -46,6 +46,10 @@
             android:name=".service.TransferForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".apkshare.ApkShareForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <activity
             android:name=".history.HistoryActivity"
             android:exported="false" />
