@@ -17,16 +17,72 @@ import java.net.InetAddress
 
 class TransferUiReducerTest {
     @Test
+    fun `active incoming transfer does not disable send for a valid selection`() {
+        val state = TransferUiState(
+            devices = listOf(peer),
+            selectedDeviceId = peer.id,
+            selectedFiles = listOf(selectedFile),
+            incomingTransfer = TransferStatus(
+                "接收", "incoming.bin", 40, "正在接收", true
+            )
+        )
+
+        assertTrue(state.canSend)
+    }
+
+    @Test
+    fun `service reducer preserves simultaneous outgoing and incoming progress`() {
+        val outgoing = ServiceTransfer(
+            "发送", "outgoing.bin", 35, "正在发送", true,
+            fileIndex = 2, fileCount = 4, batchProgress = 48
+        )
+        val incoming = ServiceTransfer(
+            "接收", "incoming.bin", 70, "正在接收", true,
+            incomingAttemptId = 9L
+        )
+
+        val result = TransferUiReducer.withServiceState(
+            TransferUiState(),
+            ServiceTransferState(
+                outgoingTransfer = outgoing,
+                incomingTransfer = incoming
+            )
+        )
+
+        assertEquals(35, result.outgoingTransfer?.progress)
+        assertEquals(48, result.outgoingTransfer?.batchProgress)
+        assertEquals("outgoing.bin", result.outgoingTransfer?.fileName)
+        assertEquals(70, result.incomingTransfer?.progress)
+        assertEquals("incoming.bin", result.incomingTransfer?.fileName)
+    }
+
+    @Test
+    fun `outgoing controls never derive from incoming transfer slot`() {
+        val incomingWithOutgoingShape = TransferStatus(
+            "发送", "incoming.bin", 40, "已暂停", true,
+            pauseState = TransferPauseState.PAUSED
+        )
+        val state = TransferUiState(incomingTransfer = incomingWithOutgoingShape)
+
+        assertFalse(state.canPause)
+        assertFalse(state.canResume)
+        assertFalse(state.canCancel)
+    }
+
+    @Test
     fun `active outgoing transfer can be cancelled including while paused`() {
-        val running = TransferUiState(transfer = TransferStatus(
+        val running = TransferUiState(outgoingTransfer = TransferStatus(
             "发送", "a.txt", 40, "正在发送", true,
             pauseState = TransferPauseState.RUNNING
         ))
-        val paused = running.copy(transfer = running.transfer!!.copy(
+        val paused = running.copy(outgoingTransfer = running.outgoingTransfer!!.copy(
             pauseState = TransferPauseState.PAUSED
         ))
-        val incoming = running.copy(transfer = running.transfer!!.copy(direction = "接收"))
-        val finished = running.copy(transfer = running.transfer!!.copy(active = false))
+        val incoming = running.copy(
+            outgoingTransfer = null,
+            incomingTransfer = running.outgoingTransfer!!.copy(direction = "接收")
+        )
+        val finished = running.copy(outgoingTransfer = running.outgoingTransfer!!.copy(active = false))
 
         assertTrue(running.canCancel)
         assertTrue(paused.canCancel)
@@ -220,7 +276,7 @@ class TransferUiReducerTest {
             pauseState = TransferPauseState.RUNNING
         )
 
-        val state = TransferUiState(transfer = status)
+        val state = TransferUiState(outgoingTransfer = status)
 
         assertTrue(state.canPause)
         assertFalse(state.canResume)
@@ -234,7 +290,7 @@ class TransferUiReducerTest {
             pauseState = TransferPauseState.PAUSED
         )
 
-        val state = TransferUiState(transfer = status)
+        val state = TransferUiState(outgoingTransfer = status)
 
         assertFalse(state.canPause)
         assertTrue(state.canResume)
@@ -242,11 +298,11 @@ class TransferUiReducerTest {
 
     @Test
     fun `incoming and inactive transfers expose no pause control`() {
-        val incoming = TransferUiState(transfer = TransferStatus(
+        val incoming = TransferUiState(incomingTransfer = TransferStatus(
             "接收", "a.txt", 40, "正在接收", true,
             pauseState = TransferPauseState.RUNNING
         ))
-        val inactive = TransferUiState(transfer = TransferStatus(
+        val inactive = TransferUiState(outgoingTransfer = TransferStatus(
             "发送", "a.txt", 100, "发送完成", false,
             pauseState = TransferPauseState.PAUSED
         ))
@@ -274,7 +330,7 @@ class TransferUiReducerTest {
         val service = ServiceTransferState(
             devices = listOf(peer),
             serviceMessage = "后台运行中",
-            transfer = ServiceTransfer(
+            outgoingTransfer = ServiceTransfer(
                 "发送", "movie.mp4", 55, "正在发送", true,
                 fileIndex = 2, fileCount = 3, batchProgress = 60,
                 pauseState = TransferPauseState.PAUSING
@@ -282,18 +338,18 @@ class TransferUiReducerTest {
         )
         val result = TransferUiReducer.withServiceState(current, service)
         assertEquals(files, result.selectedFiles)
-        assertEquals(55, result.transfer?.progress)
-        assertEquals(2, result.transfer?.fileIndex)
-        assertEquals(3, result.transfer?.fileCount)
-        assertEquals(60, result.transfer?.batchProgress)
-        assertEquals(TransferPauseState.PAUSING, result.transfer?.pauseState)
+        assertEquals(55, result.outgoingTransfer?.progress)
+        assertEquals(2, result.outgoingTransfer?.fileIndex)
+        assertEquals(3, result.outgoingTransfer?.fileCount)
+        assertEquals(60, result.outgoingTransfer?.batchProgress)
+        assertEquals(TransferPauseState.PAUSING, result.outgoingTransfer?.pauseState)
         assertEquals("后台运行中", result.serviceStatus)
     }
 
     @Test
     fun `service state preserves notice without changing pause controls`() {
         val current = TransferUiState(notice = "2 个文件无法读取，已跳过")
-        val service = ServiceTransferState(transfer = ServiceTransfer(
+        val service = ServiceTransferState(outgoingTransfer = ServiceTransfer(
             "发送", "b.txt", 40, "已暂停", true,
             fileIndex = 2, fileCount = 3, batchProgress = 50,
             pauseState = TransferPauseState.PAUSED

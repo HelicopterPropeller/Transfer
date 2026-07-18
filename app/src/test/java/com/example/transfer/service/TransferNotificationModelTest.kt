@@ -18,7 +18,7 @@ class TransferNotificationModelTest {
 
     @Test
     fun `active state shows direction file and progress`() {
-        val state = ServiceTransferState(transfer = ServiceTransfer("发送", "movie.mp4", 40, "正在发送", true))
+        val state = ServiceTransferState(outgoingTransfer = ServiceTransfer("发送", "movie.mp4", 40, "正在发送", true))
         val model = TransferNotificationModel.from(state)
         assertEquals("发送文件", model.title)
         assertEquals("movie.mp4 · 40%", model.text)
@@ -28,11 +28,37 @@ class TransferNotificationModelTest {
 
     @Test
     fun `finished state displays result without progress`() {
-        val state = ServiceTransferState(transfer = ServiceTransfer("接收", "a.zip", 100, "接收完成", false))
+        val state = ServiceTransferState(incomingTransfer = ServiceTransfer("接收", "a.zip", 100, "接收完成", false))
         val model = TransferNotificationModel.from(state)
         assertEquals("接收完成", model.title)
         assertEquals("a.zip", model.text)
         assertFalse(model.showProgress)
+    }
+
+    @Test
+    fun `simultaneous active transfers present outgoing first`() {
+        val state = ServiceTransferState(
+            outgoingTransfer = ServiceTransfer("发送", "out.bin", 25, "正在发送", true),
+            incomingTransfer = ServiceTransfer("接收", "in.bin", 75, "正在接收", true)
+        )
+
+        val model = TransferNotificationModel.from(state)
+
+        assertEquals("发送文件", model.title)
+        assertEquals("out.bin · 25%", model.text)
+    }
+
+    @Test
+    fun `active incoming transfer presents before finished outgoing`() {
+        val state = ServiceTransferState(
+            outgoingTransfer = ServiceTransfer("发送", "out.bin", 100, "发送完成", false),
+            incomingTransfer = ServiceTransfer("接收", "in.bin", 75, "正在接收", true)
+        )
+
+        val model = TransferNotificationModel.from(state)
+
+        assertEquals("接收文件", model.title)
+        assertEquals("in.bin · 75%", model.text)
     }
 
     @Test
@@ -43,7 +69,7 @@ class TransferNotificationModelTest {
             pauseState = TransferPauseState.RUNNING
         )
 
-        val model = TransferNotificationModel.from(ServiceTransferState(transfer = transfer))
+        val model = TransferNotificationModel.from(ServiceTransferState(outgoingTransfer = transfer))
 
         assertEquals("第 2/3 个 · b.bin · 50%", model.text)
         assertEquals(TransferNotificationAction.PAUSE, model.action)
@@ -58,7 +84,7 @@ class TransferNotificationModelTest {
 
         assertEquals(
             TransferNotificationAction.RESUME,
-            TransferNotificationModel.from(ServiceTransferState(transfer = transfer)).action
+            TransferNotificationModel.from(ServiceTransferState(outgoingTransfer = transfer)).action
         )
     }
 
@@ -71,7 +97,7 @@ class TransferNotificationModelTest {
 
         assertEquals(
             TransferNotificationAction.RESUME,
-            TransferNotificationModel.from(ServiceTransferState(transfer = transfer)).action
+            TransferNotificationModel.from(ServiceTransferState(outgoingTransfer = transfer)).action
         )
     }
 
@@ -116,7 +142,7 @@ class TransferNotificationModelTest {
 
     @Test
     fun `late pause publication reads latest controller state`() {
-        val initial = ServiceTransferState(transfer = ServiceTransfer(
+        val initial = ServiceTransferState(outgoingTransfer = ServiceTransfer(
             "发送", "b.bin", 25, "正在暂停", true,
             pauseState = TransferPauseState.PAUSING
         ))
@@ -131,20 +157,20 @@ class TransferNotificationModelTest {
         latestState = TransferPauseState.PAUSED
         val reduced = reduce(initial)
 
-        assertEquals(TransferPauseState.PAUSED, reduced.transfer?.pauseState)
-        assertEquals("已暂停", reduced.transfer?.message)
+        assertEquals(TransferPauseState.PAUSED, reduced.outgoingTransfer?.pauseState)
+        assertEquals("已暂停", reduced.outgoingTransfer?.message)
     }
 
     @Test
     fun `batch level failure becomes inactive`() {
-        val active = ServiceTransferState(transfer = ServiceTransfer(
+        val active = ServiceTransferState(outgoingTransfer = ServiceTransfer(
             "发送", "b.bin", 25, "正在发送", true
         ))
 
         val failed = active.withInactiveBatchFailure("批次失败")
 
-        assertFalse(failed.transfer?.active ?: true)
-        assertEquals("批次失败", failed.transfer?.message)
+        assertFalse(failed.outgoingTransfer?.active ?: true)
+        assertEquals("批次失败", failed.outgoingTransfer?.message)
         assertEquals(
             TransferNotificationAction.NONE,
             TransferNotificationModel.from(failed).action

@@ -107,7 +107,8 @@ data class TransferUiState(
     val selectedFiles: List<SelectedFile> = emptyList(),
     val notice: String? = null,
     val serviceStatus: String = "正在启动接收服务…",
-    val transfer: TransferStatus? = null,
+    val outgoingTransfer: TransferStatus? = null,
+    val incomingTransfer: TransferStatus? = null,
     val resumePrompt: ResumePrompt? = null,
     val pairingOffer: PairingOfferUi? = null
 ) {
@@ -116,21 +117,21 @@ data class TransferUiState(
             devices.any { it.id == selectedDeviceId } &&
             selectedFiles.isNotEmpty() &&
             selectedFiles.all { it.size >= 0 } &&
-            transfer?.active != true
+            outgoingTransfer?.active != true
 
     val canPause: Boolean
-        get() = transfer?.let {
+        get() = outgoingTransfer?.let {
             it.active && it.direction == "发送" && it.pauseState == TransferPauseState.RUNNING
         } == true
 
     val canResume: Boolean
-        get() = transfer?.let {
+        get() = outgoingTransfer?.let {
             it.active && it.direction == "发送" &&
                 (it.pauseState == TransferPauseState.PAUSING || it.pauseState == TransferPauseState.PAUSED)
         } == true
 
     val canCancel: Boolean
-        get() = transfer?.let {
+        get() = outgoingTransfer?.let {
             it.active && it.direction == "发送" && it.pauseState != TransferPauseState.CANCELLED
         } == true
 }
@@ -155,15 +156,10 @@ object TransferUiReducer {
                 preferredDeviceId = null
             )
         }
-        val transfer = service.transfer?.let {
-            TransferStatus(
-                it.direction, it.fileName, it.progress, it.message, it.active,
-                it.fileIndex, it.fileCount, it.batchProgress, it.pauseState
-            )
-        }
         return withDevices.copy(
             serviceStatus = service.serviceMessage,
-            transfer = transfer,
+            outgoingTransfer = service.outgoingTransfer?.toTransferStatus(),
+            incomingTransfer = service.incomingTransfer?.toTransferStatus(),
             resumePrompt = service.resumePrompt,
             pairingOffer = service.pairingOffer
         )
@@ -200,4 +196,9 @@ object TransferUiReducer {
         files: List<SelectedFile>,
         notice: String? = null
     ): TransferUiState = state.copy(selectedFiles = files, notice = notice)
+
+    private fun com.example.transfer.service.ServiceTransfer.toTransferStatus() = TransferStatus(
+        direction, fileName, progress, message, active,
+        fileIndex, fileCount, batchProgress, pauseState
+    )
 }

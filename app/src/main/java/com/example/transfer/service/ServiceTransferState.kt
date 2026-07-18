@@ -32,7 +32,8 @@ data class ServiceTransfer(
 data class ServiceTransferState(
     val devices: List<DiscoveredDevice> = emptyList(),
     val serviceMessage: String = "等待设备或文件",
-    val transfer: ServiceTransfer? = null,
+    val outgoingTransfer: ServiceTransfer? = null,
+    val incomingTransfer: ServiceTransfer? = null,
     val resumePrompt: ResumePrompt? = null,
     val recoverableBatch: RecoverableOutgoingBatch? = null,
     val pairingOffer: PairingOfferUi? = null,
@@ -86,7 +87,7 @@ internal fun ServiceTransferState.withLatestOutgoingPauseState(
     controllerMatches: Boolean,
     latestPauseState: () -> TransferPauseState
 ): ServiceTransferState {
-    val current = transfer
+    val current = outgoingTransfer
     if (
         !controllerMatches ||
         current == null ||
@@ -94,15 +95,15 @@ internal fun ServiceTransferState.withLatestOutgoingPauseState(
         current.direction != "发送"
     ) return this
     val pauseState = latestPauseState()
-    return copy(transfer = current.copy(
+    return copy(outgoingTransfer = current.copy(
         message = servicePauseMessage(pauseState),
         pauseState = pauseState
     ))
 }
 
 internal fun ServiceTransferState.withInactiveBatchFailure(message: String): ServiceTransferState {
-    val current = transfer
-    return copy(transfer = if (current == null) {
+    val current = outgoingTransfer
+    return copy(outgoingTransfer = if (current == null) {
         ServiceTransfer("发送", "", 0, message, false)
     } else {
         current.copy(message = message, active = false)
@@ -110,9 +111,9 @@ internal fun ServiceTransferState.withInactiveBatchFailure(message: String): Ser
 }
 
 internal fun ServiceTransferState.withCancelledOutgoing(message: String): ServiceTransferState {
-    val current = transfer ?: return this
+    val current = outgoingTransfer ?: return this
     if (current.direction != "发送") return this
-    return copy(transfer = current.copy(
+    return copy(outgoingTransfer = current.copy(
         message = message,
         active = false,
         pauseState = TransferPauseState.CANCELLED

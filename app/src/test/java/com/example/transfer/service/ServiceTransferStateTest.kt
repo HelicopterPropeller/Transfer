@@ -8,9 +8,37 @@ import org.junit.Test
 
 class ServiceTransferStateTest {
     @Test
+    fun `outgoing cancellation and failure preserve exact incoming state`() {
+        val incoming = ServiceTransfer(
+            direction = "接收",
+            fileName = "incoming.bin",
+            progress = 63,
+            message = "正在接收",
+            active = true,
+            incomingAttemptId = 12L
+        )
+        val state = ServiceTransferState(
+            outgoingTransfer = ServiceTransfer(
+                direction = "发送",
+                fileName = "outgoing.bin",
+                progress = 35,
+                message = "正在发送",
+                active = true
+            ),
+            incomingTransfer = incoming
+        )
+
+        val cancelled = state.withCancelledOutgoing("传输已取消")
+        val failed = state.withInactiveBatchFailure("批次失败")
+
+        assertEquals(incoming, cancelled.incomingTransfer)
+        assertEquals(incoming, failed.incomingTransfer)
+    }
+
+    @Test
     fun `cancelled outgoing transfer becomes inactive without losing batch position`() {
         val state = ServiceTransferState(
-            transfer = ServiceTransfer(
+            outgoingTransfer = ServiceTransfer(
                 direction = "发送",
                 fileName = "b.bin",
                 progress = 35,
@@ -22,7 +50,7 @@ class ServiceTransferStateTest {
             )
         )
 
-        val cancelled = state.withCancelledOutgoing("传输已取消").transfer!!
+        val cancelled = state.withCancelledOutgoing("传输已取消").outgoingTransfer!!
 
         assertFalse(cancelled.active)
         assertEquals("传输已取消", cancelled.message)

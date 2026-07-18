@@ -94,7 +94,6 @@ class TransferForegroundService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val busy = AtomicBoolean(false)
     private val resumePreflight = ResumePreflight<PreparedOutgoingFile>()
     private val shutdownCoordinator = ServiceShutdownCoordinator()
     private val terminationGate = ServiceTerminationGate()
@@ -102,6 +101,7 @@ class TransferForegroundService : Service() {
     val state: StateFlow<ServiceTransferState> = mutableState.asStateFlow()
     private lateinit var notificationFactory: TransferNotificationFactory
     private lateinit var resourceGuard: TransferResourceGuard
+    private lateinit var transferLanes: TransferLaneGate
     private lateinit var incomingAttempts: IncomingTransferAttemptTracker
     private lateinit var discovery: DiscoveryManager
     private lateinit var server: FileTransferServer
@@ -138,7 +138,11 @@ class TransferForegroundService : Service() {
             notificationFactory.build(TransferNotificationModel.from(mutableState.value))
         )
         resourceGuard = createResourceGuard()
-        incomingAttempts = IncomingTransferAttemptTracker(::beginTransfer, ::endTransfer)
+        transferLanes = TransferLaneGate(resourceGuard::acquire, resourceGuard::release)
+        incomingAttempts = IncomingTransferAttemptTracker(
+            acquire = { transferLanes.begin(TransferLane.INCOMING) },
+            release = { transferLanes.end(TransferLane.INCOMING) },
+        )
         localDeviceId = getSharedPreferences("transfer", 0).let { preferences ->
             preferences.getString("device_id", null) ?: UUID.randomUUID().toString().also {
                 preferences.edit { putString("device_id", it) }
@@ -204,7 +208,7 @@ class TransferForegroundService : Service() {
                     publish { current ->
                         current.copy(
                             serviceMessage = "断点恢复初始化失败",
-                            transfer = ServiceTransfer(
+                            incomingTransfer = ServiceTransfer(
                                 "接收",
                                 "",
                                 0,
@@ -224,9 +228,9 @@ class TransferForegroundService : Service() {
                 { attemptId, name, progress ->
                     publish { current ->
                         if (!incomingAttempts.isCurrent(attemptId) ||
-                            current.transfer?.incomingAttemptId != attemptId
+                            current.incomingTransfer?.incomingAttemptId != attemptId
                         ) current else current.copy(
-                            transfer = ServiceTransfer(
+                            incomingTransfer = ServiceTransfer(
                                 "接收", name, progress, "正在接收", true,
                                 incomingAttemptId = attemptId
                             )
@@ -236,7 +240,7 @@ class TransferForegroundService : Service() {
                 { attemptId, name ->
                     finishIncomingAttempt(attemptId) { current ->
                         current.copy(
-                            transfer = ServiceTransfer(
+                            incomingTransfer = ServiceTransfer(
                                 "接收", name, 100, "接收完成", false,
                                 incomingAttemptId = attemptId
                             )
@@ -248,9 +252,9 @@ class TransferForegroundService : Service() {
                         publish { it.copy(serviceMessage = message) }
                     } else {
                         finishIncomingAttempt(attemptId) { current ->
-                            val transfer = current.transfer
+                            val transfer = current.incomingTransfer
                             current.copy(
-                                transfer = ServiceTransfer(
+                                incomingTransfer = ServiceTransfer(
                                     "接收",
                                     transfer?.fileName.orEmpty(),
                                     transfer?.progress ?: 0,
@@ -390,7 +394,9 @@ class TransferForegroundService : Service() {
         var accepted = false
         terminationGate.runIfOpen gate@{
             val device = state.value.devices.firstOrNull { it.id == deviceId } ?: return@gate
-            val reservation = resumePreflight.reserve(busy::get) ?: return@gate
+            val reservation = resumePreflight.reserve {
+                transferLanes.isActive(TransferLane.OUTGOING)
+            } ?: return@gate
             lateinit var job: Job
             job = serviceScope.launch(start = CoroutineStart.LAZY) {
                 var batchId: String? = null
@@ -448,7 +454,7 @@ class TransferForegroundService : Service() {
                         return@launch
                     }
                     when (val result = resumePreflight.finish(
-                        reservation, prepared, acquireBusy = ::beginTransfer
+                        reservation, prepared, acquireBusy = ::beginOutgoing
                     )) {
                         is ResumePreflightResult.Ready -> {
                             if (!startPreparedOutgoing(result.files, alreadyHeld = true)) {
@@ -495,7 +501,7 @@ class TransferForegroundService : Service() {
                     batchId?.let { interruptOutgoingBatch(it) }
                     publish { current ->
                         val message = "发送预检失败：${exception.message ?: "未知错误"}"
-                        if (current.transfer?.active == true) {
+                        if (current.outgoingTransfer?.active == true) {
                             current.copy(serviceMessage = message)
                         } else {
                             current.withInactiveBatchFailure(message)
@@ -519,7 +525,7 @@ class TransferForegroundService : Service() {
         var handled = false
         terminationGate.runIfOpen {
             when (val confirmation = resumePreflight.confirm(
-                promptId, choice, acquireBusy = ::beginTransfer
+                promptId, choice, acquireBusy = ::beginOutgoing
             )) {
                 ResumeConfirmation.Ignored -> Unit
                 ResumeConfirmation.Cancelled -> {
@@ -547,10 +553,10 @@ class TransferForegroundService : Service() {
         alreadyHeld: Boolean = false
     ): Boolean {
         if (files.isEmpty()) {
-            if (alreadyHeld) endTransfer()
+            if (alreadyHeld) endOutgoing()
             return false
         }
-        if (!alreadyHeld && !beginTransfer()) return false
+        if (!alreadyHeld && !beginOutgoing()) return false
         val device = files.first().value.device
         val batchId = files.first().value.batchItem.batchId
         val sources = files.map { it.value.prepared.source }
@@ -559,7 +565,7 @@ class TransferForegroundService : Service() {
         publish { current ->
             current.copy(
                 resumePrompt = null,
-                transfer = ServiceTransfer(
+                outgoingTransfer = ServiceTransfer(
                     direction = "发送",
                     fileName = sources.first().displayName,
                     progress = 0,
@@ -578,7 +584,7 @@ class TransferForegroundService : Service() {
             if (cleanupStarted.compareAndSet(false, true)) {
                 if (activePauseController === controller) activePauseController = null
                 if (activeBatchJob === job) activeBatchJob = null
-                endTransfer()
+                endOutgoing()
             }
         }
         job = serviceScope.launch(start = CoroutineStart.LAZY) {
@@ -668,7 +674,7 @@ class TransferForegroundService : Service() {
                 publish { current ->
                     if (activePauseController !== controller) current else {
                         val terminal = lastProgress
-                        current.copy(transfer = ServiceTransfer(
+                        current.copy(outgoingTransfer = ServiceTransfer(
                             direction = "发送",
                             fileName = terminal?.fileName ?: sources.last().displayName,
                             progress = terminal?.fileProgress ?: 0,
@@ -714,11 +720,11 @@ class TransferForegroundService : Service() {
         progress: com.example.transfer.transfer.BatchTransferProgress
     ) {
         publish { current ->
-            if (activePauseController !== controller || current.transfer?.active != true) {
+            if (activePauseController !== controller || current.outgoingTransfer?.active != true) {
                 current
             } else {
                 val pauseState = controller.state
-                current.copy(transfer = ServiceTransfer(
+                current.copy(outgoingTransfer = ServiceTransfer(
                     direction = "发送",
                     fileName = progress.fileName,
                     progress = progress.fileProgress,
@@ -765,21 +771,17 @@ class TransferForegroundService : Service() {
         return true
     }
 
-    private fun beginTransfer(): Boolean {
-        if (!busy.compareAndSet(false, true)) return false
-        return runCatching { resourceGuard.acquire(); true }.getOrElse { busy.set(false); false }
-    }
+    private fun beginOutgoing(): Boolean = transferLanes.begin(TransferLane.OUTGOING)
 
-    private fun endTransfer() {
-        resourceGuard.release()
-        busy.set(false)
+    private fun endOutgoing() {
+        transferLanes.end(TransferLane.OUTGOING)
     }
 
     private fun beginIncomingAttempt(attemptId: Long): Boolean {
         if (!incomingAttempts.begin(attemptId)) return false
         publish { current ->
             current.copy(
-                transfer = ServiceTransfer(
+                incomingTransfer = ServiceTransfer(
                     "接收", "", 0, "正在连接", true,
                     incomingAttemptId = attemptId
                 )
@@ -790,10 +792,10 @@ class TransferForegroundService : Service() {
 
     private fun endIncomingAttempt(attemptId: Long) {
         finishIncomingAttempt(attemptId) { current ->
-            val transfer = current.transfer
+            val transfer = current.incomingTransfer
             if (transfer?.incomingAttemptId == attemptId && transfer.active) {
                 current.copy(
-                    transfer = transfer.copy(
+                    incomingTransfer = transfer.copy(
                         active = false,
                         message = "连接已中断，可稍后续传"
                     )
@@ -810,7 +812,7 @@ class TransferForegroundService : Service() {
     ) {
         incomingAttempts.finish(attemptId) {
             publish { current ->
-                if (current.transfer?.incomingAttemptId == attemptId) terminal(current) else current
+                if (current.incomingTransfer?.incomingAttemptId == attemptId) terminal(current) else current
             }
         }
     }
@@ -984,7 +986,17 @@ class TransferForegroundService : Service() {
         try {
             terminationGate.closeWithAction {
                 publishNow {
-                    it.copy(transfer = ServiceTransfer("", "", 0, "后台服务达到系统运行时限", false))
+                    it.copy(
+                        serviceMessage = "后台服务达到系统运行时限",
+                        outgoingTransfer = it.outgoingTransfer?.copy(
+                            message = "后台服务达到系统运行时限",
+                            active = false
+                        ),
+                        incomingTransfer = it.incomingTransfer?.copy(
+                            message = "后台服务达到系统运行时限",
+                            active = false
+                        )
+                    )
                 }
             }
         } finally {

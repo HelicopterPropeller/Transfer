@@ -228,7 +228,11 @@ class MainActivity : AppCompatActivity() {
         noticeText.text = state.notice.orEmpty()
         noticeText.visibility = if (state.notice == null) View.GONE else View.VISIBLE
         sendButton.isEnabled = state.canSend
-        state.transfer.let { transfer ->
+        val transfer = state.outgoingTransfer?.takeIf { it.active }
+            ?: state.incomingTransfer?.takeIf { it.active }
+            ?: state.outgoingTransfer
+            ?: state.incomingTransfer
+        transfer.let {
             transferCard.visibility = if (transfer == null) View.GONE else View.VISIBLE
             if (transfer != null) {
                 transferTitleText.text = if (transfer.direction.isBlank()) transfer.message else getString(R.string.transfer_title, transfer.direction)
