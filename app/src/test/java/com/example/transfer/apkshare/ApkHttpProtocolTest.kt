@@ -282,6 +282,29 @@ class ApkHttpProtocolTest {
         assertFalse(session.authorize(session.token))
     }
 
+    @Test
+    fun `download failure is published before the attempt becomes retryable`() {
+        val artifact = artifactContaining(ByteArray(256) { it.toByte() })
+        val session = fixedSession()
+        var failurePublishedWhileAttemptOwned = false
+        val protocol = ApkHttpProtocol(artifact, session) {
+            failurePublishedWhileAttemptOwned = session.beginAttempt(session.token) == null
+        }
+
+        try {
+            protocol.respond(
+                request(target = "/i/${session.token}/app.apk"),
+                FailingOutputStream(bytesBeforeFailure = 1),
+            )
+            fail("Expected download failure")
+        } catch (_: IOException) {
+            // Expected from the failing client output.
+        }
+
+        assertTrue("Failure was published only after the attempt was released", failurePublishedWhileAttemptOwned)
+        assertTrue("Failed attempt did not become retryable", session.beginAttempt(session.token) != null)
+    }
+
     private fun request(
         method: String = "GET",
         target: String,

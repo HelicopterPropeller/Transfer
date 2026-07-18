@@ -15,6 +15,7 @@ data class HttpRequest(
 class ApkHttpProtocol(
     private val artifact: ApkArtifact,
     private val session: ApkShareSession,
+    private val onDownloadFailure: (Exception) -> Unit = {},
 ) {
     fun respond(request: HttpRequest, output: OutputStream) {
         if (request.method != "GET") {
@@ -86,6 +87,12 @@ class ApkHttpProtocol(
             if (!completed) {
                 throw IOException("Download session expired before completion")
             }
+        } catch (exception: Exception) {
+            // Publish the terminal event before releasing this attempt. A retry may
+            // begin as soon as failAttempt runs, so reversing these calls can make
+            // the next start appear before this failure to a serialized listener.
+            runCatching { onDownloadFailure(exception) }
+            throw exception
         } finally {
             if (!completed) session.failAttempt(attempt)
         }

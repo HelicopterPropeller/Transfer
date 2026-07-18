@@ -146,7 +146,11 @@ class LocalApkHttpServer(
             callbacks = callbacks,
         )
         try {
-            ApkHttpProtocol(artifact, session).respond(request, trackedOutput)
+            ApkHttpProtocol(
+                artifact = artifact,
+                session = session,
+                onDownloadFailure = trackedOutput::reportFailure,
+            ).respond(request, trackedOutput)
             trackedOutput.reportCompletion()
         } catch (exception: IOException) {
             trackedOutput.reportFailure(exception)
@@ -244,13 +248,15 @@ class LocalApkHttpServer(
             acceptThread = null
         }
 
-        callbacks.close()
         closeQuietly(socket)
         activeClients.forEach(::closeQuietly)
         clients.shutdownNow()
         joinBounded(thread)
         awaitClientsBounded()
         activeClients.forEach(::closeQuietly)
+        // Seal only after server-owned producers have stopped. Events accepted
+        // before this boundary remain queued for the caller-owned executor.
+        callbacks.close()
     }
 
     private fun joinBounded(thread: Thread?) {
@@ -390,12 +396,16 @@ class LocalApkHttpServer(
             }
             if (!scheduleDrain) return
 
-            try {
-                executor.execute(::drain)
-            } catch (_: RejectedExecutionException) {
-                synchronized(lock) {
-                    pending.clear()
-                    drainScheduled = false
+            // Executor permits synchronous implementations. Always hand off from
+            // server-owned client workers first so arbitrary listener code cannot
+            // pin their bounded shutdown.
+            CALLBACK_HANDOFF.execute {
+                try {
+                    executor.execute(::drain)
+                } catch (_: RejectedExecutionException) {
+                    // Preserve accepted terminal events even if the caller-owned
+                    // executor is shutting down. This thread is not server-owned.
+                    drain()
                 }
             }
         }
@@ -403,14 +413,8 @@ class LocalApkHttpServer(
         private fun drain() {
             while (true) {
                 val callback = synchronized(lock) {
-                    if (closed) {
-                        pending.clear()
-                        drainScheduled = false
-                        null
-                    } else {
-                        pending.pollFirst().also { next ->
-                            if (next == null) drainScheduled = false
-                        }
+                    pending.pollFirst().also { next ->
+                        if (next == null) drainScheduled = false
                     }
                 } ?: return
 
@@ -422,7 +426,6 @@ class LocalApkHttpServer(
             synchronized(lock) {
                 if (closed) return
                 closed = true
-                pending.clear()
             }
         }
     }
@@ -440,5 +443,6 @@ class LocalApkHttpServer(
         val HTTP_TOKEN = Regex("[!#$%&'*+.^_`|~0-9A-Za-z-]+")
         val DOWNLOAD_TARGET = Regex("^/i/[a-f0-9]{48}/app\\.apk$")
         val SUCCESS_STATUS = "HTTP/1.1 200 OK\r\n".toByteArray(UTF_8)
+        val CALLBACK_HANDOFF: Executor = ForkJoinPool.commonPool()
     }
 }

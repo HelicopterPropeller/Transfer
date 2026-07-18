@@ -315,7 +315,7 @@ class LocalApkHttpServerTest {
     }
 
     @Test
-    fun `close drops queued callbacks without waiting for a blocking caller callback`() {
+    fun `close preserves queued callbacks without waiting for a blocking caller callback`() {
         val callbackExecutor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "test-apk-blocking-callback")
         }
@@ -350,13 +350,85 @@ class LocalApkHttpServerTest {
             assertFalse("Server closed its caller-owned executor", callbackExecutor.isShutdown)
             listener.release.countDown()
             callbackExecutor.submit {}.get(2, TimeUnit.SECONDS)
-            assertEquals(listOf("started"), listener.events)
+            assertEventually("Queued completion callbacks were lost during close") {
+                listener.events.lastOrNull() == "completed"
+            }
+            assertEquals("started", listener.events.first())
+            assertTrue(listener.events.contains("progress"))
+            assertEquals("completed", listener.events.last())
         } finally {
             listener.release.countDown()
             socket.close()
             server.close()
             callbackExecutor.shutdownNow()
             callbackExecutor.awaitTermination(2, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    fun `direct callback executor never runs a blocking listener on server client threads`() {
+        val listener = UninterruptiblyBlockingListener()
+        val server = LocalApkHttpServer(callbackExecutor = Executor { command -> command.run() })
+        val session = fixedSession()
+        val socket = try {
+            val port = server.start(loopbackSelection(), artifactContaining("apk"), session, listener)
+            connectedSocket(port).also { client ->
+                client.getOutputStream().write(
+                    "GET /i/${session.token}/app.apk HTTP/1.1\r\nHost: local\r\n\r\n".toByteArray(UTF_8),
+                )
+                client.getOutputStream().flush()
+            }
+        } catch (exception: Exception) {
+            listener.release.countDown()
+            throw exception
+        }
+
+        try {
+            assertTrue("Started callback did not block", listener.started.await(2, TimeUnit.SECONDS))
+            assertFalse(
+                "Listener ran on a server-owned client thread: ${listener.callbackThreadName}",
+                listener.callbackThreadName.orEmpty().startsWith("apk-share-client-"),
+            )
+
+            server.close()
+
+            assertEventually("Direct executor listener pinned a server-owned thread") {
+                apkServerThreads().isEmpty()
+            }
+        } finally {
+            listener.release.countDown()
+            socket.close()
+            server.close()
+        }
+    }
+
+    @Test
+    fun `close before caller executor drain preserves accepted terminal callbacks`() {
+        val callbackExecutor = ControllableExecutor()
+        val listener = EventRecordingListener()
+        val server = LocalApkHttpServer(callbackExecutor = callbackExecutor)
+        val session = fixedSession()
+        val body = "apk".toByteArray(UTF_8)
+
+        try {
+            val port = server.start(loopbackSelection(), artifactContaining(body), session, listener)
+            val response = request(
+                port,
+                "GET /i/${session.token}/app.apk HTTP/1.1\r\nHost: local\r\n\r\n",
+            )
+            assertEquals("HTTP/1.1 200 OK", response.statusLine)
+            assertFalse(session.authorize(session.token))
+            assertEventually("Callback drain was not handed to the caller executor") {
+                callbackExecutor.hasPendingTasks()
+            }
+
+            server.close()
+            callbackExecutor.runAll()
+
+            assertEquals(listOf("started", "progress:${body.size}", "completed"), listener.events)
+        } finally {
+            server.close()
+            callbackExecutor.runAll()
         }
     }
 
@@ -529,6 +601,44 @@ private class UninterruptiblyBlockingListener : ApkDownloadListener {
 
     override fun onFailed(message: String) {
         events += "failed"
+    }
+}
+
+private class EventRecordingListener : ApkDownloadListener {
+    val events = CopyOnWriteArrayList<String>()
+
+    override fun onStarted(totalBytes: Long) {
+        events += "started"
+    }
+
+    override fun onProgress(bytesSent: Long, totalBytes: Long) {
+        events += "progress:$bytesSent"
+    }
+
+    override fun onCompleted() {
+        events += "completed"
+    }
+
+    override fun onFailed(message: String) {
+        events += "failed"
+    }
+}
+
+private class ControllableExecutor : Executor {
+    private val tasks = CopyOnWriteArrayList<Runnable>()
+
+    override fun execute(command: Runnable) {
+        tasks += command
+    }
+
+    fun hasPendingTasks(): Boolean = tasks.isNotEmpty()
+
+    fun runAll() {
+        while (true) {
+            val task = tasks.firstOrNull() ?: return
+            tasks.remove(task)
+            task.run()
+        }
     }
 }
 
