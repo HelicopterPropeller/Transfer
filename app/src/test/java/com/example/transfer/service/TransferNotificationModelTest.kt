@@ -143,6 +143,32 @@ class TransferNotificationModelTest {
     }
 
     @Test
+    fun `incoming lane never offers outgoing action even when direction says send`() {
+        val transfer = ServiceTransfer(
+            "发送", "in.bin", 25, "正在接收", true,
+            pauseState = TransferPauseState.RUNNING
+        )
+
+        assertEquals(
+            TransferNotificationAction.NONE,
+            TransferNotificationModel.from(ServiceTransferState(incomingTransfer = transfer)).action
+        )
+    }
+
+    @Test
+    fun `outgoing lane action follows pause state even when direction label is unexpected`() {
+        val transfer = ServiceTransfer(
+            "接收", "out.bin", 25, "正在发送", true,
+            pauseState = TransferPauseState.RUNNING
+        )
+
+        assertEquals(
+            TransferNotificationAction.PAUSE,
+            TransferNotificationModel.from(ServiceTransferState(outgoingTransfer = transfer)).action
+        )
+    }
+
+    @Test
     fun `termination gate rejects publishing after close`() {
         val gate = ServiceTerminationGate()
         var publications = 0

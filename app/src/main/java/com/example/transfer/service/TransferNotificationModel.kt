@@ -23,10 +23,26 @@ data class TransferNotificationModel(
                     outgoing.batchProgress,
                     outgoingAction(outgoing)
                 )
-                outgoing?.active == true -> singleDirection(outgoing, state.serviceMessage)
-                incoming?.active == true -> singleDirection(incoming, state.serviceMessage)
-                outgoing != null -> singleDirection(outgoing, state.serviceMessage)
-                incoming != null -> singleDirection(incoming, state.serviceMessage)
+                outgoing?.active == true -> singleDirection(
+                    outgoing,
+                    state.serviceMessage,
+                    outgoingAction(outgoing)
+                )
+                incoming?.active == true -> singleDirection(
+                    incoming,
+                    state.serviceMessage,
+                    TransferNotificationAction.NONE
+                )
+                outgoing != null -> singleDirection(
+                    outgoing,
+                    state.serviceMessage,
+                    outgoingAction(outgoing)
+                )
+                incoming != null -> singleDirection(
+                    incoming,
+                    state.serviceMessage,
+                    TransferNotificationAction.NONE
+                )
                 else -> idle()
             }
         }
@@ -39,7 +55,8 @@ data class TransferNotificationModel(
 
         private fun singleDirection(
             transfer: ServiceTransfer,
-            serviceMessage: String
+            serviceMessage: String,
+            action: TransferNotificationAction
         ): TransferNotificationModel {
             if (!transfer.active) return TransferNotificationModel(
                 transfer.message,
@@ -58,7 +75,7 @@ data class TransferNotificationModel(
                 text,
                 true,
                 transfer.batchProgress,
-                if (transfer.direction == "发送") outgoingAction(transfer) else TransferNotificationAction.NONE
+                action
             )
         }
 
