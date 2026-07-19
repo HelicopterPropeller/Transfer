@@ -175,6 +175,12 @@ class ApkShareActivity : AppCompatActivity() {
             lastQrPayload = null
             lastQrSide = 0
         }
+        if (isFinishing && currentState is ApkShareState.Idle) {
+            binder?.stopIfIdle() ?: startService(
+                Intent(this, ApkShareForegroundService::class.java)
+                    .setAction(ApkShareForegroundService.ACTION_STOP_IF_IDLE),
+            )
+        }
         if (bound) {
             unbindService(connection)
             bound = false

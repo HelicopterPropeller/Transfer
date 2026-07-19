@@ -119,6 +119,31 @@ class HotspotControllerPolicyTest {
         assertFalse(gate.publish { firstPublished.incrementAndGet() })
         assertEquals(1, firstPublished.get())
     }
+
+    @Test
+    fun `unexpected hotspot stop is delivered once only after a successful start`() {
+        val gate = HotspotLifecycleGate()
+        val losses = AtomicInteger()
+
+        assertFalse(gate.publishUnexpectedStop { losses.incrementAndGet() })
+        assertTrue(gate.markStarted())
+        assertTrue(gate.publishUnexpectedStop { losses.incrementAndGet() })
+        assertFalse(gate.publishUnexpectedStop { losses.incrementAndGet() })
+
+        assertEquals(1, losses.get())
+    }
+
+    @Test
+    fun `closing hotspot suppresses the platform stop callback`() {
+        val gate = HotspotLifecycleGate()
+        val losses = AtomicInteger()
+        assertTrue(gate.markStarted())
+
+        gate.close()
+
+        assertFalse(gate.publishUnexpectedStop { losses.incrementAndGet() })
+        assertEquals(0, losses.get())
+    }
 }
 
 private class TestReservation : Closeable {

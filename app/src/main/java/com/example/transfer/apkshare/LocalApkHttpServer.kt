@@ -13,9 +13,10 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
-import java.util.concurrent.Executors
 import java.util.concurrent.ForkJoinPool
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -34,9 +35,14 @@ class LocalApkHttpServer(
     private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
     private val callbacks = SerialCallbackDispatcher(callbackExecutor)
     private val clientNumber = AtomicInteger()
-    private val clients = Executors.newFixedThreadPool(2) { runnable ->
-        Thread(runnable, "apk-share-client-${clientNumber.incrementAndGet()}")
-    }
+    private val clients = ThreadPoolExecutor(
+        MAX_CONCURRENT_CLIENTS,
+        MAX_CONCURRENT_CLIENTS,
+        0L,
+        TimeUnit.MILLISECONDS,
+        SynchronousQueue(),
+        { runnable -> Thread(runnable, "apk-share-client-${clientNumber.incrementAndGet()}") },
+    )
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -435,6 +441,7 @@ class LocalApkHttpServer(
             character.code == 0x7f || character.code < 0x20 && character != '\t'
 
         const val CLIENT_BACKLOG = 4
+        const val MAX_CONCURRENT_CLIENTS = 2
         const val CLIENT_TIMEOUT_MILLIS = 10_000
         const val MAX_HEADER_BYTES = 8 * 1024
         const val SHUTDOWN_TIMEOUT_MILLIS = 1_000L

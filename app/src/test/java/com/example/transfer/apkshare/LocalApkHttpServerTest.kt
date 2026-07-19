@@ -9,6 +9,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketAddress
+import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -312,6 +313,46 @@ class LocalApkHttpServerTest {
             stalled.close()
         }
         assertTrue("close() did not close an active client socket", closedByServer)
+    }
+
+    @Test
+    fun `excess stalled clients are closed instead of queued`() {
+        val server = LocalApkHttpServer()
+        val session = fixedSession()
+        val port = server.start(loopbackSelection(), artifactContaining("apk"), session, NoOpListener)
+        val stalledClients = List(2) {
+            connectedSocket(port).also { client ->
+                client.getOutputStream().write(
+                    "GET /i/${session.token}/app.apk HTTP/1.1\r\nHost:".toByteArray(UTF_8),
+                )
+                client.getOutputStream().flush()
+            }
+        }
+        try {
+            assertEventually("Server did not occupy both client workers") {
+                apkServerThreads().size >= 3
+            }
+
+            val excess = connectedSocket(port, timeoutMillis = 1_000)
+            val closedPromptly = try {
+                excess.getOutputStream().write(
+                    "GET /i/${session.token}/app.apk HTTP/1.1\r\nHost:".toByteArray(UTF_8),
+                )
+                excess.getOutputStream().flush()
+                excess.getInputStream().read() == -1
+            } catch (_: SocketTimeoutException) {
+                false
+            } catch (_: IOException) {
+                true
+            } finally {
+                excess.close()
+            }
+
+            assertTrue("Excess client remained queued behind the two stalled clients", closedPromptly)
+        } finally {
+            stalledClients.forEach(Socket::close)
+            server.close()
+        }
     }
 
     @Test

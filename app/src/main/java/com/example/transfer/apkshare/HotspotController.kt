@@ -114,6 +114,32 @@ internal class HotspotResultGate : Closeable {
     }
 }
 
+internal class HotspotLifecycleGate : Closeable {
+    private val lock = Any()
+    private var started = false
+    private var lossDelivered = false
+    private var closed = false
+
+    fun markStarted(): Boolean = synchronized(lock) {
+        if (closed) return false
+        started = true
+        true
+    }
+
+    fun publishUnexpectedStop(callback: () -> Unit): Boolean = synchronized(lock) {
+        if (closed || !started || lossDelivered) return false
+        lossDelivered = true
+        callback()
+        true
+    }
+
+    override fun close() {
+        synchronized(lock) {
+            closed = true
+        }
+    }
+}
+
 class HotspotController(
     context: Context,
     private val wifiManager: WifiManager = context.applicationContext
@@ -127,9 +153,13 @@ class HotspotController(
     private val reservations = HotspotReservationOwner<WifiManager.LocalOnlyHotspotReservation>()
     private val startRequested = AtomicBoolean()
     private val resultGate = HotspotResultGate()
+    private val lifecycleGate = HotspotLifecycleGate()
 
     @RequiresApi(Build.VERSION_CODES.O)
-    fun start(callback: (HotspotStartResult) -> Unit) {
+    fun start(
+        onLost: () -> Unit,
+        callback: (HotspotStartResult) -> Unit,
+    ) {
         if (resultGate.isClosed || !startRequested.compareAndSet(false, true)) return
         if (HotspotPermissionPolicy.requirementFor(apiLevel) == HotspotRequirement.MANUAL) {
             publishManual(callback, HotspotFailure.GENERIC)
@@ -147,6 +177,10 @@ class HotspotController(
                     close()
                     return
                 }
+                if (!lifecycleGate.markStarted()) {
+                    close()
+                    return
+                }
                 if (!resultGate.publish { callback(HotspotStartResult.Started(credentials, before)) }) {
                     close()
                 }
@@ -154,6 +188,10 @@ class HotspotController(
 
             override fun onFailed(reason: Int) {
                 publishManual(callback, HotspotFailure.fromPlatform(reason))
+            }
+
+            override fun onStopped() {
+                lifecycleGate.publishUnexpectedStop(onLost)
             }
         }
 
@@ -167,6 +205,7 @@ class HotspotController(
     }
 
     override fun close() {
+        lifecycleGate.close()
         resultGate.close()
         reservations.close()
     }

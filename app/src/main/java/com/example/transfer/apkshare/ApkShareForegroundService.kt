@@ -39,6 +39,7 @@ class ApkShareForegroundService : Service() {
             this@ApkShareForegroundService.continueAfterManualHotspot()
 
         fun showDownloadQr() = this@ApkShareForegroundService.showDownloadQr()
+        fun stopIfIdle() = this@ApkShareForegroundService.stopIfIdle()
         fun cancel() = this@ApkShareForegroundService.cancelAndStop()
     }
 
@@ -52,6 +53,7 @@ class ApkShareForegroundService : Service() {
         var hotspotBefore: List<InterfaceAddressSnapshot>? = null
         var server: LocalApkHttpServer? = null
         var session: ApkShareSession? = null
+        var downloadReadyState: ApkShareState.ReadyToDownload? = null
         var timeoutJob: Job? = null
         val servingRequested = AtomicBoolean()
         private val closed = AtomicBoolean()
@@ -103,8 +105,9 @@ class ApkShareForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_CANCEL) {
-            cancelAndStop()
+        when (intent?.action) {
+            ACTION_CANCEL -> cancelAndStop()
+            ACTION_STOP_IF_IDLE -> stopIfIdle()
         }
         return START_NOT_STICKY
     }
@@ -156,7 +159,11 @@ class ApkShareForegroundService : Service() {
                 controller.close()
                 return@launch
             }
-            controller.start { result ->
+            controller.start(
+                onLost = {
+                    fail(operation, "本地热点已关闭，请重试或使用手动热点")
+                },
+            ) { result ->
                 when (result) {
                     is HotspotStartResult.Started -> {
                         val accepted = synchronized(operationLock) {
@@ -266,6 +273,20 @@ class ApkShareForegroundService : Service() {
         serviceScope.cancel()
         closeAsync(detached)
         cleanupExecutor.shutdown()
+        stopForegroundAndSelf()
+    }
+
+    private fun stopIfIdle() {
+        val shouldStop = synchronized(operationLock) {
+            ApkShareServiceStopPolicy.shouldStopOnUiExit(
+                mutableState.value,
+                activeOperation != null,
+            )
+        }
+        if (shouldStop) stopForegroundAndSelf()
+    }
+
+    private fun stopForegroundAndSelf() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -366,11 +387,10 @@ class ApkShareForegroundService : Service() {
             return
         }
         val url = "http://${address.address.hostAddress}:$port/i/${session.token}/"
-        if (!publishFor(
+        if (!publishDownloadReadyFor(
                 operation,
                 ApkShareState.ReadyToDownload(url, artifact, session.expiresAtMillis),
-            )
-        ) {
+            )) {
             return
         }
         val timer = serviceScope.launch {
@@ -392,27 +412,37 @@ class ApkShareForegroundService : Service() {
     }
 
     private fun listenerFor(operation: ActiveOperation): ApkDownloadListener =
-        object : ApkDownloadListener {
-            override fun onStarted(totalBytes: Long) {
-                publishFor(operation, ApkShareState.Downloading(0L, totalBytes))
-            }
-
-            override fun onProgress(bytesSent: Long, totalBytes: Long) {
-                publishFor(operation, ApkShareState.Downloading(bytesSent, totalBytes))
-            }
-
-            override fun onCompleted() {
-                if (!publishFor(operation, ApkShareState.Completed)) return
+        RetryableApkDownloadListener(
+            readyState = {
+                synchronized(operationLock) {
+                    operation.downloadReadyState.takeIf { activeOperation === operation }
+                }
+            },
+            publish = { state -> publishFor(operation, state) },
+            complete = { completeOperation(operation) },
+            onCompletedPublished = {
                 operation.timeoutJob?.cancel()
+                closeAsync(operation)
                 serviceScope.launch {
                     delay(COMPLETION_CLEANUP_DELAY_MILLIS)
-                    closeAsync(detachIfCurrent(operation))
+                    val shouldStop = synchronized(operationLock) {
+                        ApkShareServiceStopPolicy.shouldStopAfterCompletion(
+                            mutableState.value,
+                            activeOperation != null,
+                        )
+                    }
+                    if (shouldStop) stopForegroundAndSelf()
                 }
-            }
+            },
+        )
 
-            override fun onFailed(message: String) {
-                fail(operation, message)
-            }
+    private fun completeOperation(operation: ActiveOperation): Boolean =
+        synchronized(operationLock) {
+            if (activeOperation !== operation) return false
+            activeOperation = null
+            mutableState.value = ApkShareState.Completed
+            scheduleNotificationLocked()
+            true
         }
 
     private fun fail(operation: ActiveOperation, message: String) {
@@ -433,6 +463,17 @@ class ApkShareForegroundService : Service() {
             scheduleNotificationLocked()
             true
         }
+
+    private fun publishDownloadReadyFor(
+        operation: ActiveOperation,
+        state: ApkShareState.ReadyToDownload,
+    ): Boolean = synchronized(operationLock) {
+        if (activeOperation !== operation) return false
+        operation.downloadReadyState = state
+        mutableState.value = state
+        scheduleNotificationLocked()
+        true
+    }
 
     private fun cancelActiveAndPublish(state: ApkShareState) {
         val detached = synchronized(operationLock) {
@@ -459,13 +500,6 @@ class ApkShareForegroundService : Service() {
         }
         closeAsync { hotspot?.close() }
     }
-
-    private fun detachIfCurrent(operation: ActiveOperation): ActiveOperation? =
-        synchronized(operationLock) {
-            if (activeOperation !== operation) return null
-            activeOperation = null
-            operation
-        }
 
     private fun detachActive(): ActiveOperation? = synchronized(operationLock) {
         activeOperation.also { activeOperation = null }
@@ -507,6 +541,7 @@ class ApkShareForegroundService : Service() {
 
     companion object {
         const val ACTION_CANCEL = "com.example.transfer.apkshare.action.CANCEL"
+        const val ACTION_STOP_IF_IDLE = "com.example.transfer.apkshare.action.STOP_IF_IDLE"
         private const val APK_SHARE_CACHE_DIRECTORY = "apk-share"
         private const val COMPLETION_CLEANUP_DELAY_MILLIS = 300L
         private const val NEARBY_WIFI_PERMISSION = "android.permission.NEARBY_WIFI_DEVICES"

@@ -52,6 +52,37 @@ internal class ApkShareCoordinator(
     }
 }
 
+internal class RetryableApkDownloadListener(
+    private val readyState: () -> ApkShareState.ReadyToDownload?,
+    private val publish: (ApkShareState) -> Boolean,
+    private val complete: () -> Boolean,
+    private val onCompletedPublished: () -> Unit,
+) : ApkDownloadListener {
+    override fun onStarted(totalBytes: Long) {
+        publish(ApkShareState.Downloading(0L, totalBytes))
+    }
+
+    override fun onProgress(bytesSent: Long, totalBytes: Long) {
+        publish(ApkShareState.Downloading(bytesSent, totalBytes))
+    }
+
+    override fun onCompleted() {
+        if (complete()) onCompletedPublished()
+    }
+
+    override fun onFailed(message: String) {
+        readyState()?.let(publish)
+    }
+}
+
+internal object ApkShareServiceStopPolicy {
+    fun shouldStopOnUiExit(state: ApkShareState, hasActiveOperation: Boolean): Boolean =
+        state is ApkShareState.Idle && !hasActiveOperation
+
+    fun shouldStopAfterCompletion(state: ApkShareState, hasActiveOperation: Boolean): Boolean =
+        state is ApkShareState.Completed && !hasActiveOperation
+}
+
 internal class ApkPreparationWorkspace(private val directory: File) {
     fun clear() {
         runCatching { directory.deleteRecursively() }
