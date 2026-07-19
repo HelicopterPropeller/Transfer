@@ -37,6 +37,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class ApkShareActivity : AppCompatActivity() {
+    private enum class PendingBinderAction {
+        START_EXISTING_LAN,
+        START_HOTSPOT,
+        REQUEST_MANUAL_FALLBACK,
+        CONTINUE_MANUAL_HOTSPOT,
+        SHOW_DOWNLOAD_QR,
+    }
+
     private var binder: ApkShareForegroundService.LocalBinder? = null
     private var bound = false
     private var collectorJob: Job? = null
@@ -46,6 +54,7 @@ class ApkShareActivity : AppCompatActivity() {
     private var lastQrPayload: String? = null
     private var lastQrSide = 0
     private var pendingPermissionRequirement: HotspotRequirement? = null
+    private var pendingBinderAction: PendingBinderAction? = null
 
     private lateinit var content: View
     private lateinit var titleText: TextView
@@ -69,6 +78,10 @@ class ApkShareActivity : AppCompatActivity() {
                         render(state)
                     }
                 }
+            }
+            pendingBinderAction?.also { action ->
+                pendingBinderAction = null
+                performBinderAction(connected, action)
             }
         }
 
@@ -94,14 +107,17 @@ class ApkShareActivity : AppCompatActivity() {
             null,
             -> false
         }
-        if (granted) binder?.startAutomaticHotspot()
-        else binder?.requestManualHotspotFallback()
+        if (granted) {
+            runWhenBound(PendingBinderAction.START_HOTSPOT)
+        } else {
+            runWhenBound(PendingBinderAction.REQUEST_MANUAL_FALLBACK)
+        }
     }
 
     private val hotspotSettings = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) {
-        binder?.continueAfterManualHotspot()
+        runWhenBound(PendingBinderAction.CONTINUE_MANUAL_HOTSPOT)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -119,7 +135,16 @@ class ApkShareActivity : AppCompatActivity() {
         primaryButton.setOnClickListener { currentUi.primaryAction?.let(::performAction) }
         secondaryButton.setOnClickListener { currentUi.secondaryAction?.let(::performAction) }
         findViewById<MaterialButton>(R.id.cancelApkShareButton).setOnClickListener {
-            binder?.cancel()
+            val connected = binder
+            if (connected != null) {
+                connected.cancel()
+            } else {
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, ApkShareForegroundService::class.java)
+                        .setAction(ApkShareForegroundService.ACTION_CANCEL),
+                )
+            }
             finish()
         }
         content.doOnLayout { renderQr(currentUi.qrPayload) }
@@ -246,9 +271,13 @@ class ApkShareActivity : AppCompatActivity() {
 
     private fun performAction(action: ApkSharePrimaryAction) {
         when (action) {
-            ApkSharePrimaryAction.START_EXISTING_LAN -> binder?.startExistingLan()
+            ApkSharePrimaryAction.START_EXISTING_LAN ->
+                runWhenBound(PendingBinderAction.START_EXISTING_LAN)
+
             ApkSharePrimaryAction.START_HOTSPOT -> requestOrStartHotspot()
-            ApkSharePrimaryAction.SHOW_DOWNLOAD_QR -> binder?.showDownloadQr()
+            ApkSharePrimaryAction.SHOW_DOWNLOAD_QR ->
+                runWhenBound(PendingBinderAction.SHOW_DOWNLOAD_QR)
+
             ApkSharePrimaryAction.OPEN_HOTSPOT_SETTINGS -> openHotspotSettings()
             ApkSharePrimaryAction.RETRY -> retryCurrentOperation()
         }
@@ -271,12 +300,12 @@ class ApkShareActivity : AppCompatActivity() {
             HotspotRequirement.NEARBY_WIFI -> arrayOf(NEARBY_WIFI_PERMISSION)
             HotspotRequirement.MANUAL -> null
             null -> {
-                binder?.startAutomaticHotspot()
+                runWhenBound(PendingBinderAction.START_HOTSPOT)
                 return
             }
         }
         if (permissions == null) {
-            binder?.requestManualHotspotFallback()
+            runWhenBound(PendingBinderAction.REQUEST_MANUAL_FALLBACK)
         } else {
             pendingPermissionRequirement = requirement
             requestHotspotPermissions.launch(permissions)
@@ -285,10 +314,42 @@ class ApkShareActivity : AppCompatActivity() {
 
     private fun retryCurrentOperation() {
         when (currentUi.retryAction) {
-            RetryAction.PREPARE_EXISTING_LAN -> binder?.startExistingLan()
-            RetryAction.PREPARE_HOTSPOT -> binder?.startAutomaticHotspot()
-            RetryAction.RESOLVE_MANUAL_HOTSPOT -> binder?.continueAfterManualHotspot()
+            RetryAction.PREPARE_EXISTING_LAN ->
+                runWhenBound(PendingBinderAction.START_EXISTING_LAN)
+
+            RetryAction.PREPARE_HOTSPOT ->
+                runWhenBound(PendingBinderAction.START_HOTSPOT)
+
+            RetryAction.RESOLVE_MANUAL_HOTSPOT ->
+                runWhenBound(PendingBinderAction.CONTINUE_MANUAL_HOTSPOT)
+
             null -> Unit
+        }
+    }
+
+    private fun runWhenBound(action: PendingBinderAction) {
+        val connected = binder
+        if (connected == null) {
+            pendingBinderAction = action
+        } else {
+            performBinderAction(connected, action)
+        }
+    }
+
+    private fun performBinderAction(
+        connected: ApkShareForegroundService.LocalBinder,
+        action: PendingBinderAction,
+    ) {
+        when (action) {
+            PendingBinderAction.START_EXISTING_LAN -> connected.startExistingLan()
+            PendingBinderAction.START_HOTSPOT -> connected.startAutomaticHotspot()
+            PendingBinderAction.REQUEST_MANUAL_FALLBACK ->
+                connected.requestManualHotspotFallback()
+
+            PendingBinderAction.CONTINUE_MANUAL_HOTSPOT ->
+                connected.continueAfterManualHotspot()
+
+            PendingBinderAction.SHOW_DOWNLOAD_QR -> connected.showDownloadQr()
         }
     }
 
