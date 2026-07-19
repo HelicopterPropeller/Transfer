@@ -1,6 +1,7 @@
 package com.example.transfer.apkshare
 
 import java.io.Closeable
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 enum class RetryAction {
@@ -48,5 +49,36 @@ internal class ApkShareCoordinator(
         runCatching(closeServer)
         runCatching(closeHotspot)
         runCatching(deleteArtifact)
+    }
+}
+
+internal class ApkPreparationWorkspace(private val directory: File) {
+    fun clear() {
+        runCatching { directory.deleteRecursively() }
+    }
+}
+
+internal class ApkShareNotificationGate : Closeable {
+    private val lock = Any()
+    private var scheduled = false
+    private var closed = false
+
+    fun request(): Boolean = synchronized(lock) {
+        if (closed || scheduled) return false
+        scheduled = true
+        true
+    }
+
+    fun beginDelivery(): Boolean = synchronized(lock) {
+        if (closed || !scheduled) return false
+        scheduled = false
+        true
+    }
+
+    override fun close() {
+        synchronized(lock) {
+            closed = true
+            scheduled = false
+        }
     }
 }

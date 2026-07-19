@@ -39,7 +39,7 @@ class ApkShareForegroundService : Service() {
             this@ApkShareForegroundService.continueAfterManualHotspot()
 
         fun showDownloadQr() = this@ApkShareForegroundService.showDownloadQr()
-        fun cancel() = this@ApkShareForegroundService.cancelSession()
+        fun cancel() = this@ApkShareForegroundService.cancelAndStop()
     }
 
     private class ActiveOperation(
@@ -47,6 +47,7 @@ class ApkShareForegroundService : Service() {
         var retry: RetryAction,
     ) {
         var artifact: ApkArtifact? = null
+        var workspace: ApkPreparationWorkspace? = null
         var hotspot: HotspotController? = null
         var hotspotBefore: List<InterfaceAddressSnapshot>? = null
         var server: LocalApkHttpServer? = null
@@ -57,7 +58,7 @@ class ApkShareForegroundService : Service() {
         private val coordinator = ApkShareCoordinator(
             closeServer = { server?.close() },
             closeHotspot = { hotspot?.close() },
-            deleteArtifact = { artifact?.file?.delete() },
+            deleteArtifact = { workspace?.clear() ?: artifact?.file?.delete() },
         )
 
         fun close() {
@@ -75,6 +76,16 @@ class ApkShareForegroundService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val operationLock = Any()
     private val mutableState = MutableStateFlow<ApkShareState>(ApkShareState.Idle)
+    private val notificationGate = ApkShareNotificationGate()
+    private val notificationRunnable = Runnable {
+        if (!notificationGate.beginDelivery()) return@Runnable
+        runCatching {
+            startForeground(
+                ApkShareNotificationFactory.NOTIFICATION_ID,
+                notificationFactory.build(mutableState.value),
+            )
+        }
+    }
     val state: StateFlow<ApkShareState> = mutableState.asStateFlow()
     private lateinit var notificationFactory: ApkShareNotificationFactory
     private var nextGeneration = 0L
@@ -93,13 +104,14 @@ class ApkShareForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_CANCEL) {
-            cancelSession()
-            stopSelf()
+            cancelAndStop()
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        notificationGate.close()
+        mainHandler.removeCallbacks(notificationRunnable)
         serviceScope.cancel()
         closeAsync(detachActive())
         cleanupExecutor.shutdown()
@@ -242,15 +254,20 @@ class ApkShareForegroundService : Service() {
         }
     }
 
-    private fun cancelSession() {
+    private fun cancelAndStop() {
         val detached = synchronized(operationLock) {
             val current = activeOperation
             activeOperation = null
             mutableState.value = ApkShareState.Cancelled
-            scheduleNotificationLocked()
             current
         }
+        notificationGate.close()
+        mainHandler.removeCallbacks(notificationRunnable)
+        serviceScope.cancel()
         closeAsync(detached)
+        cleanupExecutor.shutdown()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     private fun beginOperation(retry: RetryAction): ActiveOperation {
@@ -268,18 +285,40 @@ class ApkShareForegroundService : Service() {
     }
 
     private fun prepareArtifact(operation: ActiveOperation): ApkArtifact? {
-        val result = InstalledApkSource().prepare(
-            this,
-            File(cacheDir, "$APK_SHARE_CACHE_DIRECTORY/${operation.generation}"),
+        val workspaceDirectory = File(
+            cacheDir,
+            "$APK_SHARE_CACHE_DIRECTORY/${operation.generation}",
         )
+        val workspace = ApkPreparationWorkspace(workspaceDirectory)
+        val mayPrepare = synchronized(operationLock) {
+            if (activeOperation !== operation) {
+                false
+            } else {
+                operation.workspace = workspace
+                true
+            }
+        }
+        if (!mayPrepare) {
+            workspace.clear()
+            return null
+        }
+        val result = runCatching {
+            InstalledApkSource().prepare(this, workspaceDirectory)
+        }.getOrElse { exception ->
+            ApkPreparationResult.Failure(
+                exception.message ?: "无法读取当前安装包信息",
+            )
+        }
         val artifact = when (result) {
             is ApkPreparationResult.Ready -> result.artifact
             ApkPreparationResult.SplitInstallUnsupported -> {
+                workspace.clear()
                 fail(operation, "当前安装包含拆分 APK，无法离线分享")
                 return null
             }
 
             is ApkPreparationResult.Failure -> {
+                workspace.clear()
                 fail(operation, result.message)
                 return null
             }
@@ -292,7 +331,7 @@ class ApkShareForegroundService : Service() {
                 true
             }
         }
-        if (!attached) artifact.file.delete()
+        if (!attached) workspace.clear()
         return artifact.takeIf { attached }
     }
 
@@ -461,13 +500,8 @@ class ApkShareForegroundService : Service() {
     }
 
     private fun scheduleNotificationLocked() {
-        mainHandler.post {
-            runCatching {
-                startForeground(
-                    ApkShareNotificationFactory.NOTIFICATION_ID,
-                    notificationFactory.build(mutableState.value),
-                )
-            }
+        if (notificationGate.request()) {
+            mainHandler.post(notificationRunnable)
         }
     }
 
