@@ -99,6 +99,14 @@
                         android:text="@string/scan_connection_qr" />
                 </LinearLayout>
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/inviteInstallButton"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/invite_install" />
+
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"

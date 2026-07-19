@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/apkShareRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    tools:context=".apkshare.ApkShareActivity">
+
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/apkShareToolbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:navigationIcon="@drawable/ic_arrow_back"
+        app:title="@string/apk_share_screen_title" />
+
+    <ScrollView
+        android:id="@+id/apkShareScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:id="@+id/apkShareContent"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="20dp"
+            android:paddingTop="20dp"
+            android:paddingEnd="20dp"
+            android:paddingBottom="20dp">
+
+            <TextView
+                android:id="@+id/stateTitleText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                tools:text="第一步：加入热点" />
+
+            <TextView
+                android:id="@+id/stateDetailText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="@color/text_secondary"
+                android:textIsSelectable="true"
+                android:textSize="15sp"
+                tools:text="请扫描二维码加入热点" />
+
+            <ImageView
+                android:id="@+id/apkShareQrImage"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:adjustViewBounds="true"
+                android:contentDescription="@string/apk_share_qr_description"
+                android:scaleType="fitCenter"
+                android:visibility="gone"
+                tools:layout_height="280dp"
+                tools:visibility="visible" />
+
+            <TextView
+                android:id="@+id/hotspotCredentialsText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/bg_dashed_area"
+                android:padding="14dp"
+                android:textColor="@color/text_primary"
+                android:textIsSelectable="true"
+                android:visibility="gone"
+                tools:text="热点名称：Transfer\n密码：password"
+                tools:visibility="visible" />
+
+            <TextView
+                android:id="@+id/artifactMetadataText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/bg_dashed_area"
+                android:padding="14dp"
+                android:textColor="@color/text_secondary"
+                android:textIsSelectable="true"
+                android:visibility="gone"
+                tools:text="文件：Transfer.apk\n版本：1.0\n大小：12 MB"
+                tools:visibility="visible" />
+
+            <ProgressBar
+                android:id="@+id/apkShareProgress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="18dp"
+                android:max="100"
+                android:visibility="gone"
+                tools:progress="45"
+                tools:visibility="visible" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/primaryActionButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:visibility="gone"
+                tools:text="使用当前 Wi-Fi"
+                tools:visibility="visible" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/secondaryActionButton"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:visibility="gone"
+                tools:text="没有路由器，创建热点"
+                tools:visibility="visible" />
+        </LinearLayout>
+    </ScrollView>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/cancelApkShareButton"
+        style="@style/Widget.Material3.Button.OutlinedButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="20dp"
+        android:layout_marginBottom="16dp"
+        android:text="@string/apk_share_cancel" />
+</LinearLayout>

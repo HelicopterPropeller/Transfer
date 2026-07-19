@@ -128,6 +128,7 @@ class HotspotController(
     private val startRequested = AtomicBoolean()
     private val resultGate = HotspotResultGate()
 
+    @RequiresApi(Build.VERSION_CODES.O)
     fun start(callback: (HotspotStartResult) -> Unit) {
         if (resultGate.isClosed || !startRequested.compareAndSet(false, true)) return
         if (HotspotPermissionPolicy.requirementFor(apiLevel) == HotspotRequirement.MANUAL) {
@@ -177,10 +178,11 @@ class HotspotController(
         resultGate.publish { callback(HotspotStartResult.ManualRequired(failure)) }
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     private fun credentialsFrom(
         reservation: WifiManager.LocalOnlyHotspotReservation,
     ): HotspotCredentials {
-        val raw = if (apiLevel >= Build.VERSION_CODES.R) {
+        val raw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             credentialsFromSoftAp(reservation)
         } else {
             credentialsFromLegacyConfig(reservation)
@@ -201,6 +203,7 @@ class HotspotController(
     }
 
     @Suppress("DEPRECATION")
+    @RequiresApi(Build.VERSION_CODES.O)
     private fun credentialsFromLegacyConfig(
         reservation: WifiManager.LocalOnlyHotspotReservation,
     ): Pair<String, String> {

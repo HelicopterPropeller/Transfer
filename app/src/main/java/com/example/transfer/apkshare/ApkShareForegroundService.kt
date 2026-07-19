@@ -135,7 +135,7 @@ class ApkShareForegroundService : Service() {
 
     private fun startAutomaticHotspot() {
         val requirement = HotspotPermissionPolicy.requirementFor(Build.VERSION.SDK_INT)
-        if (requirement == HotspotRequirement.MANUAL) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             cancelActiveAndPublish(
                 ApkShareState.ManualHotspotRequired(HotspotFailure.GENERIC),
             )
@@ -495,7 +495,7 @@ class ApkShareForegroundService : Service() {
 
         HotspotRequirement.NEARBY_WIFI -> ContextCompat.checkSelfPermission(
             this,
-            Manifest.permission.NEARBY_WIFI_DEVICES,
+            NEARBY_WIFI_PERMISSION,
         ) == PackageManager.PERMISSION_GRANTED
     }
 
@@ -509,5 +509,6 @@ class ApkShareForegroundService : Service() {
         const val ACTION_CANCEL = "com.example.transfer.apkshare.action.CANCEL"
         private const val APK_SHARE_CACHE_DIRECTORY = "apk-share"
         private const val COMPLETION_CLEANUP_DELAY_MILLIS = 300L
+        private const val NEARBY_WIFI_PERMISSION = "android.permission.NEARBY_WIFI_DEVICES"
     }
 }

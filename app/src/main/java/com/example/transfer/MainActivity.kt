@@ -31,6 +31,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.transfer.history.HistoryActivity
+import com.example.transfer.apkshare.ApkShareActivity
 import com.example.transfer.history.HistoryRetryContract
 import com.example.transfer.pairing.QrBitmapEncoder
 import com.example.transfer.pairing.QrDisplaySizer
@@ -147,6 +148,9 @@ class MainActivity : AppCompatActivity() {
         deviceNameText.text = viewModel.deviceName
         findViewById<MaterialButton>(R.id.historyButton).setOnClickListener {
             startActivity(Intent(this, HistoryActivity::class.java))
+        }
+        findViewById<MaterialButton>(R.id.inviteInstallButton).setOnClickListener {
+            startActivity(Intent(this, ApkShareActivity::class.java))
         }
         findViewById<MaterialButton>(R.id.showQrButton).setOnClickListener {
             viewModel.createPairingOffer()
